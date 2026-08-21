@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+# La lógica del plugin se expone también como librería para que
+# `tests/integracion.rs` pueda ejercitarla contra un MinIO real: por gRPC no se
+# puede mirar dentro del bucket, y las partes de un multipart a medio subir
+# solo se ven desde dentro.
+[lib]
+name = "sb_plugin_r2"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sb-plugin-r2"
 path = "src/main.rs"
@@ -23,4 +31,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Solo los tests necesitan el transporte: ahí se hace de núcleo —crear el canal
+# de datos y el sobre de arranque—, no de plugin.
+sb-transport = { path = "../../crates/sb-transport" }
 tempfile = "3"
+# MinIO habla el protocolo de S3 y corre en Docker, así que permite ejercitar el
+# plugin entero sin credenciales de Cloudflare ni coste. Lo que **no** valida es
+# la regla de R2 de que todas las partes de un multipart salvo la última midan
+# lo mismo: MinIO es más permisivo. Esa regla la fija igualmente
+# `tests/integracion.rs`, y se comprueba contra R2 real en otra tarea.
+#
+# `testcontainers-modules` 0.15 exige `testcontainers` ^0.27, así que aquí no se
+# puede subir a 0.28 mientras no salga el módulo correspondiente.
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["minio"] }

@@ -1,21 +1,7 @@
-//! `sb-plugin-r2`: el destino de backups sobre Cloudflare R2.
-//!
-//! R2 habla el protocolo de S3, y de ahí que el plugin use el SDK de AWS. Lo
-//! que no es de S3 —la región `auto`, el endpoint de cuenta, los checksums y
-//! el tamaño uniforme de las partes— está aislado en `cliente` y `config`, con
-//! el motivo escrito al lado.
+//! El proceso del plugin de R2. Todo lo que hace vive en la librería
+//! [`sb_plugin_r2`]; aquí solo se monta el runtime del SDK.
 
-mod admin;
-mod canal;
-mod claves;
-mod cliente;
-mod config;
-mod get;
-mod plugin;
-mod put;
-mod storage;
-mod trozos;
-
+use sb_plugin_r2::{cliente, plugin, storage};
 use sb_plugin_sdk::PluginRuntime;
 
 #[tokio::main]

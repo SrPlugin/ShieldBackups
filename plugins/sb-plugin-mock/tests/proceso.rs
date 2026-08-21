@@ -415,6 +415,17 @@ async fn una_clave_con_barras_crea_los_directorios_y_list_la_encuentra() {
     assert_eq!(listado.artifacts.len(), 1);
     assert_eq!(listado.artifacts[0].key, clave);
     assert_eq!(listado.artifacts[0].size, 9);
+    // `modified_at` es RFC-3339 UTC por contrato —`2026-08-21T09:30:00Z`—, no
+    // el epoch. El núcleo compara fechas de artefactos que vienen de destinos
+    // distintos, y dos formatos incomparables harían que esa comparación
+    // mintiera en silencio.
+    let fecha = &listado.artifacts[0].modified_at;
+    assert_eq!(fecha.len(), 20, "«{fecha}» no es un RFC-3339 UTC");
+    assert!(fecha.ends_with('Z'), "«{fecha}» no acaba en Z");
+    assert!(
+        !fecha.chars().all(|c| c.is_ascii_digit()),
+        "«{fecha}» sigue siendo el epoch en segundos"
+    );
 
     // Un prefijo que no casa no devuelve nada.
     let vacio = vivo

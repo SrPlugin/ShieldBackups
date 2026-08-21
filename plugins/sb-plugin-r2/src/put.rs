@@ -27,7 +27,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
 use sb_plugin_sdk::EmisorProgreso;
 use sb_plugin_sdk::tonic::Status;
-use tokio::net::UnixStream;
+use tokio::io::AsyncRead;
 use tokio::task::JoinSet;
 
 use crate::canal;
@@ -52,6 +52,28 @@ pub async fn subir(
     progreso: &mut EmisorProgreso,
 ) -> Result<(), Status> {
     let datos = canal::conectar(socket).await?;
+    subir_desde(contexto, clave, datos, progreso).await
+}
+
+/// Lo mismo que [`subir`], pero leyendo de `datos` en vez del canal de datos.
+///
+/// La separación existe por una razón concreta: **el aborto de un multipart
+/// solo se puede probar con una fuente que falle a mitad**, y un socket Unix no
+/// sabe fallar. Cerrarlo es un fin de flujo limpio, no un error, así que por el
+/// canal de datos no hay forma de provocar el fallo cuyo manejo es lo más
+/// delicado de este módulo. `tests/integracion.rs` le pasa por aquí una fuente
+/// que entrega una parte y luego devuelve un error de E/S, y comprueba contra
+/// el servidor que no queda ninguna subida abierta.
+///
+/// # Errors
+///
+/// Igual que [`subir`].
+pub async fn subir_desde<R: AsyncRead + Unpin>(
+    contexto: &Contexto,
+    clave: &str,
+    datos: R,
+    progreso: &mut EmisorProgreso,
+) -> Result<(), Status> {
     let tamano_de_parte = contexto.config.part_size;
     let mut troceador = Troceador::new(datos, tamano_de_parte);
 
@@ -117,7 +139,7 @@ async fn directo(
         .put_object()
         .bucket(&contexto.config.bucket)
         .key(clave)
-        .storage_class(clase(contexto))
+        .set_storage_class(clase(contexto))
         .body(ByteStream::from(cuerpo))
         .send()
         .await
@@ -134,7 +156,7 @@ async fn crear(contexto: &Contexto, clave: &str) -> Result<String, Status> {
         .create_multipart_upload()
         .bucket(&contexto.config.bucket)
         .key(clave)
-        .storage_class(clase(contexto))
+        .set_storage_class(clase(contexto))
         .send()
         .await
         .map_err(|e| traducir("CreateMultipartUpload", &e))?;
@@ -158,12 +180,12 @@ async fn crear(contexto: &Contexto, clave: &str) -> Result<String, Status> {
 ///
 /// `tareas` viene de fuera para que quien llama pueda pararlas antes de
 /// abortar, incluso —y sobre todo— cuando esta función sale por un error.
-async fn subir_partes(
+async fn subir_partes<R: AsyncRead + Unpin>(
     contexto: &Contexto,
     clave: &str,
     upload_id: &str,
     primera: Vec<u8>,
-    mut troceador: Troceador<UnixStream>,
+    mut troceador: Troceador<R>,
     tareas: &mut JoinSet<Result<ParteSubida, ErrorDeR2>>,
     progreso: &mut EmisorProgreso,
 ) -> Result<(), Status> {
@@ -349,7 +371,13 @@ async fn abortar(contexto: &Contexto, clave: &str, upload_id: &str) {
     }
 }
 
-/// La clase de almacenamiento configurada, en el tipo que espera el SDK.
-fn clase(contexto: &Contexto) -> StorageClass {
-    StorageClass::from(contexto.config.storage_class.como_str())
+/// La clase de almacenamiento configurada, en el tipo que espera el SDK, o
+/// `None` cuando no hay que mandar la cabecera. Ver
+/// [`ClaseDeAlmacenamiento::cabecera`](crate::config::ClaseDeAlmacenamiento::cabecera).
+fn clase(contexto: &Contexto) -> Option<StorageClass> {
+    contexto
+        .config
+        .storage_class
+        .cabecera()
+        .map(StorageClass::from)
 }

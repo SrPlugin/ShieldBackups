@@ -16,7 +16,7 @@
 //! aparecen al listar el bucket y se facturan indefinidamente, así que la
 //! limpieza que solo mira la primera página deja pagando lo que no vio.
 
-use aws_sdk_s3::primitives::DateTimeFormat;
+use aws_sdk_s3::primitives::{DateTime, DateTimeFormat};
 use aws_sdk_s3::types::Object;
 use sb_plugin_sdk::tonic::Status;
 
@@ -29,10 +29,10 @@ pub struct Artefacto {
     /// guardarlo y la única con la que puede volver a pedirlo.
     pub clave: String,
     pub tamano: u64,
-    /// Fecha de última modificación en **ISO-8601 UTC** (RFC-3339), del estilo
-    /// `2026-08-21T09:30:00Z`. Se elige este formato y no el epoch porque es el
-    /// que el operador lee sin convertir nada, y porque ordena igual como texto
-    /// que como fecha. Cadena vacía si R2 no la devolvió.
+    /// Fecha de última modificación en **RFC-3339 UTC con precisión de
+    /// segundo**: `2026-08-21T09:30:00Z`, veinte caracteres exactos. Es lo que
+    /// exige el `.proto` para `ArtifactMeta.modified_at`. Cadena vacía si R2 no
+    /// la devolvió.
     pub modificado: String,
 }
 
@@ -109,11 +109,24 @@ fn artefacto_de(contexto: &Contexto, objeto: &Object) -> Option<Artefacto> {
         // Un tamaño negativo no existe en S3; si llegara, cero es más honesto
         // que un número enorme por dar la vuelta.
         tamano: u64::try_from(objeto.size().unwrap_or(0)).unwrap_or(0),
-        modificado: objeto
-            .last_modified()
-            .and_then(|f| f.fmt(DateTimeFormat::DateTime).ok())
-            .unwrap_or_default(),
+        modificado: objeto.last_modified().map(fecha).unwrap_or_default(),
     })
+}
+
+/// La fecha en el formato que fija el `.proto`: RFC-3339 UTC **sin fracción de
+/// segundo**.
+///
+/// El truncado a segundos no es cosmético. R2 devuelve milisegundos y el
+/// destino de pruebas no los tiene, así que sin truncar los dos destinos
+/// producen cadenas que **no se pueden ordenar entre sí**: `…:15Z` y
+/// `…:15.983Z` se comparan en el carácter 19, donde `Z` es mayor que `.`, y el
+/// artefacto más antiguo sale por delante del más nuevo. Lo destapó el test de
+/// integración contra `MinIO`, comparando lo que devuelve este plugin con lo
+/// que promete el contrato.
+fn fecha(momento: &DateTime) -> String {
+    DateTime::from_secs(momento.secs())
+        .fmt(DateTimeFormat::DateTime)
+        .unwrap_or_default()
 }
 
 /// Borra `clave`. **Es idempotente**: borrar lo que ya no está no es un error.
@@ -157,6 +170,9 @@ pub async fn borrar(contexto: &Contexto, clave: &str) -> Result<(), Status> {
 /// `upload_id`—, porque una misma clave puede tener varias subidas abiertas y
 /// la clave sola no las distingue.
 ///
+/// El filtro por prefijo lo aplica **este código**, no el servidor: ver el
+/// comentario dentro del bucle.
+///
 /// # Errors
 ///
 /// El motivo ya depurado si falla el listado o alguno de los abortos.
@@ -171,11 +187,22 @@ pub async fn abortar_incompletos(contexto: &Contexto, prefijo: &str) -> Result<u
             Some((clave, id)) => (Some(clave.clone()), id.clone()),
             None => (None, None),
         };
+        // **Sin `prefix` en la petición, a propósito.** El parámetro existe en
+        // la API, pero no todos los servidores compatibles con S3 lo
+        // implementan: `MinIO` solo devuelve algo cuando el prefijo es el
+        // nombre completo del objeto, y con cualquier prefijo parcial contesta
+        // una lista vacía. Confiar en él convierte `shieldbk storage gc` en una
+        // operación que **dice que abortó cero y se queda tan ancha** mientras
+        // las partes huérfanas se siguen facturando. Un filtro que no filtra se
+        // ve; uno que devuelve vacío, no.
+        //
+        // El filtrado se hace aquí abajo, sobre la clave. Cuesta traer las
+        // subidas de todo el bucket, pero las subidas en curso son pocas por
+        // definición: las que sobreviven son fallos, no tráfico normal.
         let pagina = contexto
             .cliente
             .list_multipart_uploads()
             .bucket(&contexto.config.bucket)
-            .prefix(prefijo)
             .set_key_marker(clave_desde)
             .set_upload_id_marker(id_desde)
             .send()
@@ -186,6 +213,12 @@ pub async fn abortar_incompletos(contexto: &Contexto, prefijo: &str) -> Result<u
             let (Some(clave), Some(id)) = (subida.key(), subida.upload_id()) else {
                 continue;
             };
+            // Lo que no está bajo el prefijo no es nuestro. En un bucket
+            // compartido, abortar la subida de otro sería destruir su backup a
+            // mitad.
+            if !clave.starts_with(prefijo) {
+                continue;
+            }
             contexto
                 .cliente
                 .abort_multipart_upload()
@@ -228,4 +261,30 @@ pub async fn abortar_incompletos(contexto: &Contexto, prefijo: &str) -> Result<u
     }
 
     Ok(abortadas)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn la_fecha_sale_en_rfc3339_utc_con_precision_de_segundo() {
+        // 1 771 234 200 = 2026-02-16T09:30:00Z.
+        assert_eq!(
+            fecha(&DateTime::from_secs(1_771_234_200)),
+            "2026-02-16T09:30:00Z"
+        );
+    }
+
+    #[test]
+    fn los_milisegundos_que_manda_r2_se_recortan() {
+        // Sin recortar saldría `2026-02-16T09:30:00.983Z`, que ordena **por
+        // detrás** de un `2026-02-16T09:30:00Z` de otro destino aunque sea
+        // posterior: en el carácter 19 se compara `.` contra `Z`.
+        let con_milisegundos = DateTime::from_secs_and_nanos(1_771_234_200, 983_000_000);
+        let recortada = fecha(&con_milisegundos);
+        assert_eq!(recortada, "2026-02-16T09:30:00Z");
+        assert_eq!(recortada.len(), 20);
+        assert!(recortada > fecha(&DateTime::from_secs(1_771_234_199)));
+    }
 }

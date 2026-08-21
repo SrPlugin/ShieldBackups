@@ -24,6 +24,12 @@ workspace = true
 # `connect_data`, que es todo lo que hace falta para hablar con el núcleo.
 sb-plugin-sdk = { path = "../../crates/sb-plugin-sdk" }
 tokio = { workspace = true }
+# `ArtifactMeta.modified_at` es RFC-3339 UTC por contrato, y convertir segundos
+# desde el epoch a fecha civil tiene reglas —bisiestos, la excepción de los
+# múltiplos de 400— que no merece la pena reimplementar. Como en `sb-core`,
+# solo se usan los accesores y la cadena se compone con `format!`: no hacen
+# falta las features `formatting`/`parsing`/`macros`.
+time = "0.3.55"
 tracing = { workspace = true }
 
 [dev-dependencies]

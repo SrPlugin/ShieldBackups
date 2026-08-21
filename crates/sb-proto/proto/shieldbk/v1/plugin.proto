@@ -132,6 +132,29 @@ message GetRequest {
 message ArtifactMeta {
   string key         = 1;
   uint64 size        = 2;
+  // Fecha de última modificación en **RFC-3339 con la hora en UTC y sufijo
+  // `Z`**: `2026-08-21T09:30:00Z`. El formato es parte del contrato, no una
+  // elección de cada plugin.
+  //
+  // Exactamente veinte caracteres, `YYYY-MM-DDTHH:MM:SSZ`, **sin fracción de
+  // segundo**. La precisión también es del contrato: si un destino mandara
+  // milisegundos y otro no, sus cadenas dejarían de ser comparables entre sí
+  // —`…:15Z` y `…:15.983Z` se comparan en el carácter 19, donde `Z` es mayor
+  // que `.`— y el artefacto más antiguo saldría por delante del más nuevo. Un
+  // destino que reciba más precisión del servidor la recorta.
+  //
+  // Sin fijarlo, dos destinos igual de correctos devuelven cosas
+  // incomparables —uno el epoch en segundos, otro ISO-8601— y el núcleo no
+  // puede ordenar ni comparar artefactos entre destinos: fallaría en
+  // silencio, dando por más reciente lo que solo tiene la cadena mayor.
+  //
+  // Se elige RFC-3339 sobre el epoch por dos motivos: ordena igual como texto
+  // que como fecha —de modo que comparar cadenas ya es comparar instantes— y
+  // un operador lo lee sin convertir nada.
+  //
+  // Si el destino no conoce la fecha, **cadena vacía**. Nunca un valor
+  // inventado ni un cero: una fecha falsa es indistinguible de una real y
+  // acabaría decidiendo qué se borra en una retención.
   string modified_at = 3;
 }
 

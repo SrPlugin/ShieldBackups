@@ -119,12 +119,38 @@ impl ClaseDeAlmacenamiento {
     pub(crate) const ESTANDAR: &'static str = "Standard";
     pub(crate) const POCO_FRECUENTE: &'static str = "InfrequentAccess";
 
-    /// El nombre tal y como lo espera la API de R2.
+    /// El nombre tal y como lo espera la API de R2. Es lo que se enseña en los
+    /// logs y en el preflight, no necesariamente lo que se manda.
     #[must_use]
     pub fn como_str(self) -> &'static str {
         match self {
             Self::Estandar => Self::ESTANDAR,
             Self::PocoFrecuente => Self::POCO_FRECUENTE,
+        }
+    }
+
+    /// El valor de la cabecera `x-amz-storage-class`, o `None` si no hay que
+    /// mandarla.
+    ///
+    /// La clase estándar **no se manda**, y esto no es un ahorro de bytes.
+    /// `Standard` es el nombre que le da R2 a la clase por defecto, pero la
+    /// cabecera es de S3 y ahí ese nombre no existe: un servidor compatible con
+    /// S3 que no sea R2 responde `400 InvalidStorageClass` y la subida falla
+    /// entera. Lo descubrieron los tests de integración contra `MinIO`, que es
+    /// exactamente el escenario para el que existe el campo `endpoint`.
+    ///
+    /// Omitirla deja el objeto en la clase por defecto del bucket, que en R2 es
+    /// `Standard` salvo que el operador haya puesto otra en el propio bucket.
+    /// Ese es el único caso en el que pedir `Standard` aquí y no mandarlo
+    /// difiere: un bucket cuya clase por defecto sea `InfrequentAccess`
+    /// guardará ahí también lo que este destino escriba. Es una decisión que se
+    /// tomó en el bucket, no algo que este plugin pueda contradecir sin romper
+    /// a todos los demás servidores.
+    #[must_use]
+    pub fn cabecera(self) -> Option<&'static str> {
+        match self {
+            Self::Estandar => None,
+            Self::PocoFrecuente => Some(Self::POCO_FRECUENTE),
         }
     }
 
@@ -669,5 +695,36 @@ mod tests {
             R2Config::from_values(&base()).unwrap().clave("x.age"),
             "x.age"
         );
+    }
+
+    #[test]
+    fn la_clase_estandar_no_manda_cabecera_y_la_poco_frecuente_si() {
+        // `Standard` es como R2 llama a la clase por defecto, pero ese nombre
+        // no existe en S3: mandarlo hace que cualquier otro servidor compatible
+        // conteste `400 InvalidStorageClass` y la subida falle entera. Sin
+        // cabecera, el objeto va a la clase por defecto del bucket, que es lo
+        // que se pedía.
+        assert_eq!(ClaseDeAlmacenamiento::Estandar.cabecera(), None);
+        assert_eq!(
+            ClaseDeAlmacenamiento::PocoFrecuente.cabecera(),
+            Some("InfrequentAccess")
+        );
+    }
+
+    #[test]
+    fn la_clase_se_lee_sin_distinguir_mayusculas_y_lo_desconocido_se_rechaza() {
+        let mut m = base();
+        m.insert("storage_class".into(), v_str("infrequentaccess"));
+        assert_eq!(
+            R2Config::from_values(&m).unwrap().storage_class,
+            ClaseDeAlmacenamiento::PocoFrecuente
+        );
+
+        let mut m = base();
+        m.insert("storage_class".into(), v_str("Glacier"));
+        assert!(matches!(
+            R2Config::from_values(&m),
+            Err(R2ConfigError::ClaseDesconocida)
+        ));
     }
 }

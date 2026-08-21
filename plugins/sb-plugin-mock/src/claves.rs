@@ -8,13 +8,15 @@
 use std::path::{Component, Path, PathBuf};
 
 use sb_plugin_sdk::tonic::Status;
+use time::OffsetDateTime;
 
 /// Un artefacto guardado, tal y como lo ve `List`.
 pub struct Artefacto {
     pub clave: String,
     pub tamano: u64,
-    /// Segundos desde el epoch Unix, en decimal. Cadena vacía si el sistema de
-    /// ficheros no expone la fecha.
+    /// Fecha de última modificación en **RFC-3339 UTC**, como exige el `.proto`
+    /// para `ArtifactMeta.modified_at`: `2026-08-21T09:30:00Z`. Cadena vacía si
+    /// el sistema de ficheros no expone la fecha.
     pub modificado: String,
 }
 
@@ -101,11 +103,44 @@ fn clave_de(dir: &Path, ruta: &Path) -> Option<String> {
     Some(partes.join("/"))
 }
 
+/// La fecha de modificación en el único formato que el `.proto` admite para
+/// `ArtifactMeta.modified_at`: RFC-3339 con la hora en UTC.
+///
+/// Este destino devolvía antes el epoch en segundos. Era estable, pero el
+/// plugin de R2 devuelve RFC-3339, y dos destinos que contestan cosas
+/// incomparables rompen en silencio cualquier comparación de fechas entre
+/// destinos. El formato lo fija ahora el contrato y aquí solo se cumple.
+///
+/// Un fichero cuya fecha el sistema no expone —o que cae fuera del rango de
+/// fechas representables, cosa que solo pasa con un reloj roto— devuelve
+/// cadena vacía: es lo que el contrato pide para «no lo sé», y es preferible a
+/// inventarse un instante que luego decidiría qué se borra.
 fn modificado(meta: &std::fs::Metadata) -> String {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or_else(String::new, |d| d.as_secs().to_string())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok())
+        .map_or_else(String::new, rfc3339)
+}
+
+/// `2026-08-21T09:30:00Z`.
+///
+/// Se compone con `format!` sobre los accesores en vez de con la feature
+/// `formatting` de `time`, que arrastraría proc-macros solo para esto. Sin
+/// fracción de segundo, que es lo que fija el `.proto`: una precisión que un
+/// destino tiene y otro no volvería a hacer incomparables las fechas —`…:15Z`
+/// ordena **después** de `…:15.983Z`, porque `Z` es mayor que `.`—.
+fn rfc3339(fecha: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        fecha.year(),
+        u8::from(fecha.month()),
+        fecha.day(),
+        fecha.hour(),
+        fecha.minute(),
+        fecha.second()
+    )
 }
 
 #[cfg(test)]
@@ -169,5 +204,43 @@ mod tests {
         let filtrados = listar(dir.path(), "a/").unwrap();
         assert_eq!(filtrados.len(), 1);
         assert_eq!(filtrados[0].clave, "a/b/dos.age");
+    }
+
+    #[test]
+    fn la_fecha_de_un_instante_conocido_es_rfc3339_en_utc() {
+        // 1 771 234 200 = 2026-02-16T09:30:00Z. Un instante fijo, no `now()`:
+        // así el test comprueba el formato **y** la conversión, y no cambia de
+        // resultado según cuándo se ejecute ni en qué huso.
+        let fecha = OffsetDateTime::from_unix_timestamp(1_771_234_200).unwrap();
+        assert_eq!(rfc3339(fecha), "2026-02-16T09:30:00Z");
+    }
+
+    #[test]
+    fn el_listado_devuelve_la_fecha_en_rfc3339_y_no_en_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("uno.age"), b"y").unwrap();
+
+        let todos = listar(dir.path(), "").unwrap();
+        let fecha = &todos[0].modificado;
+
+        // La forma exacta que fija el `.proto`: `2026-08-21T09:30:00Z`. Se
+        // comprueba la forma y no un valor concreto porque la fecha la pone el
+        // sistema de ficheros.
+        assert_eq!(fecha.len(), 20, "«{fecha}» no mide lo que un RFC-3339 UTC");
+        assert!(fecha.ends_with('Z'), "«{fecha}» no acaba en Z");
+        assert_eq!(&fecha[4..5], "-");
+        assert_eq!(&fecha[7..8], "-");
+        assert_eq!(&fecha[10..11], "T");
+        assert_eq!(&fecha[13..14], ":");
+        assert_eq!(&fecha[16..17], ":");
+        // El epoch en decimal era lo que este destino devolvía antes: si
+        // volviera, la cadena sería toda dígitos.
+        assert!(
+            !fecha.chars().all(|c| c.is_ascii_digit()),
+            "«{fecha}» sigue siendo el epoch en segundos"
+        );
+        // Y se puede volver a leer como fecha, que es lo que el núcleo haría.
+        let año: i32 = fecha[..4].parse().unwrap();
+        assert!(año >= 2024, "«{fecha}» no parece una fecha real");
     }
 }
