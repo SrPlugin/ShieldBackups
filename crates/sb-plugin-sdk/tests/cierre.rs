@@ -76,3 +76,76 @@ async fn shutdown_responde_y_despues_el_proceso_termina_solo() {
         "el cierre ordenado debe terminar con éxito, terminó con {estado}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn el_shutdown_responde_antes_de_que_el_proceso_muera() {
+    // Es lo que distingue un cierre ordenado de matar el proceso: el núcleo
+    // debe recibir la respuesta del RPC, no un error de transporte.
+    //
+    // Refuerza al test de arriba mirando el *error* cuando lo hay: un
+    // `Unavailable`/`Unknown` de transporte sería exactamente el fallo espurio
+    // que el cierre con GOAWAY existe para evitar, y aquí se nombra para que
+    // una regresión no se confunda con un fallo del plugin.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let pki = EphemeralPki::generate().unwrap();
+    let boot = Bootstrap::nuevo(vec![1], socket.display().to_string(), pki.server_bundle());
+
+    let mut hijo = Command::new(env!("CARGO_BIN_EXE_sb-plugin-smoke"))
+        .stderr(Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ent = hijo.stdin.take().unwrap();
+    writeln!(ent, "{}", boot.to_line().unwrap()).unwrap();
+    ent.flush().unwrap();
+
+    let mut sal = BufReader::new(hijo.stdout.take().unwrap());
+    let mut linea = String::new();
+    sal.read_line(&mut linea).unwrap();
+    Ready::from_line(&linea).unwrap();
+
+    let canal = connect_control(&socket, pki.client_config().unwrap())
+        .await
+        .unwrap();
+    let mut cliente = PluginClient::new(canal);
+
+    // El proceso sigue vivo cuando se pide el cierre: lo que se comprueba es
+    // que la respuesta sale igualmente, no que el plugin ya estuviera muerto.
+    assert!(
+        hijo.try_wait().unwrap().is_none(),
+        "el plugin debe seguir vivo antes de pedirle el cierre"
+    );
+
+    let respuesta = cliente.shutdown(sb_proto::ShutdownRequest {}).await;
+    if let Err(estado) = &respuesta {
+        panic!(
+            "el Shutdown debe devolver Ok, no un error de transporte: {:?} {}",
+            estado.code(),
+            estado.message()
+        );
+    }
+
+    // Y solo después el proceso se apaga por su cuenta, con éxito.
+    let limite = Instant::now() + PACIENCIA;
+    let estado = loop {
+        match hijo.try_wait().unwrap() {
+            Some(estado) => break estado,
+            None if Instant::now() >= limite => {
+                hijo.kill().unwrap();
+                hijo.wait().unwrap();
+                panic!(
+                    "el plugin seguía vivo {} s después de responder al Shutdown",
+                    PACIENCIA.as_secs()
+                );
+            }
+            None => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+
+    assert!(
+        estado.success(),
+        "el cierre ordenado debe terminar con éxito, terminó con {estado}"
+    );
+}

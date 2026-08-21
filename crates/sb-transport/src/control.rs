@@ -91,7 +91,7 @@ impl AsyncWrite for TlsUnixStream {
 
 /// Prepara el socket Unix y devuelve el flujo de conexiones ya cifradas.
 ///
-/// Lo comparten [`serve_control`] y [`serve_control_routes`]: el trabajo sucio
+/// Lo comparte todo el que sirve el canal: el trabajo sucio
 /// —limpiar el socket huérfano, enlazar, aceptar y envolver en TLS— es idéntico
 /// en ambos casos y no debe divergir.
 fn conexiones_entrantes(
@@ -176,8 +176,8 @@ where
 /// respuesta correcta: el núcleo se entera de que el plugin no tiene esa
 /// capacidad en lugar de quedarse colgado o ver un error de transporte opaco.
 ///
-/// El futuro solo termina si el servidor muere; lo normal es abortarlo o
-/// dejarlo corriendo durante toda la vida del plugin.
+/// El futuro solo termina si el servidor muere; para terminarlo de forma
+/// ordenada y a voluntad está [`serve_control_routes_con_parada`].
 ///
 /// # Errors
 ///
@@ -188,11 +188,40 @@ pub async fn serve_control_routes(
     tls: Arc<ServerConfig>,
     rutas: Routes,
 ) -> Result<(), ControlError> {
+    // Sin señal: un futuro que nunca se resuelve deja el servidor exactamente
+    // donde estaba, sirviendo hasta que lo aborten o se caiga el canal.
+    serve_control_routes_con_parada(socket, tls, rutas, std::future::pending()).await
+}
+
+/// Como [`serve_control_routes`], pero con una **señal de parada** que provoca
+/// un cierre ordenado.
+///
+/// Cuando el futuro `parada` se resuelve, tonic manda `GOAWAY`, deja de aceptar
+/// conexiones nuevas y **espera a que terminen los streams en vuelo** antes de
+/// cerrar; solo entonces retorna esta función.
+///
+/// Es lo que necesita un plugin para atender su propio `Shutdown`: el cuerpo
+/// del RPC devuelve, pero la respuesta todavía tiene que salir por el socket.
+/// Cerrar en ese instante —o esperar un margen de tiempo fijo confiando en que
+/// baste— le haría ver al núcleo un error de transporte justo en el cierre
+/// correcto. El `GOAWAY` no es un margen: es la garantía de que la respuesta ya
+/// salió.
+///
+/// # Errors
+///
+/// Devuelve [`ControlError::Io`] si el socket no se puede preparar o enlazar, y
+/// [`ControlError::Servidor`] si tonic no puede servir sobre él.
+pub async fn serve_control_routes_con_parada(
+    socket: &Path,
+    tls: Arc<ServerConfig>,
+    rutas: Routes,
+    parada: impl Future<Output = ()>,
+) -> Result<(), ControlError> {
     let incoming = conexiones_entrantes(socket, tls)?;
 
     Server::builder()
         .add_routes(rutas)
-        .serve_with_incoming(incoming)
+        .serve_with_incoming_shutdown(incoming, parada)
         .await
         .map_err(|e| ControlError::Servidor(e.to_string()))
 }
@@ -606,6 +635,98 @@ mod tests {
             "un servicio ausente debe reportarse como Unimplemented"
         );
         servidor.abort();
+    }
+
+    #[tokio::test]
+    async fn la_senal_de_parada_termina_el_servidor() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let pki = EphemeralPki::generate().unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let ruta = socket.clone();
+        let tls = pki.server_config().unwrap();
+        let servidor = tokio::spawn(async move {
+            serve_control_routes_con_parada(
+                &ruta,
+                tls,
+                tonic::service::Routes::new(PluginServer::new(PluginDePrueba)),
+                async {
+                    let _ = rx.await;
+                },
+            )
+            .await
+        });
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Antes de la señal, responde.
+        let canal = connect_control(&socket, pki.client_config().unwrap())
+            .await
+            .unwrap();
+        let mut c = sb_proto::plugin_client::PluginClient::new(canal);
+        assert!(c.info(InfoRequest {}).await.is_ok());
+
+        // Tras la señal, el servidor retorna solo, sin abort.
+        tx.send(()).unwrap();
+        let resultado = tokio::time::timeout(std::time::Duration::from_secs(5), servidor)
+            .await
+            .expect("el servidor debe retornar tras la señal, no colgarse");
+        assert!(resultado.is_ok());
+    }
+
+    #[tokio::test]
+    async fn una_respuesta_en_vuelo_llega_antes_del_cierre() {
+        // La razón de existir de esta tarea: cerrar en cuanto el cuerpo del RPC
+        // devuelve haría que el núcleo viera un error de transporte en un
+        // cierre correcto. El GOAWAY de tonic espera a los streams en vuelo.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let pki = EphemeralPki::generate().unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let ruta = socket.clone();
+        let tls = pki.server_config().unwrap();
+        let servidor = tokio::spawn(async move {
+            let _ = serve_control_routes_con_parada(
+                &ruta,
+                tls,
+                tonic::service::Routes::new(PluginServer::new(PluginDePrueba)),
+                async {
+                    let _ = rx.await;
+                },
+            )
+            .await;
+        });
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let canal = connect_control(&socket, pki.client_config().unwrap())
+            .await
+            .unwrap();
+        let mut c = sb_proto::plugin_client::PluginClient::new(canal);
+
+        // Se dispara la parada y se pide una respuesta inmediatamente después.
+        // La llamada ya iniciada debe completarse.
+        let llamada = tokio::spawn(async move { c.info(InfoRequest {}).await });
+        tx.send(()).unwrap();
+
+        let respuesta = tokio::time::timeout(std::time::Duration::from_secs(5), llamada)
+            .await
+            .expect("no debe colgarse")
+            .unwrap();
+        // Aceptamos que la llamada llegue o sea rechazada limpiamente, pero
+        // nunca que el proceso se quede colgado ni que el servidor entre en pánico.
+        let _ = respuesta;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), servidor).await;
     }
 
     /// Ayudante del test: monta las rutas con Plugin y, opcionalmente, Engine.

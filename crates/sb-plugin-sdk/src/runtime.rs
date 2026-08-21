@@ -12,7 +12,9 @@ use sb_proto::PROTOCOL_VERSION;
 use sb_proto::engine_server::{Engine, EngineServer};
 use sb_proto::plugin_server::{Plugin, PluginServer};
 use sb_proto::storage_server::{Storage, StorageServer};
-use sb_transport::{Bootstrap, MAGIC, Ready, serve_control_routes, server_config_from_bundle};
+use sb_transport::{
+    Bootstrap, MAGIC, Ready, serve_control_routes_con_parada, server_config_from_bundle,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tonic::service::Routes;
 
@@ -25,14 +27,15 @@ use crate::cierre::{PluginConCierre, SenalDeCierre};
 const ESPERA_SOCKET: Duration = Duration::from_secs(2);
 /// Granularidad del sondeo del socket.
 const SONDEO_SOCKET: Duration = Duration::from_millis(10);
-/// Margen entre atender un `Shutdown` y cerrar el canal de control.
+/// Tope de seguridad para el cierre ordenado. **No es el mecanismo de cierre.**
 ///
-/// El cuerpo del RPC ya devolvió, pero la respuesta todavía tiene que salir por
-/// el socket: cerrar en ese instante le parecería al núcleo un error de
-/// transporte justo en el cierre correcto. Sobre un socket Unix la respuesta
-/// sale en microsegundos, así que este margen es holgado a propósito y solo se
-/// paga una vez, al final de la vida del plugin.
-const GRACIA_CIERRE: Duration = Duration::from_millis(250);
+/// Quien garantiza que la respuesta del `Shutdown` llega al núcleo es el
+/// `GOAWAY` de tonic, que espera a los streams en vuelo antes de cerrar. Este
+/// tope solo cubre el caso patológico de un stream que no termina nunca —un
+/// volcado colgado, por ejemplo—, que sin él dejaría al plugin inmortal
+/// justo después de que el núcleo le pidiera morir. Es generoso a propósito:
+/// si llega a saltar, algo iba mal de antes.
+const TOPE_CIERRE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
@@ -180,12 +183,17 @@ impl<P: Plugin> PluginRuntime<P> {
             rutas = registrar(rutas);
         }
 
+        // La parada del servidor va por su propio canal: `cierre` la pide y este
+        // `oneshot` se la traslada a tonic, que responde con un `GOAWAY`.
         let socket = PathBuf::from(&bootstrap.control_socket);
         let socket_del_servidor = socket.clone();
-        let mut servidor =
-            tokio::spawn(
-                async move { serve_control_routes(&socket_del_servidor, tls, rutas).await },
-            );
+        let (pedir_parada, parada) = tokio::sync::oneshot::channel::<()>();
+        let mut servidor = tokio::spawn(async move {
+            serve_control_routes_con_parada(&socket_del_servidor, tls, rutas, async move {
+                let _ = parada.await;
+            })
+            .await
+        });
 
         // Anunciarse antes de estar escuchando es una carrera perdida: el
         // núcleo conectaría contra un socket que aún no existe.
@@ -205,16 +213,34 @@ impl<P: Plugin> PluginRuntime<P> {
             std::process::id(),
         ))?;
 
+        // Se vive hasta que pase una de dos cosas: que el canal se caiga solo
+        // —y entonces su error es el resultado del plugin— o que el núcleo pida
+        // el cierre. El `return` en la primera rama evita tener que volver a
+        // tocar `servidor` dentro del `select!`, que aún lo tiene prestado.
         tokio::select! {
-            resultado = &mut servidor => match resultado {
-                Ok(resultado) => Ok(resultado?),
-                Err(e) => Err(SdkError::TareaDelServidor(e.to_string())),
-            },
-            () = cierre.esperar() => {
-                // La respuesta del `Shutdown` va camino del núcleo: se le deja
-                // salir antes de tirar el canal.
-                tokio::time::sleep(GRACIA_CIERRE).await;
-                tracing::info!("cierre solicitado por el núcleo; el plugin termina");
+            resultado = &mut servidor => {
+                return match resultado {
+                    Ok(resultado) => Ok(resultado?),
+                    Err(e) => Err(SdkError::TareaDelServidor(e.to_string())),
+                };
+            }
+            () = cierre.esperar() => {}
+        }
+
+        tracing::info!("cierre solicitado por el núcleo; el plugin termina");
+        // A partir de aquí manda tonic: manda `GOAWAY`, deja de aceptar
+        // conexiones y espera a los streams en vuelo, de modo que la respuesta
+        // del propio `Shutdown` sale por el socket antes de que el canal muera.
+        // No hay margen temporal que apurar: se espera a que termine de verdad.
+        let _ = pedir_parada.send(());
+        match tokio::time::timeout(TOPE_CIERRE, &mut servidor).await {
+            Ok(Ok(resultado)) => Ok(resultado?),
+            Ok(Err(e)) => Err(SdkError::TareaDelServidor(e.to_string())),
+            Err(_) => {
+                tracing::warn!(
+                    tope_s = TOPE_CIERRE.as_secs(),
+                    "el canal de control no cerró dentro del tope de seguridad; se aborta"
+                );
                 servidor.abort();
                 Ok(())
             }
