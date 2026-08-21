@@ -1,0 +1,23 @@
+[package]
+name = "sb-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tonic = "0.14.6"
+# El código que genera `tonic-prost-build` referencia `tonic_prost::ProstCodec`,
+# así que este crate es una dependencia de ejecución, no solo de compilación.
+tonic-prost = "0.14.6"
+prost = "0.14.4"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+prost-build = "0.14.4"
+# Trae un binario de protoc precompilado. Sin esto, compilar el proyecto exige
+# instalar el compilador de protobuf a mano en cada máquina y en CI.
+protoc-bin-vendored = "3.2.0"

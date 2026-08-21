@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package shieldbk.v1;
+
+// Todo plugin implementa este servicio. Además implementa Engine, Storage o
+// ambos, y lo declara en Info.
+service Plugin {
+  // Primer RPC sobre el canal ya autenticado. Confirma identidad y capacidades.
+  rpc Info      (InfoRequest)      returns (InfoResponse);
+  // Describe los campos de configuración que el plugin acepta.
+  rpc Schema    (SchemaRequest)    returns (SchemaResponse);
+  // Entrega la configuración validada, incluidos los secretos ya resueltos.
+  rpc Configure (ConfigureRequest) returns (ConfigureResponse);
+  // Comprueba conectividad, permisos y dependencias. Lo usa `doctor`.
+  rpc Preflight (PreflightRequest) returns (PreflightResponse);
+  // Cierre ordenado.
+  rpc Shutdown  (ShutdownRequest)  returns (ShutdownResponse);
+}
+
+service Engine {
+  rpc Dump    (DumpRequest)    returns (stream Progress);
+  rpc Restore (RestoreRequest) returns (stream Progress);
+}
+
+service Storage {
+  rpc Put             (PutRequest)             returns (stream Progress);
+  rpc Get             (GetRequest)             returns (stream Progress);
+  rpc List            (ListRequest)            returns (ListResponse);
+  rpc Delete          (DeleteRequest)          returns (DeleteResponse);
+  // Limpia subidas multipart incompletas. Sin esto, un fallo deja partes
+  // huérfanas que el proveedor sigue facturando.
+  rpc AbortIncomplete (AbortIncompleteRequest) returns (AbortIncompleteResponse);
+}
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_ENGINE      = 1;
+  CAPABILITY_STORAGE     = 2;
+}
+
+message InfoRequest {}
+message InfoResponse {
+  string              name             = 1;
+  string              version          = 2;
+  uint32              protocol_version = 3;
+  repeated Capability capabilities     = 4;
+}
+
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  FIELD_TYPE_STRING      = 1;
+  FIELD_TYPE_INT         = 2;
+  FIELD_TYPE_BOOL        = 3;
+  FIELD_TYPE_DURATION    = 4;
+  FIELD_TYPE_PATH        = 5;
+  FIELD_TYPE_LIST        = 6;
+}
+
+message Field {
+  string    name          = 1;
+  FieldType type          = 2;
+  bool      required      = 3;
+  // Un campo secreto nunca se imprime, nunca se loguea y nunca admite valor
+  // literal en el archivo de configuración.
+  bool      secret        = 4;
+  string    description   = 5;
+  string    default_value = 6;
+}
+
+message SchemaRequest {}
+message SchemaResponse { repeated Field fields = 1; }
+
+message StringList { repeated string values = 1; }
+
+message Value {
+  oneof kind {
+    string     string_value = 1;
+    int64      int_value    = 2;
+    bool       bool_value   = 3;
+    StringList list_value   = 4;
+  }
+}
+
+message ConfigureRequest { map<string, Value> config = 1; }
+message ConfigureResponse {}
+
+message Check {
+  string name        = 1;
+  bool   ok          = 2;
+  string detail      = 3;
+  // Qué hacer para arreglarlo. Un preflight que dice "falló" sin decir cómo
+  // arreglarlo no sirve de nada.
+  string remediation = 4;
+}
+
+message PreflightRequest {}
+message PreflightResponse {
+  bool           ok             = 1;
+  repeated Check checks         = 2;
+  // Versión del servidor detectada, para el manifiesto.
+  string         server_version = 3;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {}
+
+// Ruta del socket Unix por el que fluyen los bytes. El plugin se conecta a él.
+message DumpRequest    { string data_socket = 1; }
+message RestoreRequest { string data_socket = 1; }
+
+message Progress {
+  uint64 bytes   = 1;
+  string message = 2;
+}
+
+message PutRequest {
+  string key         = 1;
+  string data_socket = 2;
+}
+message GetRequest {
+  string key         = 1;
+  string data_socket = 2;
+}
+
+message ArtifactMeta {
+  string key         = 1;
+  uint64 size        = 2;
+  string modified_at = 3;
+}
+
+message ListRequest  { string prefix = 1; }
+message ListResponse { repeated ArtifactMeta artifacts = 1; }
+
+message DeleteRequest  { string key = 1; }
+message DeleteResponse {}
+
+message AbortIncompleteRequest  { string prefix = 1; }
+message AbortIncompleteResponse { uint32 aborted = 1; }
