@@ -5,10 +5,12 @@
 //! núcleo entero para poder hablar el protocolo.
 
 pub mod control;
+pub mod data;
 pub mod handshake;
 pub mod pki;
 
 pub use control::{ControlError, connect_control, serve_control};
+pub use data::{DataChannel, connect_data};
 pub use handshake::{Bootstrap, HANDSHAKE_VERSION, HandshakeError, MAGIC, READY_TIMEOUT_MS, Ready};
 pub use pki::{
     CLIENT_NAME, EphemeralPki, PkiError, SERVER_NAME, ServerBundle, server_config_from_bundle,
