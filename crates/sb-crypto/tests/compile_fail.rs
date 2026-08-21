@@ -1,10 +1,22 @@
-/// Este test documenta una garantía del diseño: imprimir un `Secret` no compila.
-/// Se verifica manualmente descomentando la línea de abajo — debe dar
-/// "`Secret<String>` doesn't implement `Debug`" (y con `{s}`,
-/// "doesn't implement `std::fmt::Display`").
+//! Garantías que se comprueban por *ausencia* de compilación.
+//!
+//! `Secret<T>` e `Identity` no implementan `Debug` ni `Display` a propósito:
+//! intentar imprimir una credencial debe ser un error de compilación, no una
+//! línea de log. Un test normal no puede verificar eso — solo puede ejecutar
+//! código que sí compila.
+//!
+//! `trybuild` compila cada archivo de `tests/ui/` y exige que falle con
+//! exactamente el error registrado en su `.stderr`. Si alguien añadiera
+//! `#[derive(Debug)]` a cualquiera de los dos tipos, este test se pondría rojo.
+//!
+//! Para regenerar los `.stderr` tras un cambio legítimo:
+//!
+//! ```sh
+//! TRYBUILD=overwrite cargo test -p sb-crypto --test compile_fail
+//! ```
+
 #[test]
-fn secret_no_es_imprimible() {
-    let s = sb_crypto::Secret::new(String::from("x"));
-    // println!("{s:?}");  // <- debe ser un error de compilación
-    assert_eq!(s.expose(), "x");
+fn imprimir_una_credencial_no_compila() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/*.rs");
 }

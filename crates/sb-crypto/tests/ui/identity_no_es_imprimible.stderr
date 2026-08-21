@@ -1,0 +1,18 @@
+error[E0277]: `Identity` doesn't implement `Debug`
+ --> tests/ui/identity_no_es_imprimible.rs:5:15
+  |
+5 |     println!("{id:?}");
+  |               ^^^^^^ `Identity` cannot be formatted using `{:?}` because it doesn't implement `Debug`
+  |
+  = help: the trait `Debug` is not implemented for `Identity`
+  = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `println` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Identity` doesn't implement `std::fmt::Display`
+ --> tests/ui/identity_no_es_imprimible.rs:6:15
+  |
+6 |     println!("{id}");
+  |               ^^^^ `Identity` cannot be formatted with the default formatter
+  |
+  = help: the trait `std::fmt::Display` is not implemented for `Identity`
+  = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+  = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `println` (in Nightly builds, run with -Z macro-backtrace for more info)

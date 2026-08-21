@@ -20,3 +20,4 @@ age = { version = "0.12.1", features = ["async"] }
 [dev-dependencies]
 proptest = "1.11.0"
 tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
+trybuild = "1.0.120"
