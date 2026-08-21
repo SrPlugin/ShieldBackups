@@ -6,7 +6,9 @@
 //! plugin correspondiente declara por gRPC.
 
 pub mod model;
+pub mod secrets;
 
 pub use model::{
     Config, ConfigError, ConfigTable, ConfigValue, Defaults, PluginsConfig, SecretRef, Target,
 };
+pub use secrets::{SecretError, resolver};
