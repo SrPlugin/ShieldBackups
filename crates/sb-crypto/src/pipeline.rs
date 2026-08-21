@@ -305,37 +305,60 @@ mod tests {
 
     #[tokio::test]
     async fn el_nivel_de_compresion_llega_a_la_capa_zstd() {
+        // La entrada es deliberadamente grande y sólo parcialmente comprimible.
+        // Una versión anterior de este test usaba 90 KB de texto repetido y era
+        // intermitente: el artefacto quedaba en 300-400 bytes, donde la varianza
+        // del framing de zstd domina sobre la diferencia real entre niveles y la
+        // comparación se convertía en una moneda al aire. Con varios megabytes
+        // de contenido tipo dump, la diferencia entre nivel 1 y 19 es de órdenes
+        // muy superiores a ese ruido.
         let id = Identity::generate();
-        let datos = b"texto con estructura repetida ".repeat(3000);
+        let datos = datos_tipo_dump(4 * 1024 * 1024);
 
-        let mut bajo = Vec::new();
-        backup(
-            &datos[..],
-            &mut bajo,
-            &BackupOptions {
-                recipient: id.to_recipient(),
-                level: CompressionLevel::new(1).unwrap(),
-            },
-        )
-        .await
-        .unwrap();
+        let comprimir_con = |nivel: i32| {
+            let datos = &datos;
+            let rec = id.to_recipient();
+            async move {
+                let mut salida = Vec::new();
+                backup(
+                    &datos[..],
+                    &mut salida,
+                    &BackupOptions {
+                        recipient: rec,
+                        level: CompressionLevel::new(nivel).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+                salida.len()
+            }
+        };
 
-        let mut alto = Vec::new();
-        backup(
-            &datos[..],
-            &mut alto,
-            &BackupOptions {
-                recipient: id.to_recipient(),
-                level: CompressionLevel::new(19).unwrap(),
-            },
-        )
-        .await
-        .unwrap();
+        let bajo = comprimir_con(1).await;
+        let alto = comprimir_con(19).await;
 
         assert!(
-            alto.len() <= bajo.len(),
-            "el nivel debe estar llegando de verdad a zstd"
+            alto < bajo,
+            "el nivel no está llegando a zstd: nivel 1 dio {bajo} bytes y nivel 19 dio {alto}"
         );
+    }
+
+    /// Contenido parecido a un dump de base de datos: vocabulario acotado y muy
+    /// repetitivo, pero con suficiente variación para que el nivel de
+    /// compresión cambie el resultado de forma medible.
+    fn datos_tipo_dump(bytes: usize) -> Vec<u8> {
+        let mut salida = Vec::with_capacity(bytes + 128);
+        let mut x: u32 = 0x1234_5678;
+        while salida.len() < bytes {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = x % 10_000;
+            salida.extend_from_slice(
+                format!("INSERT INTO clientes VALUES ({n}, 'cliente-{n}', '2026-08-21');\n")
+                    .as_bytes(),
+            );
+        }
+        salida.truncate(bytes);
+        salida
     }
 
     #[tokio::test]
