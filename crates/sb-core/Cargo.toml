@@ -9,11 +9,22 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# `rustix` da acceso a `kill(-pgid)` —matar al grupo entero, que es lo que se
+# lleva por delante a los nietos del plugin— con una API segura. La
+# alternativa, `libc::kill`, exigiría `unsafe`, y el workspace lo prohíbe.
+rustix = { version = "1.1.4", features = ["process"] }
+sb-proto = { version = "0.1.0", path = "../sb-proto" }
+sb-transport = { version = "0.1.0", path = "../sb-transport" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11.0"
 thiserror = { workspace = true }
+# El tokio del workspace ya trae `process`, `io-util`, `time`, `net`, `macros`
+# y `rt-multi-thread`, que es todo lo que necesita el arranque de plugins: no
+# hace falta activar nada extra solo para este crate.
+tokio.workspace = true
 toml = "1.1.4"
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
