@@ -2026,6 +2026,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-plugin-mock"
+version = "0.1.0"
+dependencies = [
+ "sb-plugin-sdk",
+ "sb-transport",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "sb-plugin-sdk"
 version = "0.1.0"
 dependencies = [

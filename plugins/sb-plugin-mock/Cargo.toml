@@ -1,0 +1,30 @@
+[package]
+name = "sb-plugin-mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "sb-plugin-mock"
+path = "src/main.rs"
+
+# El generador de datos se expone también como librería para que los tests del
+# núcleo puedan regenerar exactamente lo que el motor produjo y compararlo.
+[lib]
+name = "sb_plugin_mock"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sb-plugin-sdk = { path = "../../crates/sb-plugin-sdk" }
+sb-transport = { path = "../../crates/sb-transport" }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
