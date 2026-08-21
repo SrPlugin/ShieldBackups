@@ -24,6 +24,18 @@ const MARCADORES: [&str; 7] = [
     "dd",
 ];
 
+/// Longitud máxima de una clave, en **bytes**.
+///
+/// Es el límite de S3 y de Cloudflare R2, el más restrictivo de los destinos
+/// previstos: el disco local y SFTP admiten rutas más largas, pero una clave
+/// que solo vale para algunos destinos no es una clave portable. Se mide en
+/// bytes y no en caracteres porque así lo mide el destino: un nombre de 600
+/// letras acentuadas ocupa 1200 bytes.
+///
+/// Rechazarla aquí evita que el backup falle —o que la clave se trunque en
+/// silencio— a mitad de la subida.
+pub const MAX_CLAVE_BYTES: usize = 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum NamingError {
     #[error(
@@ -128,8 +140,9 @@ impl NamingContext {
 /// - [`NamingError::MarcadorDesconocido`] si la plantilla nombra un marcador
 ///   que no está en la lista de válidos.
 /// - [`NamingError::RutaInsegura`] si la clave resultante está vacía, es
-///   absoluta, contiene `\`, contiene un byte nulo, o alguno de sus segmentos
-///   separados por `/` es exactamente `..`.
+///   absoluta, contiene `\`, contiene algún carácter de control, ocupa más de
+///   [`MAX_CLAVE_BYTES`], o alguno de sus segmentos separados por `/` está
+///   vacío o es exactamente `.` o `..`.
 pub fn render(plantilla: &str, ctx: &NamingContext) -> Result<String, NamingError> {
     let mut salida = String::with_capacity(plantilla.len());
     let mut resto = plantilla;
@@ -186,13 +199,49 @@ fn validar(clave: &str) -> Result<(), NamingError> {
              artefacto en un sitio distinto del que dice la clave",
         ));
     }
+    // El rango C0 (U+0000–U+001F), U+007F y el C1 (U+0080–U+009F). El byte
+    // nulo ya se ha comprobado arriba porque su mensaje es más concreto; el
+    // resto cae aquí.
+    if let Some(control) = clave
+        .chars()
+        .find(|c| matches!(*c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}'))
+    {
+        return Err(insegura(&format!(
+            "contiene el carácter de control U+{:04X}. La clave viaja en las cabeceras de la \
+             petición al object storage, y un salto de línea ahí inyecta cabeceras en la \
+             petición",
+            control as u32
+        )));
+    }
+    if clave.len() > MAX_CLAVE_BYTES {
+        return Err(insegura(&format!(
+            "ocupa {} bytes y el máximo son {MAX_CLAVE_BYTES}: es el límite de S3 y R2, el más \
+             restrictivo de los destinos previstos. Aceptarla aquí solo trasladaría el fallo al \
+             destino, a mitad del backup",
+            clave.len()
+        )));
+    }
     // Solo el segmento completo es peligroso: «backup..2026.age» es un nombre
-    // legítimo, «backup/../..» sube dos niveles.
-    if clave.split('/').any(|segmento| segmento == "..") {
-        return Err(insegura(
-            "tiene un segmento «..», que sube un nivel y escribiría fuera del directorio de \
-             backups",
-        ));
+    // legítimo, «backup/../..» sube dos niveles. Lo mismo con «.»: los nombres
+    // de artefacto llevan puntos, pero un segmento que es solo un punto no.
+    for segmento in clave.split('/') {
+        let motivo = match segmento {
+            ".." => {
+                "tiene un segmento «..», que sube un nivel y escribiría fuera del directorio de \
+                 backups"
+            }
+            "." => {
+                "tiene un segmento «.», que un sistema de archivos ignora y el object storage \
+                 conserva: la misma clave apuntaría a dos objetos distintos según el destino"
+            }
+            "" => {
+                "tiene un segmento vacío —dos «/» seguidos, o una «/» final—, que en un sistema \
+                 de archivos colapsa y en el object storage no: dos claves distintas acabarían \
+                 en el mismo objeto y se perdería la correspondencia entre clave y artefacto"
+            }
+            _ => continue,
+        };
+        return Err(insegura(motivo));
     }
     Ok(())
 }
@@ -347,5 +396,99 @@ mod tests {
         let a = NamingContext::new("t", "e", "s", 1_755_770_400);
         let b = NamingContext::new("t", "e", "s", 1_755_770_400);
         assert_eq!(a.timestamp, b.timestamp);
+    }
+
+    #[test]
+    fn se_rechaza_un_retorno_de_carro() {
+        // La clave viaja en cabeceras HTTP hacia el object storage: un \r\n
+        // es inyección de cabeceras en la petición.
+        assert!(render("archivo\rmalo", &contexto()).is_err());
+    }
+
+    #[test]
+    fn se_rechaza_un_salto_de_linea() {
+        assert!(render("archivo\nmalo", &contexto()).is_err());
+    }
+
+    #[test]
+    fn se_rechaza_cualquier_caracter_de_control() {
+        for c in ['\u{1}', '\u{7}', '\u{1b}', '\u{7f}', '\u{9b}'] {
+            let plantilla = format!("archivo{c}malo");
+            assert!(
+                render(&plantilla, &contexto()).is_err(),
+                "debería rechazar U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn un_nombre_de_target_con_salto_de_linea_tambien_se_rechaza() {
+        // El vector real: el nombre viene de la configuración del usuario, no
+        // de la plantilla.
+        let mut ctx = contexto();
+        ctx.target = "produccion\r\nX-Inyectada: si".into();
+        assert!(render("{target}/x.age", &ctx).is_err());
+    }
+
+    #[test]
+    fn se_rechaza_una_clave_mas_larga_que_el_limite_de_s3() {
+        // S3 y R2 limitan las claves a 1024 bytes. Aceptarla aquí solo
+        // traslada el fallo al destino, a mitad de un backup.
+        let mut ctx = contexto();
+        ctx.target = "a".repeat(2000);
+        let err = render("{target}/x.age", &ctx).err().unwrap();
+        assert!(matches!(err, NamingError::RutaInsegura { .. }));
+        assert!(
+            err.to_string().contains("1024"),
+            "debe decir cuál es el límite"
+        );
+    }
+
+    #[test]
+    fn una_clave_justo_en_el_limite_se_acepta() {
+        let mut ctx = contexto();
+        ctx.target = "a".repeat(1024);
+        assert!(render("{target}", &ctx).is_ok());
+    }
+
+    #[test]
+    fn el_limite_se_mide_en_bytes_no_en_caracteres() {
+        // Los nombres con acentos o emoji ocupan más de un byte, y el límite
+        // del destino es de bytes.
+        let mut ctx = contexto();
+        ctx.target = "ñ".repeat(600); // 1200 bytes en UTF-8
+        assert!(render("{target}", &ctx).is_err());
+    }
+
+    #[test]
+    fn se_rechaza_un_segmento_vacio() {
+        // `a//b` y `a/b` son la misma ruta en un sistema de archivos y dos
+        // claves distintas en S3. Esa ambigüedad rompe la correspondencia
+        // entre clave y artefacto de la que depende la retención.
+        assert!(render("{target}//x.age", &contexto()).is_err());
+    }
+
+    #[test]
+    fn se_rechaza_una_clave_que_termina_en_barra() {
+        // Sería un «directorio», no un objeto.
+        assert!(render("{target}/", &contexto()).is_err());
+    }
+
+    #[test]
+    fn se_rechaza_un_segmento_de_un_solo_punto() {
+        assert!(render("{target}/./x.age", &contexto()).is_err());
+    }
+
+    #[test]
+    fn un_punto_dentro_de_un_nombre_sigue_siendo_valido() {
+        // Solo el segmento completo es problemático: los nombres de artefacto
+        // llevan puntos por todas partes.
+        assert!(render("{target}/x.dump.zst.age", &contexto()).is_ok());
+    }
+
+    #[test]
+    fn un_nombre_oculto_sigue_siendo_valido() {
+        assert!(render(".shieldbk/{target}.age", &contexto()).is_ok());
     }
 }
