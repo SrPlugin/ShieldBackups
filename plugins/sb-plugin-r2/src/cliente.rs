@@ -53,6 +53,29 @@ pub enum ErrorDeR2 {
     Desconocido { operacion: &'static str },
 }
 
+impl ErrorDeR2 {
+    /// Si el fallo es «eso no está»: un objeto que no existe.
+    ///
+    /// Lo usan la descarga —para responder `not_found` con la clave— y el
+    /// borrado, que es idempotente y trata la ausencia como el resultado que se
+    /// pedía.
+    ///
+    /// Se excluye `NoSuchBucket` a propósito: también viene con un 404, pero un
+    /// bucket que falta es un problema de configuración y no puede pasar por
+    /// «ese artefacto ya no estaba».
+    #[must_use]
+    pub fn es_ausencia(&self) -> bool {
+        matches!(
+            self,
+            Self::Servicio {
+                estado: 404,
+                codigo,
+                ..
+            } if codigo != "NoSuchBucket"
+        )
+    }
+}
+
 /// Cómo llega al núcleo un fallo contra R2.
 ///
 /// El mensaje es el de [`ErrorDeR2`], que ya está depurado; lo único que se
@@ -279,6 +302,35 @@ mod tests {
             })
             .code(),
             sb_plugin_sdk::tonic::Code::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn un_404_de_objeto_es_ausencia_y_uno_de_bucket_no() {
+        // El borrado idempotente y el `not_found` de la descarga cuelgan de
+        // esta distinción: un bucket que falta no puede pasar por «ese
+        // artefacto ya no estaba».
+        let servicio = |codigo: &str| ErrorDeR2::Servicio {
+            operacion: "GetObject",
+            estado: 404,
+            codigo: codigo.into(),
+        };
+        assert!(servicio("NoSuchKey").es_ausencia());
+        assert!(!servicio("NoSuchBucket").es_ausencia());
+        assert!(
+            !ErrorDeR2::Servicio {
+                operacion: "GetObject",
+                estado: 403,
+                codigo: "AccessDenied".into(),
+            }
+            .es_ausencia(),
+            "un 403 no dice que el objeto no exista, dice que no se puede mirar"
+        );
+        assert!(
+            !ErrorDeR2::Transporte {
+                operacion: "GetObject"
+            }
+            .es_ausencia()
         );
     }
 

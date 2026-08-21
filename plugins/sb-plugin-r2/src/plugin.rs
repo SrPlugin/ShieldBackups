@@ -1,5 +1,6 @@
 //! Los cinco RPC que todo plugin implementa.
 
+use aws_sdk_s3::primitives::ByteStream;
 use sb_plugin_sdk::sb_proto::plugin_server::Plugin;
 use sb_plugin_sdk::sb_proto::{
     Capability, Check, ConfigureRequest, ConfigureResponse, InfoRequest, InfoResponse,
@@ -88,10 +89,17 @@ impl Plugin for PluginR2 {
             }));
         };
 
-        let check = comprobar_bucket(&contexto).await;
+        // Los tres en orden de dependencia: sin bucket accesible los otros dos
+        // no dicen nada nuevo, pero se ejecutan igual porque `doctor` sirve
+        // para ver **todo** lo que está mal de una vez, no lo primero.
+        let checks = vec![
+            comprobar_bucket(&contexto).await,
+            comprobar_escritura(&contexto).await,
+            comprobar_listado(&contexto).await,
+        ];
         Ok(Response::new(PreflightResponse {
-            ok: check.ok,
-            checks: vec![check],
+            ok: checks.iter().all(|c| c.ok),
+            checks,
             server_version: format!("cloudflare-r2 ({})", contexto.config.endpoint()),
         }))
     }
@@ -136,5 +144,186 @@ async fn comprobar_bucket(contexto: &Contexto) -> Check {
                 contexto.config.account_id
             ),
         },
+    }
+}
+
+/// Prefijo bajo el que el preflight escribe su objeto de prueba.
+///
+/// Empieza por punto y se nombra a sí mismo para que, si alguna vez queda un
+/// residuo, quien mire el bucket sepa de dónde salió y que puede borrarlo.
+const PREFIJO_PREFLIGHT: &str = ".shieldbk-preflight";
+
+/// Contenido del objeto de prueba. Diminuto: lo que se comprueba es el
+/// permiso, no el ancho de banda.
+const CUERPO_PREFLIGHT: &[u8] = b"shieldbk preflight\n";
+
+/// La clave del objeto de prueba de este proceso.
+///
+/// Lleva el PID para que dos `doctor` a la vez —o uno en cada máquina— no se
+/// pisen el objeto y se borren la prueba el uno al otro.
+fn clave_de_prueba(contexto: &Contexto) -> String {
+    contexto
+        .config
+        .clave(&format!("{PREFIJO_PREFLIGHT}/{}", std::process::id()))
+}
+
+/// Comprueba que se puede **escribir de verdad**, subiendo un objeto diminuto
+/// y borrándolo después.
+///
+/// Es la única comprobación fiable, y por eso escribe en vez de preguntar. Un
+/// token con `s3:ListBucket` concedido y `s3:PutObject` denegado responde que
+/// sí a cualquier chequeo pasivo; una policy de bucket que exija SSE-KMS con
+/// una clave a la que el rol no llega, también. Las dos revientan en el primer
+/// `PUT`, a mitad del primer backup nocturno y con el volcado ya hecho.
+///
+/// Si el objeto se sube pero no se puede borrar, el check queda **en verde**
+/// con la advertencia en el detalle: lo que se venía a comprobar se comprobó, y
+/// lo único que queda es un objeto de veinte bytes que alguien tendrá que
+/// quitar.
+async fn comprobar_escritura(contexto: &Contexto) -> Check {
+    let clave = clave_de_prueba(contexto);
+    let bucket = &contexto.config.bucket;
+
+    if let Err(e) = contexto
+        .cliente
+        .put_object()
+        .bucket(bucket)
+        .key(&clave)
+        // Sin `storage_class`: va a la clase estándar aunque el destino esté
+        // configurado como `InfrequentAccess`, porque esa clase factura un
+        // mínimo de treinta días de almacenamiento y este objeto vive
+        // segundos. Lo que se comprueba es el permiso de escritura, y ese es
+        // el mismo para las dos clases.
+        .body(ByteStream::from_static(CUERPO_PREFLIGHT))
+        .send()
+        .await
+        .map_err(|e| crate::cliente::traducir("PutObject", &e))
+    {
+        return Check {
+            name: "escritura".into(),
+            ok: false,
+            detail: format!("no se pudo escribir `{clave}`: {e}"),
+            remediation: format!(
+                "dale al token de R2 permiso de escritura (`PutObject`) sobre `{bucket}`; si el bucket tiene una policy que exige cifrado con una clave gestionada, comprueba que el token puede usarla"
+            ),
+        };
+    }
+
+    // Escrito. A partir de aquí el check ya es verde: lo que falte es residuo,
+    // no un impedimento para hacer backups.
+    match crate::admin::borrar(contexto, &clave).await {
+        Ok(()) => Check {
+            name: "escritura".into(),
+            ok: true,
+            detail: format!("objeto de prueba escrito y borrado en `{bucket}`"),
+            remediation: String::new(),
+        },
+        Err(e) => Check {
+            name: "escritura".into(),
+            ok: true,
+            detail: format!(
+                "se pudo escribir en `{bucket}`, que es lo que se comprobaba, pero el objeto de prueba `{clave}` no se pudo borrar y queda ahí: {}",
+                e.message()
+            ),
+            remediation: format!(
+                "borra `{clave}` a mano y añade el permiso `DeleteObject` al token, que también lo necesita la retención"
+            ),
+        },
+    }
+}
+
+/// Comprueba que se puede listar el bucket.
+///
+/// Pide una sola clave: lo que se comprueba es el permiso, y traerse mil
+/// nombres para eso sería trabajo tirado. Sin listado no hay `verify --all` ni
+/// retención, aunque los backups se sigan escribiendo.
+async fn comprobar_listado(contexto: &Contexto) -> Check {
+    let bucket = &contexto.config.bucket;
+    match contexto
+        .cliente
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(contexto.config.clave(""))
+        .max_keys(1)
+        .send()
+        .await
+        .map_err(|e| crate::cliente::traducir("ListObjectsV2", &e))
+    {
+        Ok(_) => Check {
+            name: "listado".into(),
+            ok: true,
+            detail: format!("`{bucket}` se puede listar"),
+            remediation: String::new(),
+        },
+        Err(e) => Check {
+            name: "listado".into(),
+            ok: false,
+            detail: e.to_string(),
+            remediation: format!(
+                "dale al token de R2 permiso de listado (`ListBucket`) sobre `{bucket}`: sin él no hay `verify --all` ni retención, aunque los backups se sigan escribiendo"
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::R2Config;
+    use sb_plugin_sdk::sb_proto::{Value, value::Kind};
+    use std::collections::HashMap;
+
+    fn contexto(prefijo: &str) -> Contexto {
+        let valores: HashMap<String, Value> = [
+            ("account_id", "abc123"),
+            ("bucket", "backups"),
+            ("access_key_id", "AKIAEJEMPLO"),
+            ("secret_access_key", "secreta"),
+            ("prefix", prefijo),
+        ]
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                Value {
+                    kind: Some(Kind::StringValue(v.to_string())),
+                },
+            )
+        })
+        .collect();
+        let config = R2Config::from_values(&valores).unwrap();
+        let cliente = crate::cliente::construir(&config);
+        Contexto { config, cliente }
+    }
+
+    #[test]
+    fn el_objeto_de_prueba_vive_dentro_del_prefijo_configurado() {
+        // Escribir fuera del prefijo es escribir en el bucket de otro: el
+        // permiso del token puede estar acotado justo a este prefijo, y el
+        // preflight fallaría por escribir donde no le toca.
+        let clave = clave_de_prueba(&contexto("equipo/backups"));
+        assert!(
+            clave.starts_with("equipo/backups/"),
+            "la clave de prueba se salió del prefijo: {clave}"
+        );
+        assert!(clave.contains(PREFIJO_PREFLIGHT));
+    }
+
+    #[test]
+    fn dos_procesos_a_la_vez_no_se_pisan_el_objeto_de_prueba() {
+        // El PID es lo que lo evita; aquí solo se comprueba que está.
+        let clave = clave_de_prueba(&contexto(""));
+        assert!(
+            clave.ends_with(&std::process::id().to_string()),
+            "la clave de prueba no lleva el PID: {clave}"
+        );
+    }
+
+    #[test]
+    fn el_cuerpo_de_prueba_es_diminuto() {
+        // Se comprueba el permiso, no el ancho de banda: un preflight que
+        // subiera megabytes se ejecutaría menos veces de las que hace falta.
+        assert!(CUERPO_PREFLIGHT.len() < 128);
+        assert!(!CUERPO_PREFLIGHT.is_empty(), "un objeto vacío prueba menos");
     }
 }

@@ -23,15 +23,14 @@
 //! programa: multiplicar la concurrencia por cuatro también multiplica por
 //! cuatro la memoria, no solo la velocidad.
 
-use std::path::Path;
-
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
+use sb_plugin_sdk::EmisorProgreso;
 use sb_plugin_sdk::tonic::Status;
-use sb_plugin_sdk::{EmisorProgreso, connect_data};
 use tokio::net::UnixStream;
 use tokio::task::JoinSet;
 
+use crate::canal;
 use crate::cliente::{Contexto, ErrorDeR2, traducir};
 use crate::config::PARTES_MAXIMAS;
 use crate::trozos::Troceador;
@@ -52,16 +51,16 @@ pub async fn subir(
     socket: &str,
     progreso: &mut EmisorProgreso,
 ) -> Result<(), Status> {
-    let canal = conectar(socket).await?;
+    let datos = canal::conectar(socket).await?;
     let tamano_de_parte = contexto.config.part_size;
-    let mut troceador = Troceador::new(canal, tamano_de_parte);
+    let mut troceador = Troceador::new(datos, tamano_de_parte);
 
     // La primera parte decide el camino. Leerla es obligatorio de todas formas,
     // así que no cuesta nada.
     let primera = troceador
         .siguiente()
         .await
-        .map_err(|e| fallo_de_canal(&e))?
+        .map_err(|e| canal::fallo_de_lectura(&e))?
         .unwrap_or_default();
 
     // Objeto pequeño: una llamada en vez de tres, y ningún multipart que se
@@ -185,7 +184,7 @@ async fn subir_partes(
             None => match troceador
                 .siguiente()
                 .await
-                .map_err(|e| fallo_de_canal(&e))?
+                .map_err(|e| canal::fallo_de_lectura(&e))?
             {
                 Some(p) => p,
                 None => break,
@@ -353,18 +352,4 @@ async fn abortar(contexto: &Contexto, clave: &str, upload_id: &str) {
 /// La clase de almacenamiento configurada, en el tipo que espera el SDK.
 fn clase(contexto: &Contexto) -> StorageClass {
     StorageClass::from(contexto.config.storage_class.como_str())
-}
-
-/// Se conecta al canal de datos que creó el núcleo.
-async fn conectar(socket: &str) -> Result<UnixStream, Status> {
-    connect_data(Path::new(socket)).await.map_err(|e| {
-        Status::unavailable(format!(
-            "no se pudo abrir el canal de datos `{socket}`: {e}"
-        ))
-    })
-}
-
-/// Un fallo leyendo el canal de datos es del otro extremo, no de R2.
-fn fallo_de_canal(e: &std::io::Error) -> Status {
-    Status::unavailable(format!("fallo leyendo el canal de datos: {e}"))
 }

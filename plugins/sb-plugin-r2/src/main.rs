@@ -5,8 +5,12 @@
 //! el tamaño uniforme de las partes— está aislado en `cliente` y `config`, con
 //! el motivo escrito al lado.
 
+mod admin;
+mod canal;
+mod claves;
 mod cliente;
 mod config;
+mod get;
 mod plugin;
 mod put;
 mod storage;

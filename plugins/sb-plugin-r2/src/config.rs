@@ -351,6 +351,16 @@ impl R2Config {
         }
     }
 
+    /// El prefijo ya normalizado, sin barras en los extremos.
+    ///
+    /// Lo necesita `List` para hacer el camino de vuelta con
+    /// [`crate::claves::sin_prefijo`]: lo que R2 devuelve lleva el prefijo
+    /// puesto y el núcleo nunca lo escribió.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     #[must_use]
     pub fn access_key_id(&self) -> &str {
         &self.access_key_id
