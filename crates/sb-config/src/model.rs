@@ -251,16 +251,35 @@ impl Config {
     ///
     /// Devuelve [`ConfigError::TomlInvalido`] si el texto no es TOML válido,
     /// le falta un campo obligatorio o trae un campo desconocido;
-    /// [`ConfigError::SinTargets`] si no hay ningún `[[target]]`;
+    /// [`ConfigError::SinTargets`] si no hay ningún `[[target]]` —los comandos
+    /// que no respaldan nada usan [`Config::parse_sin_exigir_targets`]—;
     /// [`ConfigError::NombreDuplicado`] o [`ConfigError::NombreInvalido`] si
     /// los nombres de target no sirven, y [`ConfigError::ValorInvalido`] si un
     /// nivel de compresión está fuera de `1..=22`.
     pub fn parse(texto: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(texto)?;
-
+        let config = Self::parse_sin_exigir_targets(texto)?;
         if config.targets.is_empty() {
             return Err(ConfigError::SinTargets);
         }
+        Ok(config)
+    }
+
+    /// Igual que [`Config::parse`] pero **sin** exigir que haya targets.
+    ///
+    /// Existe para los comandos que solo necesitan la sección `[plugins]`:
+    /// registrar, verificar o listar los binarios de plugin no tiene nada que
+    /// ver con qué bases de datos se respaldan, y de hecho es lo que se hace
+    /// *antes* de decidirlo —al instalar, o al construir una imagen—. Exigir
+    /// ahí un `[[target]]` obliga a inventarse uno con un `recipient` falso.
+    ///
+    /// Todo lo demás se valida igual. Quien sí vaya a respaldar algo llama a
+    /// [`Config::parse`], que es la que exige los targets.
+    ///
+    /// # Errors
+    ///
+    /// Los mismos que [`Config::parse`] menos [`ConfigError::SinTargets`].
+    pub fn parse_sin_exigir_targets(texto: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(texto)?;
 
         valida_nivel(config.defaults.compression_level, "[defaults]")?;
 
@@ -462,6 +481,31 @@ recipient = "age1x"
             Config::parse("[plugins]\ndir = \"/x\"").unwrap_err(),
             ConfigError::SinTargets
         ));
+    }
+
+    #[test]
+    fn sin_exigir_targets_una_config_de_solo_plugins_es_valida() {
+        // Instalar plugins pasa antes que decidir qué se respalda: quien solo
+        // va a sellar el lockfile no tiene por qué inventarse un target.
+        let c = Config::parse_sin_exigir_targets("[plugins]\ndir = \"/opt/sb\"").unwrap();
+        assert!(c.targets.is_empty());
+        assert_eq!(c.plugins.dir, "/opt/sb");
+    }
+
+    #[test]
+    fn sin_exigir_targets_el_resto_de_la_validacion_sigue_en_pie() {
+        // Lo único que se relaja es la exigencia de targets. Un target mal
+        // escrito se sigue rechazando igual.
+        for malo in [
+            "[defaults]\ncompression_level = 99\n",
+            "[[target]]\nname = \"con/barra\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n",
+            "esto no es toml [[[",
+        ] {
+            assert!(
+                Config::parse_sin_exigir_targets(malo).is_err(),
+                "«{malo}» debería rechazarse igual que en `parse`"
+            );
+        }
     }
 
     #[test]

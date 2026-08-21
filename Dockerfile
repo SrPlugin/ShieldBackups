@@ -157,26 +157,13 @@ COPY --from=builder --chown=root:root --chmod=0555 \
 # nada, y un plugin sustituido en caliente (un volumen montado encima, un
 # `docker cp`) se detecta y se rechaza en el primer `backup`.
 #
-# La configuración de aquí es de usar y tirar: `plugin lock` solo mira el
-# directorio de plugins, pero el modelo de configuración exige al menos un
-# `[[target]]`, así que se le da uno y se borra el fichero en el mismo `RUN`.
+# La configuración de aquí es de usar y tirar y solo dice dónde están los
+# plugins: los comandos de `plugin` no necesitan ningún `[[target]]`.
 RUN set -eux; \
     printf '%s\n' \
       '[plugins]' \
       'dir = "/usr/lib/shieldbk/plugins"' \
       'lockfile = "/usr/lib/shieldbk/plugins.lock"' \
-      '' \
-      '[[target]]' \
-      'name = "build"' \
-      'engine = "mock"' \
-      'storage = "mock"' \
-      'recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"' \
-      '' \
-      '[target.engine_config]' \
-      'dir = "/tmp"' \
-      '' \
-      '[target.storage_config]' \
-      'dir = "/tmp"' \
       > /tmp/lock.toml; \
     shieldbk --config /tmp/lock.toml --format json plugin lock; \
     shieldbk --config /tmp/lock.toml plugin verify; \

@@ -444,3 +444,41 @@ fn walk(raiz: &std::path::Path) -> Vec<String> {
     encontrados.sort();
     encontrados
 }
+
+#[test]
+fn plugin_docs_funciona_con_una_config_de_solo_plugins() {
+    // `docs` pregunta al plugin qué campos acepta. Es justo lo que se consulta
+    // *antes* de escribir el primer `[[target]]`, así que no puede exigir uno.
+    let banco = Banco::nuevo();
+    banco.instalar_mock();
+    let config = banco.config_solo_plugins();
+
+    let lock = banco
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
+        .output()
+        .unwrap();
+    assert!(lock.status.success());
+
+    let salida = banco
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "plugin",
+            "docs",
+            "mock",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        salida.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&salida.stderr)
+    );
+    let texto = String::from_utf8_lossy(&salida.stdout).to_string();
+    for esperado in ["CAMPO", "dir", "seed", "size"] {
+        assert!(texto.contains(esperado), "falta «{esperado}»:\n{texto}");
+    }
+}

@@ -82,6 +82,23 @@ dir = {datos:?}
         ))
     }
 
+    /// Configuración con **solo** la sección `[plugins]`: ni un `[[target]]`.
+    ///
+    /// Es la que tiene quien acaba de instalar los plugins y todavía no ha
+    /// decidido qué bases de datos va a respaldar —el caso del `Dockerfile`,
+    /// que sella el lockfile durante el build—.
+    pub fn config_solo_plugins(&self) -> PathBuf {
+        self.config(&format!(
+            r"
+[plugins]
+dir = {dir:?}
+lockfile = {lock:?}
+",
+            dir = self.dir_plugins().to_string_lossy(),
+            lock = self.lockfile().to_string_lossy(),
+        ))
+    }
+
     /// El binario, con el entorno ya aislado.
     pub fn cmd(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_shieldbk"));

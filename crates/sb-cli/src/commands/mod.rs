@@ -27,8 +27,9 @@ use crate::output::Informe;
 pub async fn ejecutar(cli: &Cli) -> Result<Informe, CliError> {
     // La configuración se carga para todos los comandos, incluidos los de
     // `plugin`: el directorio de plugins y el lockfile salen de ahí, así que
-    // sin ella no se sabría ni dónde mirar.
-    let ctx = Contexto::cargar(cli)?;
+    // sin ella no se sabría ni dónde mirar. Lo que cambia entre unos y otros es
+    // cuánto le exigen (ver [`contexto`]).
+    let ctx = contexto(cli)?;
 
     match &cli.comando {
         Comando::Backup { target } => backup::ejecutar(&ctx, target.as_deref()).await,
@@ -50,5 +51,23 @@ pub async fn ejecutar(cli: &Cli) -> Result<Informe, CliError> {
         Comando::Storage { accion } => match accion {
             AccionStorage::Gc { target } => storage::gc(&ctx, target).await,
         },
+    }
+}
+
+/// El contexto que le toca a cada comando.
+///
+/// Los de `plugin` solo usan la sección `[plugins]`: registrar el hash de un
+/// binario, comprobarlo o listarlo no tiene nada que ver con qué bases de
+/// datos se respaldan, y es lo que se hace **antes** de decidirlo —al
+/// instalar, o al construir una imagen—. Los demás sí trabajan sobre targets y
+/// tienen que seguir exigiéndolos: un `backup` que arrancara con una
+/// configuración vacía no haría nada y terminaría diciendo que todo fue bien,
+/// que es peor que negarse.
+///
+/// El caso general es exigirlos, así que un comando nuevo lo hará por defecto.
+fn contexto(cli: &Cli) -> Result<Contexto, CliError> {
+    match &cli.comando {
+        Comando::Plugin { .. } => Contexto::cargar_sin_exigir_targets(cli),
+        _ => Contexto::cargar(cli),
     }
 }

@@ -305,3 +305,133 @@ recipient = "age1qqqqqqqqqq"
         "no puede haberse creado un directorio llamado literalmente «~»"
     );
 }
+
+// ── Instalar plugins es un paso anterior a configurar destinos ──────────────
+//
+// El lockfile solo depende del directorio de plugins, así que los comandos que
+// lo manejan tienen que funcionar con una configuración que todavía no declara
+// ningún `[[target]]`. Los que sí respaldan algo siguen exigiéndolos: la
+// distinción es justo lo que estos tests fijan.
+
+#[test]
+fn plugin_lock_funciona_con_una_config_de_solo_plugins() {
+    let banco = Banco::nuevo();
+    let config = banco.config_solo_plugins();
+    std::fs::write(banco.dir_plugins().join("sb-plugin-uno"), b"binario uno").unwrap();
+    std::fs::write(banco.dir_plugins().join("sb-plugin-dos"), b"binario dos").unwrap();
+
+    let salida = banco
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
+        .output()
+        .unwrap();
+
+    assert!(
+        salida.status.success(),
+        "sellar el lockfile no necesita ningún target; stderr: {}",
+        String::from_utf8_lossy(&salida.stderr)
+    );
+    let lock = std::fs::read_to_string(banco.lockfile()).unwrap();
+    assert!(
+        lock.contains("uno"),
+        "el lockfile debe registrar uno: {lock}"
+    );
+    assert!(
+        lock.contains("dos"),
+        "el lockfile debe registrar dos: {lock}"
+    );
+}
+
+#[test]
+fn plugin_verify_y_list_funcionan_con_una_config_de_solo_plugins() {
+    let banco = Banco::nuevo();
+    let config = banco.config_solo_plugins();
+    std::fs::write(banco.dir_plugins().join("sb-plugin-uno"), b"binario uno").unwrap();
+
+    let lock = banco
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
+        .output()
+        .unwrap();
+    assert!(lock.status.success());
+
+    let verify = banco
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--format",
+            "json",
+            "plugin",
+            "verify",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    assert_eq!(json_de(&verify.stdout)["fallidos"], 0);
+
+    let list = banco
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--format",
+            "json",
+            "plugin",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let json = json_de(&list.stdout);
+    assert_eq!(json["plugins"][0]["nombre"], "uno");
+    assert_eq!(json["plugins"][0]["estado"], "registrado");
+}
+
+#[test]
+fn backup_con_una_config_de_solo_plugins_sigue_exigiendo_targets() {
+    // Lo contrario sería peor que el problema que se arregla: un `backup` que
+    // arranca, no encuentra nada que respaldar y termina «bien».
+    let banco = Banco::nuevo();
+    let config = banco.config_solo_plugins();
+
+    let salida = banco
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+
+    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
+    let texto = String::from_utf8_lossy(&salida.stderr).to_lowercase();
+    assert!(
+        texto.contains("target"),
+        "el error debe decir que faltan targets: {texto}"
+    );
+}
+
+#[test]
+fn doctor_con_una_config_de_solo_plugins_sigue_exigiendo_targets() {
+    let banco = Banco::nuevo();
+    let config = banco.config_solo_plugins();
+
+    let salida = banco
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "doctor"])
+        .output()
+        .unwrap();
+
+    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
+    let texto = String::from_utf8_lossy(&salida.stderr).to_lowercase();
+    assert!(
+        texto.contains("target"),
+        "el error debe decir que faltan targets: {texto}"
+    );
+}

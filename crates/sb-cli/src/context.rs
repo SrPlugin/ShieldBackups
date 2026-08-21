@@ -28,12 +28,41 @@ pub struct Contexto {
 impl Contexto {
     /// Lee la configuración que pidió la línea de órdenes.
     ///
+    /// Exige al menos un `[[target]]`: es lo que necesitan los comandos que de
+    /// verdad respaldan o restauran algo. Los que solo miran el directorio de
+    /// plugins usan [`Contexto::cargar_sin_exigir_targets`].
+    ///
     /// # Errors
     /// Devuelve [`CliError::Config`] si el fichero no existe —el mensaje
     /// nombra la ruta exacta que se buscó, que es lo único que permite
     /// distinguir «me equivoqué de ruta» de «se me olvidó crearlo»—, si no se
     /// puede leer o si su contenido no es una configuración válida.
     pub fn cargar(cli: &Cli) -> Result<Self, CliError> {
+        Self::leer(cli, sb_config::Config::parse)
+    }
+
+    /// Igual, pero sin exigir que la configuración declare ningún target.
+    ///
+    /// Es para los comandos de `plugin`: el directorio de plugins y el
+    /// lockfile son lo único que miran, y registrar un binario es un paso de
+    /// instalación que ocurre **antes** de decidir qué bases de datos se
+    /// respaldan. Exigirles un `[[target]]` obliga a inventarse uno con un
+    /// `recipient` falso solo para poder sellar el lockfile.
+    ///
+    /// # Errors
+    /// Los mismos que [`Contexto::cargar`] menos «no hay targets».
+    pub fn cargar_sin_exigir_targets(cli: &Cli) -> Result<Self, CliError> {
+        Self::leer(cli, sb_config::Config::parse_sin_exigir_targets)
+    }
+
+    /// El cuerpo común: localizar el fichero, leerlo, interpretarlo con el
+    /// parser que corresponda y expandir las rutas. Lo único que cambia entre
+    /// las dos entradas es esa función, así que «expandir la tilde» sigue
+    /// teniendo una sola implementación.
+    fn leer(
+        cli: &Cli,
+        parsear: fn(&str) -> Result<Config, sb_config::ConfigError>,
+    ) -> Result<Self, CliError> {
         let ruta_config = cli
             .config
             .clone()
@@ -47,7 +76,7 @@ impl Contexto {
             ))
         })?;
 
-        let config = Config::parse(&texto).map_err(|fuente| {
+        let config = parsear(&texto).map_err(|fuente| {
             CliError::config(format!(
                 "la configuración «{}» no se pudo usar: {fuente}",
                 ruta_config.display()
