@@ -332,7 +332,7 @@ impl PluginClient {
 /// El mensaje a secas es lo que el plugin quiso decir y es lo que hay que
 /// enseñar; cuando viene vacío —le pasa a los errores de transporte, donde no
 /// hay nadie al otro lado que redacte nada— el código es lo único que informa.
-fn mensaje_de(status: &tonic::Status) -> String {
+pub(crate) fn mensaje_de(status: &tonic::Status) -> String {
     if status.message().is_empty() {
         format!("{:?}", status.code())
     } else {

@@ -13,6 +13,9 @@ workspace = true
 # lleva por delante a los nietos del plugin— con una API segura. La
 # alternativa, `libc::kill`, exigiría `unsafe`, y el workspace lo prohíbe.
 rustix = { version = "1.1.4", features = ["process"] }
+# El pipeline `zstd → age → SHA-256` vive en `sb-crypto`: el núcleo lo compone
+# entre los dos canales de datos, pero no reimplementa nada de él.
+sb-crypto = { version = "0.1.0", path = "../sb-crypto" }
 sb-proto = { version = "0.1.0", path = "../sb-proto" }
 sb-transport = { version = "0.1.0", path = "../sb-transport" }
 serde = { workspace = true }
@@ -37,4 +40,7 @@ tonic = "0.14.6"
 tracing.workspace = true
 
 [dev-dependencies]
+# El generador determinista del mock, para poder regenerar en el test lo que el
+# motor dijo haber producido y comparar digests en vez de creerle.
+sb-plugin-mock = { version = "0.1.0", path = "../../plugins/sb-plugin-mock" }
 tempfile = "3.27.0"

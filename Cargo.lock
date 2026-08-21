@@ -2453,6 +2453,8 @@ name = "sb-core"
 version = "0.1.0"
 dependencies = [
  "rustix",
+ "sb-crypto",
+ "sb-plugin-mock",
  "sb-proto",
  "sb-transport",
  "serde",
