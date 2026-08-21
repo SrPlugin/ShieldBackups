@@ -105,6 +105,13 @@ message ShutdownRequest {}
 message ShutdownResponse {}
 
 // Ruta del socket Unix por el que fluyen los bytes. El plugin se conecta a él.
+//
+// REQUISITO DEL PROTOCOLO: el plugin debe devolver la respuesta del RPC (las
+// cabeceras del stream) ANTES de empezar a escribir en el socket de datos, y
+// hacer el trabajo en una tarea aparte. Un plugin que escriba primero y
+// responda después bloquea al núcleo, que espera esa respuesta para poner en
+// marcha al otro extremo del pipeline. El SDK de Rust lo garantiza; un plugin
+// escrito sin él debe respetarlo explícitamente.
 message DumpRequest    { string data_socket = 1; }
 message RestoreRequest { string data_socket = 1; }
 
