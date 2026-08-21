@@ -1,0 +1,34 @@
+[package]
+name = "sb-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "shieldbk"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+sb-config = { version = "0.1.0", path = "../sb-config" }
+sb-core = { version = "0.1.0", path = "../sb-core" }
+sb-crypto = { version = "0.1.0", path = "../sb-crypto" }
+sb-proto = { version = "0.1.0", path = "../sb-proto" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = "0.3.55"
+tokio = { workspace = true }
+tonic = "0.14.6"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+sb-plugin-mock = { version = "0.1.0", path = "../../plugins/sb-plugin-mock" }
+tempfile = "3"

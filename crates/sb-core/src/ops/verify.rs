@@ -41,6 +41,37 @@ pub struct VerifyOutcome {
     pub bytes: u64,
 }
 
+/// Trae del destino el manifiesto que describe a `artifact_key`.
+///
+/// Es lo primero que hace [`ejecutar_verify`], y está aparte porque no es solo
+/// suyo: `restore` necesita el mismo manifiesto —para saber qué digest debe
+/// tener el artefacto que le sirvan— y sin esto tendría que repetir la regla de
+/// cómo se deriva la clave y cómo se interpreta el contenido.
+///
+/// # Errors
+/// Devuelve [`BackupError::SinManifiesto`] si no se pudo traer —el mensaje
+/// nombra la clave exacta que se buscó— o [`BackupError::Manifiesto`] si no se
+/// entiende.
+pub async fn leer_manifiesto(
+    storage: &PluginClient,
+    artifact_key: &str,
+) -> Result<Manifest, BackupError> {
+    let clave_manifiesto = manifest_key_de(artifact_key);
+    let crudo = descargar_blob(storage, &clave_manifiesto)
+        .await
+        .map_err(|fuente| BackupError::SinManifiesto {
+            plugin: storage.nombre().to_string(),
+            clave: clave_manifiesto.clone(),
+            motivo: fuente.to_string(),
+        })?;
+    let texto = String::from_utf8(crudo).map_err(|_| BackupError::SinManifiesto {
+        plugin: storage.nombre().to_string(),
+        clave: clave_manifiesto.clone(),
+        motivo: "no es texto UTF-8".to_string(),
+    })?;
+    Ok(Manifest::parse(&texto)?)
+}
+
 /// Descarga el artefacto y comprueba su digest contra el manifiesto.
 ///
 /// Que un artefacto no cuadre **no** es un error de esta función: es su
@@ -68,20 +99,7 @@ pub async fn ejecutar_verify(
 
     // 1. El manifiesto primero: es pequeño y es lo único que dice qué se
     //    espera. Va a memoria porque cabe; el artefacto no.
-    let clave_manifiesto = manifest_key_de(artifact_key);
-    let crudo = descargar_blob(storage, &clave_manifiesto)
-        .await
-        .map_err(|fuente| BackupError::SinManifiesto {
-            plugin: storage.nombre().to_string(),
-            clave: clave_manifiesto.clone(),
-            motivo: fuente.to_string(),
-        })?;
-    let texto = String::from_utf8(crudo).map_err(|_| BackupError::SinManifiesto {
-        plugin: storage.nombre().to_string(),
-        clave: clave_manifiesto.clone(),
-        motivo: "no es texto UTF-8".to_string(),
-    })?;
-    let manifiesto = Manifest::parse(&texto)?;
+    let manifiesto = leer_manifiesto(storage, artifact_key).await?;
 
     // 2. El artefacto se lee **en flujo**, contra un sumidero que lo tira. Lo
     //    único que interesa es lo que el hasher va acumulando por el camino:

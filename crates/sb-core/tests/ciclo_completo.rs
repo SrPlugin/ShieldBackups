@@ -354,3 +354,32 @@ async fn el_ciclo_completo_de_una_fuente_vacia() {
     motor.shutdown().await.unwrap();
     destino.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn el_manifiesto_se_puede_leer_sin_descargar_el_artefacto() {
+    // `restore` necesita el digest que el manifiesto promete **antes** de
+    // mover un byte, igual que `verify`. Que la lectura del manifiesto sea una
+    // operación propia es lo que evita que cada una tenga su propia idea de
+    // cómo se llama y de qué contiene.
+    let dir = tempfile::tempdir().unwrap();
+    let id = Identity::generate();
+    let (motor, destino) = preparar(dir.path(), 5, 32 * 1024).await;
+
+    let backup = ejecutar_backup(peticion(&motor, &destino, "manifiesto.age", &id))
+        .await
+        .unwrap();
+
+    let m = sb_core::ops::verify::leer_manifiesto(&destino, "manifiesto.age")
+        .await
+        .unwrap();
+    assert_eq!(m.artifact_key, "manifiesto.age");
+    assert_eq!(m.target, "prueba");
+    assert_eq!(
+        m.ciphertext_sha256,
+        backup.summary.ciphertext_sha256.to_hex()
+    );
+    assert_eq!(m.ciphertext_bytes, backup.summary.ciphertext_bytes);
+
+    motor.shutdown().await.unwrap();
+    destino.shutdown().await.unwrap();
+}

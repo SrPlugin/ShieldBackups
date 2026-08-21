@@ -19,6 +19,16 @@ pub enum AgeError {
     /// El artefacto no está dirigido a la identidad proporcionada.
     #[error("no se pudo descifrar: el artefacto no está dirigido a esta identidad")]
     IdentidadIncorrecta,
+    /// El texto no contiene una clave privada age.
+    ///
+    /// El mensaje no repite nada de lo que se le pasó **a propósito**: lo que
+    /// se estaba leyendo era una clave privada, y un error que la citara la
+    /// dejaría escrita en el log de quien se equivocó de fichero.
+    #[error(
+        "no se encontró ninguna clave privada age: se espera una línea `AGE-SECRET-KEY-1…`, \
+         como la que escribe `age-keygen`"
+    )]
+    IdentidadInvalida,
     /// Fallo de E/S sobre el flujo subyacente.
     #[error("error de E/S en el flujo cifrado: {0}")]
     Io(#[from] std::io::Error),
@@ -63,6 +73,41 @@ impl Identity {
     #[must_use]
     pub fn to_recipient(&self) -> Recipient {
         Recipient(self.0.to_public())
+    }
+
+    /// Lee una identidad del contenido de un fichero de clave age.
+    ///
+    /// Acepta el fichero entero tal y como lo escribe `age-keygen` —dos líneas
+    /// de comentario y la clave— y no solo la clave suelta: obligar a quien
+    /// restaura a recortar el fichero a mano, con la base de datos caída,
+    /// sería pedirle justo lo que no puede hacer bien en ese momento. Se queda
+    /// con la **primera** clave que encuentre, que es la única que hay en un
+    /// fichero generado así.
+    ///
+    /// # Errors
+    /// Devuelve [`AgeError::IdentidadInvalida`] si no hay ninguna línea que sea
+    /// una clave privada age. El error no cita nada del texto recibido.
+    pub fn parse(texto: &str) -> Result<Self, AgeError> {
+        texto
+            .lines()
+            .map(str::trim)
+            .filter(|linea| !linea.is_empty() && !linea.starts_with('#'))
+            .find_map(|linea| linea.parse::<age::x25519::Identity>().ok())
+            .map(Self)
+            .ok_or(AgeError::IdentidadInvalida)
+    }
+
+    /// La forma textual de la clave privada, envuelta para que no se pueda
+    /// imprimir por accidente.
+    ///
+    /// El envoltorio [`Secret`](crate::Secret) no es decorativo: es lo único
+    /// que separa «escribir un fichero de clave» de «dejar la clave en un log».
+    /// Quien la necesite de verdad tiene que pedir `expose()` explícitamente.
+    #[must_use]
+    pub fn to_secret_string(&self) -> crate::Secret<String> {
+        crate::Secret::new(
+            age::secrecy::ExposeSecret::expose_secret(&self.0.to_string()).to_owned(),
+        )
     }
 }
 
@@ -216,5 +261,60 @@ mod tests {
     fn un_recipient_invalido_se_rechaza() {
         assert!(Recipient::parse("esto-no-es-un-recipient").is_err());
         assert!(Recipient::parse("").is_err());
+    }
+
+    #[test]
+    fn una_identidad_da_la_vuelta_por_su_forma_textual() {
+        let id = Identity::generate();
+        let publica = id.to_recipient().to_string();
+        let texto = id.to_secret_string();
+        assert!(texto.expose().starts_with("AGE-SECRET-KEY-1"));
+
+        let leida = Identity::parse(texto.expose()).unwrap();
+        assert_eq!(
+            leida.to_recipient().to_string(),
+            publica,
+            "la identidad leída debe ser la misma que se escribió"
+        );
+    }
+
+    #[test]
+    fn un_fichero_de_clave_con_comentarios_se_lee_igual() {
+        // Es exactamente lo que escribe `age-keygen`: dos líneas de comentario
+        // con la fecha y la clave pública, y luego la clave.
+        let id = Identity::generate();
+        let fichero = format!(
+            "# created: 2026-08-21T10:00:00Z\n# public key: {}\n{}\n",
+            id.to_recipient(),
+            id.to_secret_string().expose()
+        );
+        assert_eq!(
+            Identity::parse(&fichero)
+                .unwrap()
+                .to_recipient()
+                .to_string(),
+            id.to_recipient().to_string()
+        );
+    }
+
+    #[test]
+    fn una_identidad_invalida_se_rechaza_sin_delatar_su_contenido() {
+        for malo in ["", "# solo comentarios\n", "AGE-SECRET-KEY-1NOESVALIDA"] {
+            // `unwrap_err` exigiría `Debug` en `Identity`, que no lo tiene a
+            // propósito. `err()` no exige nada del lado correcto.
+            let error = Identity::parse(malo).err().unwrap();
+            assert!(matches!(error, AgeError::IdentidadInvalida));
+            assert!(
+                !error.to_string().contains("AGE-SECRET-KEY-1NOESVALIDA"),
+                "el error no puede repetir lo que se le dio: era una clave privada"
+            );
+        }
+    }
+
+    #[test]
+    fn una_clave_publica_no_cuela_como_identidad() {
+        // El error de teclado más probable: pasar el `.pub` en vez de la clave.
+        let id = Identity::generate();
+        assert!(Identity::parse(&id.to_recipient().to_string()).is_err());
     }
 }
