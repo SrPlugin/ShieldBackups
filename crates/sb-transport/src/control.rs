@@ -29,7 +29,7 @@ use tower::service_fn;
 
 #[cfg(test)]
 use crate::pki::EphemeralPki;
-use crate::pki::SERVER_NAME;
+use crate::pki::{PkiError, SERVER_NAME};
 
 /// Fallos al levantar o usar el canal de control.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +43,27 @@ pub enum ControlError {
     /// Fallo del sistema de ficheros al preparar el socket.
     #[error("error de E/S: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Un fallo del material criptográfico visto desde el canal.
+///
+/// Quien pide un canal no puede hacer nada distinto según si lo que falló fue
+/// la CA o la clave del cliente: en ambos casos el canal no se abre. Se
+/// conserva el texto del error de PKI, que es donde está el detalle.
+impl From<PkiError> for ControlError {
+    fn from(fuente: PkiError) -> Self {
+        Self::Conexion(fuente.to_string())
+    }
+}
+
+impl ControlError {
+    /// Igual que la conversión, pero con nombre: en el sitio donde se llama
+    /// —montando la configuración TLS del cliente— `.into()` no dejaría claro
+    /// hacia qué se convierte.
+    #[must_use]
+    pub fn from_pki(fuente: PkiError) -> Self {
+        fuente.into()
+    }
 }
 
 /// Envoltorio sobre una conexión TLS en socket Unix.

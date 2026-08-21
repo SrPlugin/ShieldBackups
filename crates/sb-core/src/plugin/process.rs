@@ -471,7 +471,7 @@ fn borrar_directorio(dir: &Path) {
 /// Al grupo, no al proceso: es lo que se lleva por delante a los nietos. Como
 /// el plugin se lanzó con `process_group(0)`, el identificador del grupo es su
 /// propio pid, y el núcleo —que está en otro grupo— no se mata a sí mismo.
-fn matar_al_grupo(pid: u32) {
+pub(crate) fn matar_al_grupo(pid: u32) {
     let Ok(crudo) = i32::try_from(pid) else {
         return;
     };
@@ -494,6 +494,7 @@ fn matar_al_grupo(pid: u32) {
 )]
 mod tests {
     use super::*;
+    use crate::plugin::test_support::ruta_mock;
 
     #[tokio::test]
     async fn arranca_un_plugin_y_completa_el_handshake() {
@@ -622,48 +623,6 @@ mod tests {
         p.shutdown().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!es_zombie(pid), "el proceso quedó zombie");
-    }
-
-    /// Ruta del binario del plugin mock.
-    ///
-    /// `CARGO_BIN_EXE_*` solo lo define cargo para los binarios del **propio**
-    /// paquete, y el mock vive en otro. Como estos tests son unitarios —viven
-    /// en `src/`, no en `tests/`—, su ejecutable está siempre en
-    /// `target/<perfil>/deps/`, así que se sube un nivel para llegar al
-    /// `target/<perfil>/` donde cargo deja los binarios. Si el mock todavía no
-    /// está construido se construye una sola vez, para que este fichero se
-    /// pueda ejecutar aislado con `cargo test -p sb-core process`.
-    fn ruta_mock() -> std::path::PathBuf {
-        use std::ffi::OsStr;
-        use std::path::PathBuf;
-        use std::sync::LazyLock;
-
-        static MOCK: LazyLock<PathBuf> = LazyLock::new(|| {
-            let mut dir = std::env::current_exe().unwrap();
-            dir.pop();
-            if dir.ends_with("deps") {
-                dir.pop();
-            }
-            let binario = dir.join("sb-plugin-mock");
-            if !binario.is_file() {
-                let release = dir.file_name() == Some(OsStr::new("release"));
-                let mut cargo = std::process::Command::new(env!("CARGO"));
-                cargo.args(["build", "-p", "sb-plugin-mock"]);
-                if release {
-                    cargo.arg("--release");
-                }
-                let estado = cargo.status().unwrap();
-                assert!(estado.success(), "no se pudo construir el plugin mock");
-            }
-            assert!(
-                binario.is_file(),
-                "no se encontró el binario del plugin mock en {}",
-                binario.display()
-            );
-            binario
-        });
-
-        MOCK.clone()
     }
 
     /// Comprueba si un pid sigue vivo sin enviarle señal.

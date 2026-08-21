@@ -24,6 +24,9 @@ thiserror = { workspace = true }
 # hace falta activar nada extra solo para este crate.
 tokio.workspace = true
 toml = "1.1.4"
+# El canal de control es gRPC: el núcleo necesita el `Channel` de tonic para
+# construir los clientes generados en `sb-proto`.
+tonic = "0.14.6"
 tracing.workspace = true
 
 [dev-dependencies]
