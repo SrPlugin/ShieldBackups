@@ -1,20 +1,21 @@
-//! El destino R2. De momento solo sabe decir que todavía no sabe.
+//! El destino R2.
 //!
-//! Los cinco RPC están registrados —para que el núcleo vea la capacidad
-//! `storage` y `doctor` pueda hablar con el plugin— pero mover bytes llega en
-//! la tarea siguiente. Cada uno exige antes la configuración, así que un núcleo
-//! que se saltara `Configure` se entera por el primer RPC que haga y no por el
+//! `Put` ya sube de verdad —la lógica está en [`crate::put`], que es donde vive
+//! lo delicado del multipart—; los otros cuatro RPC llegan en la tarea
+//! siguiente. Cada uno exige antes la configuración, así que un núcleo que se
+//! saltara `Configure` se entera por el primer RPC que haga y no por el
 //! segundo.
 
-use sb_plugin_sdk::ProgresoStream;
 use sb_plugin_sdk::sb_proto::storage_server::Storage;
 use sb_plugin_sdk::sb_proto::{
     AbortIncompleteRequest, AbortIncompleteResponse, DeleteRequest, DeleteResponse, GetRequest,
     ListRequest, ListResponse, PutRequest,
 };
 use sb_plugin_sdk::tonic::{Request, Response, Status};
+use sb_plugin_sdk::{ProgresoStream, stream_de_progreso};
 
 use crate::cliente::Estado;
+use crate::put;
 
 pub struct DestinoR2 {
     estado: Estado,
@@ -36,11 +37,21 @@ impl Storage for DestinoR2 {
         &self,
         peticion: Request<PutRequest>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        // Lo que se puede saber antes de mover un byte se resuelve aquí, con un
+        // `?`: una vez arranca el trabajo, la respuesta del RPC ya se envió y el
+        // error solo tendría el flujo de progreso para volver.
         let contexto = self.estado.resuelta()?;
-        let clave = contexto.config.clave(&peticion.into_inner().key);
-        Err(Status::unimplemented(format!(
-            "el destino r2 todavía no sabe subir `{clave}`"
-        )))
+        let PutRequest { key, data_socket } = peticion.into_inner();
+        let clave = contexto.config.clave(&key);
+        // `stream_de_progreso` responde al RPC **antes** de que el trabajo
+        // toque el socket de datos, que es lo que el protocolo exige: el núcleo
+        // espera esa respuesta para poner en marcha el otro extremo.
+        Ok(stream_de_progreso(move |mut progreso| async move {
+            put::subir(&contexto, &clave, &data_socket, &mut progreso).await?;
+            progreso.terminar("artefacto almacenado").await;
+            tracing::info!(clave = %clave, bytes = progreso.bytes(), "artefacto almacenado en R2");
+            Ok(())
+        }))
     }
 
     async fn get(

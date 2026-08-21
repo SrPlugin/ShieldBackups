@@ -10,6 +10,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Region, RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use sb_plugin_sdk::tonic::Status;
 
 use crate::config::R2Config;
 
@@ -50,6 +51,29 @@ pub enum ErrorDeR2 {
     Respuesta { operacion: &'static str },
     #[error("`{operacion}` falló contra R2 por un motivo que este plugin no sabe clasificar")]
     Desconocido { operacion: &'static str },
+}
+
+/// Cómo llega al núcleo un fallo contra R2.
+///
+/// El mensaje es el de [`ErrorDeR2`], que ya está depurado; lo único que se
+/// añade es el código gRPC, para que el núcleo sepa si tiene sentido
+/// reintentar. Un 403 y un 500 de R2 no se parecen en nada desde el otro lado.
+impl From<ErrorDeR2> for Status {
+    fn from(e: ErrorDeR2) -> Self {
+        let texto = e.to_string();
+        match e {
+            ErrorDeR2::Servicio { estado, .. } => match estado {
+                401 | 403 => Self::permission_denied(texto),
+                404 => Self::not_found(texto),
+                // Un 5xx de R2 es el caso en el que reintentar sirve de algo.
+                500..=599 => Self::unavailable(texto),
+                _ => Self::internal(texto),
+            },
+            ErrorDeR2::Transporte { .. } => Self::unavailable(texto),
+            ErrorDeR2::Tiempo { .. } => Self::deadline_exceeded(texto),
+            _ => Self::internal(texto),
+        }
+    }
 }
 
 /// Traduce un error del SDK de AWS a uno nuestro, quedándose solo con lo que
@@ -215,5 +239,59 @@ mod tests {
         let texto = traducido.to_string();
         assert!(!texto.contains(SECRETO), "el secreto se filtró: {texto}");
         assert!(texto.contains("HeadBucket"), "debe decir qué operación fue");
+    }
+
+    #[test]
+    fn el_codigo_grpc_distingue_lo_reintentable_de_lo_que_no() {
+        // El núcleo decide con este código si reintentar; un 403 y un 500 de R2
+        // no se parecen en nada desde el otro lado.
+        let servicio = |estado| ErrorDeR2::Servicio {
+            operacion: "PutObject",
+            estado,
+            codigo: "X".into(),
+        };
+        assert_eq!(
+            Status::from(servicio(403)).code(),
+            sb_plugin_sdk::tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            Status::from(servicio(404)).code(),
+            sb_plugin_sdk::tonic::Code::NotFound
+        );
+        assert_eq!(
+            Status::from(servicio(503)).code(),
+            sb_plugin_sdk::tonic::Code::Unavailable
+        );
+        assert_eq!(
+            Status::from(servicio(400)).code(),
+            sb_plugin_sdk::tonic::Code::Internal
+        );
+        assert_eq!(
+            Status::from(ErrorDeR2::Transporte {
+                operacion: "PutObject"
+            })
+            .code(),
+            sb_plugin_sdk::tonic::Code::Unavailable
+        );
+        assert_eq!(
+            Status::from(ErrorDeR2::Tiempo {
+                operacion: "PutObject"
+            })
+            .code(),
+            sb_plugin_sdk::tonic::Code::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn el_status_que_viaja_al_nucleo_conserva_el_mensaje_depurado() {
+        let e = ErrorDeR2::Servicio {
+            operacion: "UploadPart",
+            estado: 403,
+            codigo: "AccessDenied".into(),
+        };
+        let texto = e.to_string();
+        let status = Status::from(e);
+        assert_eq!(status.message(), texto);
+        assert!(status.message().contains("UploadPart"));
     }
 }

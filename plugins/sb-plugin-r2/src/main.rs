@@ -8,7 +8,9 @@
 mod cliente;
 mod config;
 mod plugin;
+mod put;
 mod storage;
+mod trozos;
 
 use sb_plugin_sdk::PluginRuntime;
 
