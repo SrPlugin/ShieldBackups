@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# Plugin mínimo real, usado por tests/smoke.rs para ejercitar el arranque
+# completo: sobre por stdin, mTLS, anuncio por stdout y una llamada gRPC.
+# Vive bajo tests/ para no ensuciar src/ ni acabar en el paquete publicado.
+[[bin]]
+name = "sb-plugin-smoke"
+path = "tests/bin/smoke_plugin.rs"
+
 [lints]
 workspace = true
 
@@ -21,3 +28,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
