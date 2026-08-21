@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Digest SHA-256 de 32 bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,6 +98,58 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Sha256Writer<W> {
     }
 }
 
+/// Adaptador que hashea los bytes según se leen de la fuente.
+pub struct Sha256Reader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R> Sha256Reader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// Digest de todo lo leído hasta ahora. Solo es el digest completo del
+    /// flujo si ya se llegó al final.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        // Se clona el hasher en vez de consumirlo para poder consultar el
+        // digest a mitad de la lectura.
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(&self.hasher.clone().finalize());
+        Digest(out)
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Sha256Reader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        let antes = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                // Solo lo recién llenado en esta llamada, no el buffer entero:
+                // el `ReadBuf` puede llegar con contenido de otra capa del
+                // pipeline y hashearlo entero corrompería el digest.
+                this.hasher.update(&buf.filled()[antes..]);
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +218,32 @@ mod tests {
     fn un_hex_invalido_se_rechaza() {
         assert!(Digest::from_hex("no-es-hex").is_err());
         assert!(Digest::from_hex("ab").is_err()); // longitud incorrecta
+    }
+
+    #[tokio::test]
+    async fn el_reader_hashea_lo_que_lee() {
+        use tokio::io::AsyncReadExt;
+        let mut r = Sha256Reader::new(&b"abc"[..]);
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"abc");
+        assert_eq!(r.digest().to_hex(), SHA256_ABC);
+    }
+
+    #[tokio::test]
+    async fn reader_y_writer_producen_el_mismo_digest() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let datos = vec![7_u8; 100_000];
+
+        let mut w = Sha256Writer::new(Vec::new());
+        w.write_all(&datos).await.unwrap();
+        w.shutdown().await.unwrap();
+        let (_, d_write, _) = w.into_parts();
+
+        let mut r = Sha256Reader::new(&datos[..]);
+        let mut sink = Vec::new();
+        r.read_to_end(&mut sink).await.unwrap();
+
+        assert_eq!(d_write, r.digest());
     }
 }
