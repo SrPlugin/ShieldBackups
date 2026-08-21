@@ -16,6 +16,8 @@ use sb_transport::{Bootstrap, MAGIC, Ready, serve_control_routes, server_config_
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tonic::service::Routes;
 
+use crate::cierre::{PluginConCierre, SenalDeCierre};
+
 /// Cuánto se espera a que el socket de control aparezca antes de rendirse.
 /// Anunciarse antes de estar escuchando hace que el núcleo falle al conectar,
 /// así que se espera; pero se espera **acotado**, para que un fallo al enlazar
@@ -23,6 +25,14 @@ use tonic::service::Routes;
 const ESPERA_SOCKET: Duration = Duration::from_secs(2);
 /// Granularidad del sondeo del socket.
 const SONDEO_SOCKET: Duration = Duration::from_millis(10);
+/// Margen entre atender un `Shutdown` y cerrar el canal de control.
+///
+/// El cuerpo del RPC ya devolvió, pero la respuesta todavía tiene que salir por
+/// el socket: cerrar en ese instante le parecería al núcleo un error de
+/// transporte justo en el cierre correcto. Sobre un socket Unix la respuesta
+/// sale en microsegundos, así que este margen es holgado a propósito y solo se
+/// paga una vez, al final de la vida del plugin.
+const GRACIA_CIERRE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
@@ -129,7 +139,11 @@ impl<P: Plugin> PluginRuntime<P> {
         self
     }
 
-    /// Ejecuta el plugin hasta que el núcleo cierre el canal.
+    /// Ejecuta el plugin hasta que el núcleo lo cierre.
+    ///
+    /// Termina cuando el núcleo llama a `Shutdown` —el SDK lo intercepta, así
+    /// que el plugin no tiene que hacer nada para que su proceso muera— o
+    /// cuando el canal de control se cae por su cuenta.
     ///
     /// El logging va a **stderr**: stdout está reservado para la línea del
     /// handshake, y cualquier otra cosa ahí rompe el arranque.
@@ -151,7 +165,14 @@ impl<P: Plugin> PluginRuntime<P> {
         let motor = self.motor.is_some();
         let destino = self.destino.is_some();
 
-        let mut rutas = Routes::new(PluginServer::new(self.plugin));
+        // El servicio Plugin va envuelto: `Shutdown` se atiende primero en la
+        // implementación del plugin y después termina el proceso, sin que el
+        // plugin tenga que colaborar ni pueda olvidarse.
+        let cierre = SenalDeCierre::default();
+        let mut rutas = Routes::new(PluginServer::new(PluginConCierre::nuevo(
+            self.plugin,
+            cierre.clone(),
+        )));
         if let Some(registrar) = self.motor {
             rutas = registrar(rutas);
         }
@@ -184,9 +205,19 @@ impl<P: Plugin> PluginRuntime<P> {
             std::process::id(),
         ))?;
 
-        match servidor.await {
-            Ok(resultado) => Ok(resultado?),
-            Err(e) => Err(SdkError::TareaDelServidor(e.to_string())),
+        tokio::select! {
+            resultado = &mut servidor => match resultado {
+                Ok(resultado) => Ok(resultado?),
+                Err(e) => Err(SdkError::TareaDelServidor(e.to_string())),
+            },
+            () = cierre.esperar() => {
+                // La respuesta del `Shutdown` va camino del núcleo: se le deja
+                // salir antes de tirar el canal.
+                tokio::time::sleep(GRACIA_CIERRE).await;
+                tracing::info!("cierre solicitado por el núcleo; el plugin termina");
+                servidor.abort();
+                Ok(())
+            }
         }
     }
 }

@@ -1,92 +1,25 @@
-//! Mover bytes por el canal de datos informando del avance.
+//! Mover bytes entre el canal de datos y el disco.
 //!
-//! Los cinco RPC que mueven bytes —`Dump`, `Restore`, `Put`, `Get`— comparten
-//! la misma forma: devolver un flujo de `Progress` mientras una tarea de fondo
-//! bombea bytes entre el socket y un fichero. Esa forma vive aquí una sola vez.
+//! El armazón de los RPC que mueven bytes —la tarea de fondo y el flujo de
+//! `Progress`— lo pone el SDK con `stream_de_progreso`. Lo que queda aquí es lo
+//! único que es de este plugin: bombear bytes entre el socket y un fichero.
 
-use std::future::Future;
 use std::path::Path;
 
-use sb_plugin_sdk::sb_proto::Progress;
 use sb_plugin_sdk::tonic::Status;
-use sb_transport::connect_data;
+use sb_plugin_sdk::{EmisorProgreso, connect_data};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use tokio_stream::wrappers::ReceiverStream;
 
-/// Cada cuántos bytes se emite un `Progress`.
-const MIB: u64 = 1024 * 1024;
 /// Tamaño de los trozos que se mueven de una vez.
+///
+/// Más pequeño que el hito de progreso del SDK a propósito: un trozo mayor
+/// saltaría hitos enteros y el progreso daría saltos en vez de fluir.
 pub const TROZO: usize = 64 * 1024;
-/// Cuántos `Progress` caben sin consumir antes de frenar a la tarea.
-///
-/// Hay backpressure a propósito: un núcleo que no lee el progreso es un núcleo
-/// que tampoco está leyendo los datos, y seguir generando no ayudaría.
-const CAPACIDAD: usize = 64;
 
-/// El flujo de `Progress` que devuelven los RPC de datos.
-pub type FlujoProgreso = ReceiverStream<Result<Progress, Status>>;
-
-/// Contador de bytes que emite un `Progress` cada mebibyte.
-pub struct Progreso {
-    tx: tokio::sync::mpsc::Sender<Result<Progress, Status>>,
-    bytes: u64,
-    hitos: u64,
-}
-
-impl Progreso {
-    /// Anota `n` bytes movidos y emite un `Progress` si se cruzó un mebibyte.
-    pub async fn avanzar(&mut self, n: usize) {
-        self.bytes += como_u64(n);
-        let hitos = self.bytes / MIB;
-        if hitos > self.hitos {
-            self.hitos = hitos;
-            self.emitir("en curso").await;
-        }
-    }
-
-    /// Emite el `Progress` final con el total movido.
-    pub async fn terminar(&mut self, mensaje: &str) {
-        self.emitir(mensaje).await;
-    }
-
-    async fn emitir(&self, mensaje: &str) {
-        // Un envío fallido significa que el núcleo cerró el flujo; no es un
-        // error del plugin y no debe abortar la transferencia en curso.
-        let _ = self
-            .tx
-            .send(Ok(Progress {
-                bytes: self.bytes,
-                message: mensaje.into(),
-            }))
-            .await;
-    }
-}
-
-/// Lanza `trabajo` en segundo plano y devuelve el flujo de progreso que emite.
-///
-/// Si el trabajo falla, el `Status` viaja por el mismo flujo: el núcleo se
-/// entera del fallo por donde ya está escuchando.
-pub fn servir<F, Fut>(trabajo: F) -> FlujoProgreso
-where
-    F: FnOnce(Progreso) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(), Status>> + Send + 'static,
-{
-    let (tx, rx) = tokio::sync::mpsc::channel(CAPACIDAD);
-    let tx_error = tx.clone();
-    tokio::spawn(async move {
-        let progreso = Progreso {
-            tx,
-            bytes: 0,
-            hitos: 0,
-        };
-        if let Err(e) = trabajo(progreso).await {
-            tracing::warn!(error = %e, "la transferencia falló");
-            let _ = tx_error.send(Err(e)).await;
-        }
-    });
-    ReceiverStream::new(rx)
-}
+/// El hito del SDK, atado con este nombre para poder compararlo con `TROZO`.
+#[cfg(test)]
+use sb_plugin_sdk::progreso::HITO as MIB;
 
 /// Se conecta al canal de datos que creó el núcleo.
 ///
@@ -111,7 +44,7 @@ pub async fn conectar(socket: &str) -> Result<UnixStream, Status> {
 pub async fn del_canal_al_fichero(
     socket: &str,
     destino: &Path,
-    progreso: &mut Progreso,
+    progreso: &mut EmisorProgreso,
 ) -> Result<(), Status> {
     // Conectar primero: si el canal no está, no tiene sentido dejar atrás un
     // fichero vacío que luego parecería un artefacto de cero bytes.
@@ -156,7 +89,7 @@ pub async fn del_canal_al_fichero(
 pub async fn del_fichero_al_canal(
     socket: &str,
     origen: &Path,
-    progreso: &mut Progreso,
+    progreso: &mut EmisorProgreso,
 ) -> Result<(), Status> {
     let mut fichero = tokio::fs::File::open(origen)
         .await
@@ -203,8 +136,9 @@ pub async fn cerrar(canal: &mut UnixStream) -> Result<(), Status> {
         .map_err(|e| Status::unavailable(format!("fallo cerrando el canal de datos: {e}")))
 }
 
-/// `usize` a `u64` sin un `as` que clippy tenga que perdonar. En las
-/// plataformas que soporta el proyecto la conversión nunca satura.
+/// `usize` a `u64` sin un `as` que clippy tenga que perdonar. Solo la usa la
+/// comprobación de abajo: el conteo de bytes lo lleva el SDK.
+#[cfg(test)]
 fn como_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }

@@ -22,6 +22,7 @@ tonic = "0.14"
 # `io-std` no está en las features del workspace: solo el SDK lee stdin de forma
 # asíncrona, porque solo un plugin recibe su sobre de arranque por ahí.
 tokio = { workspace = true, features = ["io-std"] }
+tokio-stream = "0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

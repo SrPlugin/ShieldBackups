@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
 
+use sb_plugin_sdk::Configurado;
 use sb_plugin_sdk::sb_proto::{Field, FieldType, Value, value::Kind};
 use sb_plugin_sdk::tonic::Status;
 
@@ -116,37 +116,12 @@ fn entero(mapa: &HashMap<String, Value>, nombre: &str) -> Result<Option<i64>, St
 
 /// La configuración compartida entre los tres servicios del plugin.
 ///
-/// `Configure` la escribe y el motor y el destino la leen. Antes de que se
-/// escriba **no hay valores por defecto silenciosos**: leerla falla, porque un
+/// `Configure` la escribe y el motor y el destino la leen. El SDK pone el
+/// almacén y la regla de «antes de `Configure` no hay valores por defecto
+/// silenciosos»: leerla sin configurar da `failed_precondition`, porque un
 /// volcado que se escribiera en un directorio que nadie pidió es peor que un
 /// error claro.
-#[derive(Clone, Default)]
-pub struct Estado(Arc<Mutex<Option<Config>>>);
-
-impl Estado {
-    pub fn guardar(&self, config: Config) {
-        // Un mutex envenenado significa que otro hilo panicó teniéndolo; el
-        // dato de dentro sigue siendo un `Option<Config>` válido, así que se
-        // recupera en vez de propagar el pánico a todo el plugin.
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(config);
-    }
-
-    /// La configuración actual.
-    ///
-    /// # Errors
-    /// [`Status::failed_precondition`] si todavía no se llamó a `Configure`.
-    pub fn resuelta(&self) -> Result<Config, Status> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| {
-                Status::failed_precondition(
-                    "el plugin mock aún no está configurado: llama a Configure antes de cualquier RPC de datos",
-                )
-            })
-    }
-}
+pub type Estado = Configurado<Config>;
 
 #[cfg(test)]
 mod tests {

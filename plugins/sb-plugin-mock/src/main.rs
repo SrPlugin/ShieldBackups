@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Un único estado compartido: `Configure` llega por el servicio Plugin y
     // lo leen el motor y el destino. Sin él, cada servicio tendría su propia
     // idea de dónde está `dir`.
-    let estado = config::Estado::default();
+    let estado = config::Estado::nuevo(plugin::NOMBRE);
     PluginRuntime::new(plugin::PluginMock::new(estado.clone()))
         .con_motor(engine::MotorMock::new(estado.clone()))
         .con_destino(storage::DestinoMock::new(estado))

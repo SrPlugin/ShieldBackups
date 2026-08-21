@@ -10,9 +10,10 @@ use sb_plugin_mock::datos_deterministas;
 use sb_plugin_sdk::sb_proto::engine_server::Engine;
 use sb_plugin_sdk::sb_proto::{DumpRequest, RestoreRequest};
 use sb_plugin_sdk::tonic::{Request, Response, Status};
+use sb_plugin_sdk::{EmisorProgreso, ProgresoStream, stream_de_progreso};
 
 use crate::config::{Config, Estado};
-use crate::flujo::{self, FlujoProgreso, Progreso};
+use crate::flujo;
 
 /// Nombre del fichero donde `Restore` deja lo que recibe.
 pub const FICHERO_RESTAURADO: &str = "restore.bin";
@@ -30,8 +31,8 @@ impl MotorMock {
 
 #[sb_plugin_sdk::tonic::async_trait]
 impl Engine for MotorMock {
-    type DumpStream = FlujoProgreso;
-    type RestoreStream = FlujoProgreso;
+    type DumpStream = ProgresoStream;
+    type RestoreStream = ProgresoStream;
 
     async fn dump(
         &self,
@@ -42,9 +43,9 @@ impl Engine for MotorMock {
         // volcado silencioso con valores que nadie pidió.
         let config = self.estado.resuelta()?;
         let socket = peticion.into_inner().data_socket;
-        Ok(Response::new(flujo::servir(
-            move |mut progreso| async move { volcar(&socket, &config, &mut progreso).await },
-        )))
+        Ok(stream_de_progreso(move |mut progreso| async move {
+            volcar(&socket, &config, &mut progreso).await
+        }))
     }
 
     async fn restore(
@@ -54,14 +55,18 @@ impl Engine for MotorMock {
         let config = self.estado.resuelta()?;
         let socket = peticion.into_inner().data_socket;
         let destino = config.dir.join(FICHERO_RESTAURADO);
-        Ok(Response::new(flujo::servir(
-            move |mut progreso| async move { restaurar(&socket, &destino, &mut progreso).await },
-        )))
+        Ok(stream_de_progreso(move |mut progreso| async move {
+            restaurar(&socket, &destino, &mut progreso).await
+        }))
     }
 }
 
 /// Escribe `size` bytes de la semilla en el canal y lo cierra.
-async fn volcar(socket: &str, config: &Config, progreso: &mut Progreso) -> Result<(), Status> {
+async fn volcar(
+    socket: &str,
+    config: &Config,
+    progreso: &mut EmisorProgreso,
+) -> Result<(), Status> {
     let mut canal = flujo::conectar(socket).await?;
     let mut generador = datos_deterministas(config.seed, config.size);
     loop {
@@ -79,7 +84,11 @@ async fn volcar(socket: &str, config: &Config, progreso: &mut Progreso) -> Resul
     Ok(())
 }
 
-async fn restaurar(socket: &str, destino: &Path, progreso: &mut Progreso) -> Result<(), Status> {
+async fn restaurar(
+    socket: &str,
+    destino: &Path,
+    progreso: &mut EmisorProgreso,
+) -> Result<(), Status> {
     flujo::del_canal_al_fichero(socket, destino, progreso).await?;
     progreso.terminar("restauración completada").await;
     tracing::info!(destino = %destino.display(), "restauración escrita");

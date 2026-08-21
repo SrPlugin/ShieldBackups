@@ -10,10 +10,11 @@ use sb_plugin_sdk::sb_proto::{
     GetRequest, ListRequest, ListResponse, PutRequest,
 };
 use sb_plugin_sdk::tonic::{Request, Response, Status};
+use sb_plugin_sdk::{ProgresoStream, stream_de_progreso};
 
 use crate::claves;
 use crate::config::Estado;
-use crate::flujo::{self, FlujoProgreso};
+use crate::flujo;
 
 pub struct DestinoMock {
     estado: Estado,
@@ -28,8 +29,8 @@ impl DestinoMock {
 
 #[sb_plugin_sdk::tonic::async_trait]
 impl Storage for DestinoMock {
-    type PutStream = FlujoProgreso;
-    type GetStream = FlujoProgreso;
+    type PutStream = ProgresoStream;
+    type GetStream = ProgresoStream;
 
     async fn put(
         &self,
@@ -41,14 +42,12 @@ impl Storage for DestinoMock {
         // error inmediato del RPC, no como un error a mitad del flujo cuando
         // ya se escribió algo fuera del directorio.
         let destino = claves::ruta_de(&config.dir, &key)?;
-        Ok(Response::new(flujo::servir(
-            move |mut progreso| async move {
-                flujo::del_canal_al_fichero(&data_socket, &destino, &mut progreso).await?;
-                progreso.terminar("artefacto almacenado").await;
-                tracing::info!(clave = %key, "artefacto almacenado");
-                Ok(())
-            },
-        )))
+        Ok(stream_de_progreso(move |mut progreso| async move {
+            flujo::del_canal_al_fichero(&data_socket, &destino, &mut progreso).await?;
+            progreso.terminar("artefacto almacenado").await;
+            tracing::info!(clave = %key, "artefacto almacenado");
+            Ok(())
+        }))
     }
 
     async fn get(
@@ -66,13 +65,11 @@ impl Storage for DestinoMock {
                 config.dir.display()
             )));
         }
-        Ok(Response::new(flujo::servir(
-            move |mut progreso| async move {
-                flujo::del_fichero_al_canal(&data_socket, &origen, &mut progreso).await?;
-                progreso.terminar("artefacto entregado").await;
-                Ok(())
-            },
-        )))
+        Ok(stream_de_progreso(move |mut progreso| async move {
+            flujo::del_fichero_al_canal(&data_socket, &origen, &mut progreso).await?;
+            progreso.terminar("artefacto entregado").await;
+            Ok(())
+        }))
     }
 
     async fn list(&self, peticion: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
