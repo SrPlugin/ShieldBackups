@@ -5,6 +5,21 @@ use zeroize::Zeroize;
 /// No implementa `Debug` ni `Display` a propósito: si algo intenta imprimir un
 /// secreto, el resultado debe ser un error de compilación, no una línea de log.
 /// El contenido se borra de memoria al destruirse el valor.
+///
+/// # Qué garantiza y qué no
+///
+/// Garantiza que una credencial no pueda acabar en un log por accidente, y que
+/// el valor que este contenedor posee se borre al destruirse.
+///
+/// **No** garantiza que ninguna copia sobreviva en memoria. Un `String` que
+/// realoca al crecer deja atrás su buffer anterior sin borrar, y clonar un
+/// `Secret` crea una asignación nueva e independiente. Construye el valor con
+/// su capacidad final siempre que puedas, y no des por hecho más protección de
+/// la que hay.
+///
+/// La comparación con `PartialEq` es de tiempo constante en el contenido, pero
+/// devuelve antes si las longitudes difieren: filtra la longitud, no el valor.
+/// Es el comportamiento estándar para comparar credenciales.
 #[derive(Clone)]
 pub struct Secret<T: Zeroize>(T);
 
