@@ -9,7 +9,7 @@ pub mod data;
 pub mod handshake;
 pub mod pki;
 
-pub use control::{ControlError, connect_control, serve_control};
+pub use control::{ControlError, connect_control, serve_control, serve_control_routes};
 pub use data::{DataChannel, connect_data};
 pub use handshake::{Bootstrap, HANDSHAKE_VERSION, HandshakeError, MAGIC, READY_TIMEOUT_MS, Ready};
 pub use pki::{
