@@ -1,0 +1,6 @@
+/target
+*.lock.bak
+.env
+
+# Material de trabajo interno: nunca va al repositorio.
+/docs/
