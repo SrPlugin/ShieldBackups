@@ -68,14 +68,25 @@ pub fn v_int(i: i64) -> sb_proto::Value {
     }
 }
 
+/// Arranca un plugin mock **sin configurarlo**.
+///
+/// Aparte para los tests de `doctor`, que necesitan justo eso: un plugin vivo
+/// al que todavía nadie ha dicho sobre qué trabajar.
+pub async fn arrancar(nombre: &str) -> PluginClient {
+    PluginClient::start(nombre, &ruta_mock()).await.unwrap()
+}
+
+/// Le dice al mock sobre qué directorio trabajar, sin semilla ni tamaño.
+pub async fn configurar(cliente: &PluginClient, dir: &Path) {
+    let mut cfg = HashMap::new();
+    cfg.insert("dir".into(), v_str(dir.to_string_lossy()));
+    cliente.configure(cfg).await.unwrap();
+}
+
 /// Arranca motor y destino ya configurados sobre el mismo directorio.
 pub async fn preparar(dir: &Path, seed: i64, size: i64) -> (PluginClient, PluginClient) {
-    let motor = PluginClient::start("mock-engine", &ruta_mock())
-        .await
-        .unwrap();
-    let destino = PluginClient::start("mock-storage", &ruta_mock())
-        .await
-        .unwrap();
+    let motor = arrancar("mock-engine").await;
+    let destino = arrancar("mock-storage").await;
 
     let mut cfg_m = HashMap::new();
     cfg_m.insert("dir".into(), v_str(dir.to_string_lossy()));
@@ -83,11 +94,38 @@ pub async fn preparar(dir: &Path, seed: i64, size: i64) -> (PluginClient, Plugin
     cfg_m.insert("size".into(), v_int(size));
     motor.configure(cfg_m).await.unwrap();
 
-    let mut cfg_d = HashMap::new();
-    cfg_d.insert("dir".into(), v_str(dir.to_string_lossy()));
-    destino.configure(cfg_d).await.unwrap();
+    configurar(&destino, dir).await;
 
     (motor, destino)
+}
+
+/// Mata al plugin por las bravas y **espera a que de verdad esté muerto**.
+///
+/// Simula lo que en producción es un plugin que se cae a media faena: el
+/// handle sigue existiendo y el canal sigue abierto, pero al otro lado ya no
+/// hay nadie. Sin la espera el test sería una carrera —`kill` vuelve antes de
+/// que el proceso termine—, así que se sondea el socket de control: mientras
+/// alguien escuche, conectarse funciona; en cuanto el proceso muere, el núcleo
+/// rechaza la conexión y no hay duda posible.
+///
+/// El `shutdown` del handle sigue haciendo falta después: es quien recoge al
+/// hijo y borra su directorio.
+pub async fn matar(cliente: &PluginClient) {
+    let pid = i32::try_from(cliente.proceso().pid()).unwrap();
+    let objetivo = rustix::process::Pid::from_raw(pid).unwrap();
+    rustix::process::kill_process_group(objetivo, rustix::process::Signal::KILL).unwrap();
+
+    let socket = cliente.proceso().control_socket().to_path_buf();
+    for _ in 0..500 {
+        if tokio::net::UnixStream::connect(&socket).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "el plugin «{}» siguió aceptando conexiones",
+        cliente.nombre()
+    );
 }
 
 pub fn peticion<'a>(
