@@ -1,0 +1,5 @@
+# `unwrap`/`expect` están prohibidos en código de producción (ver
+# workspace.lints.clippy), pero en un test son la forma correcta de afirmar
+# que una operación no falla.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
