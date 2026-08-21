@@ -2002,6 +2002,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "sb-core"
 version = "0.1.0"
 dependencies = [
