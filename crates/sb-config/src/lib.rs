@@ -7,8 +7,10 @@
 
 pub mod model;
 pub mod secrets;
+pub mod validate;
 
 pub use model::{
     Config, ConfigError, ConfigTable, ConfigValue, Defaults, PluginsConfig, SecretRef, Target,
 };
 pub use secrets::{SecretError, resolver};
+pub use validate::{ValidationError, validar_y_convertir};
