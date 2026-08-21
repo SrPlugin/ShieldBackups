@@ -54,11 +54,22 @@ pub struct Manifest {
     pub encryption: EncryptionInfo,
 }
 
+/// Clave del manifiesto que acompaña al artefacto guardado bajo `artifact_key`.
+///
+/// Es una función suelta y no solo un método porque `verify` necesita esta
+/// clave **antes** de tener el manifiesto: lo primero que hace es descargarlo.
+/// Si la regla estuviera solo dentro de [`Manifest`], la operación tendría que
+/// repetir el `format!` y el día que el sufijo cambiara habría dos verdades.
+#[must_use]
+pub fn manifest_key_de(artifact_key: &str) -> String {
+    format!("{artifact_key}.manifest.json")
+}
+
 impl Manifest {
     /// Clave del manifiesto en el destino, derivada de la del artefacto.
     #[must_use]
     pub fn manifest_key(&self) -> String {
-        format!("{}.manifest.json", self.artifact_key)
+        manifest_key_de(&self.artifact_key)
     }
 
     /// # Errors

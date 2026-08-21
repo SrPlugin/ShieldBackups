@@ -11,106 +11,16 @@
 //! destino. Un fallo en ese camino no lo ve ningún test unitario, y se
 //! manifestaría como un artefacto que no se puede restaurar.
 
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::path::PathBuf;
-use std::sync::LazyLock;
+mod comun;
+
+use comun::{peticion, preparar};
 
 use sb_core::ops::backup::{BackupRequest, ejecutar_backup};
-use sb_core::plugin::PluginClient;
-use sb_crypto::{CompressionLevel, Identity};
+use sb_crypto::Identity;
 // Arriba y no dentro de cada test: `clippy::pedantic` prohíbe declarar items
 // después de las sentencias, y `shutdown` sobre el `Sha256Writer` lo necesitan
 // varios de ellos.
 use tokio::io::AsyncWriteExt as _;
-
-/// Ruta del binario del plugin mock.
-///
-/// `CARGO_BIN_EXE_*` solo lo define cargo para los binarios del **propio**
-/// paquete, y el mock vive en otro. Se localiza junto al ejecutable del test
-/// —cargo deja ambos bajo el mismo `target/<perfil>/`— y, si todavía no está
-/// construido, se construye una sola vez para que este fichero se pueda
-/// ejecutar aislado con `cargo test -p sb-core --test backup_mock`.
-fn ruta_mock() -> PathBuf {
-    static MOCK: LazyLock<PathBuf> = LazyLock::new(|| {
-        let mut dir = std::env::current_exe().unwrap();
-        dir.pop();
-        if dir.ends_with("deps") {
-            dir.pop();
-        }
-        let binario = dir.join("sb-plugin-mock");
-        if !binario.is_file() {
-            let release = dir.file_name() == Some(OsStr::new("release"));
-            let mut cargo = std::process::Command::new(env!("CARGO"));
-            cargo.args(["build", "-p", "sb-plugin-mock"]);
-            if release {
-                cargo.arg("--release");
-            }
-            let estado = cargo.status().unwrap();
-            assert!(estado.success(), "no se pudo construir el plugin mock");
-        }
-        assert!(
-            binario.is_file(),
-            "no se encontró el binario del plugin mock en {}",
-            binario.display()
-        );
-        binario
-    });
-
-    MOCK.clone()
-}
-
-fn v_str(s: impl Into<String>) -> sb_proto::Value {
-    sb_proto::Value {
-        kind: Some(sb_proto::value::Kind::StringValue(s.into())),
-    }
-}
-fn v_int(i: i64) -> sb_proto::Value {
-    sb_proto::Value {
-        kind: Some(sb_proto::value::Kind::IntValue(i)),
-    }
-}
-
-/// Arranca motor y destino ya configurados sobre el mismo directorio.
-async fn preparar(dir: &std::path::Path, seed: i64, size: i64) -> (PluginClient, PluginClient) {
-    let motor = PluginClient::start("mock-engine", &ruta_mock())
-        .await
-        .unwrap();
-    let destino = PluginClient::start("mock-storage", &ruta_mock())
-        .await
-        .unwrap();
-
-    let mut cfg_m = HashMap::new();
-    cfg_m.insert("dir".into(), v_str(dir.to_string_lossy()));
-    cfg_m.insert("seed".into(), v_int(seed));
-    cfg_m.insert("size".into(), v_int(size));
-    motor.configure(cfg_m).await.unwrap();
-
-    let mut cfg_d = HashMap::new();
-    cfg_d.insert("dir".into(), v_str(dir.to_string_lossy()));
-    destino.configure(cfg_d).await.unwrap();
-
-    (motor, destino)
-}
-
-fn peticion<'a>(
-    motor: &'a PluginClient,
-    destino: &'a PluginClient,
-    clave: &str,
-    id: &sb_crypto::Identity,
-) -> BackupRequest<'a> {
-    BackupRequest {
-        target: "prueba".into(),
-        engine: motor,
-        storage: destino,
-        artifact_key: clave.into(),
-        recipient: id.to_recipient(),
-        level: CompressionLevel::default(),
-        engine_version: "0.1.0".into(),
-        server_version: "mock".into(),
-        created_at: "2026-08-21T10:00:00Z".into(),
-    }
-}
 
 #[tokio::test]
 async fn un_backup_completo_produce_artefacto_y_manifiesto() {
