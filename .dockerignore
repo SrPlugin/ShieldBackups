@@ -1,0 +1,34 @@
+# Lo que nunca debe viajar al contexto de build.
+#
+# `target/` es lo primero y lo más grande: son varios GiB de artefactos de la
+# máquina de quien construye, compilados contra *su* libc y su toolchain. Si
+# entran en el contexto, el `docker build` tarda minutos solo en subirlos al
+# demonio y, peor, `cargo` dentro del contenedor podría intentar reutilizarlos.
+/target
+**/target
+
+# Estado de git: pesado y sin valor para la compilación.
+/.git
+/.github
+.gitignore
+
+# Material de trabajo interno (especificaciones, notas).
+/docs
+
+# Lo que el propio contenedor genera o lo que sería un desastre copiar dentro.
+/.env
+*.lock.bak
+/artefactos
+/deploy/.verificacion
+
+# Ficheros de despliegue que no participan en la compilación.
+Dockerfile
+.dockerignore
+compose.yaml
+docker-compose.yml
+
+# Basura de editores.
+*.swp
+*~
+.idea
+.vscode

@@ -2,5 +2,8 @@
 *.lock.bak
 .env
 
-# Material de trabajo interno: nunca va al repositorio.
-/docs/
+# Material de trabajo interno —planes y especificaciones de diseño—: nunca va al
+# repositorio. La regla se estrecha a este subdirectorio a propósito: la
+# documentación de producto (guías de despliegue, manuales) sí se versiona, y
+# antes ni siquiera podía vivir bajo `docs/`.
+/docs/superpowers/
