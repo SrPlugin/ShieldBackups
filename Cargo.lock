@@ -2024,6 +2024,7 @@ name = "sb-transport"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "http",
  "hyper-util",
  "rcgen",
  "rustls",
