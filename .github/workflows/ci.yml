@@ -1,19 +1,140 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+  pull_request:
+  # Los tests de memoria: ver el job `memoria`.
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Puerta de entrada de cada push: formato, lints, documentación y la suite de
+  # tests. Si esto falla, lo demás da igual.
   check:
+    name: formato, clippy, doc y tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `rust-toolchain.toml` fija 1.92 y manda sobre lo que instale esta
+      # acción; se declara igual para no descargar primero otra toolchain.
       - uses: dtolnay/rust-toolchain@1.92
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features --workspace
+      # La documentación se pudre en silencio: un enlace intra-doc que apunta a
+      # un elemento privado o que se ha renombrado no rompe ninguna build. Va
+      # como paso de este job y no como job aparte porque reutiliza las
+      # dependencias ya compiladas aquí; en un runner propio costaría varios
+      # minutos de recompilar el árbol entero para nada.
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features --workspace
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      # Un hilo: varios tests arrancan procesos de plugin y se estorban si
+      # corren en paralelo.
+      - run: cargo test --all-features --workspace -- --test-threads=1
+
+  # Auditoría de la cadena de suministro: avisos de RustSec, licencias,
+  # procedencia de los crates y duplicados. Es lo único que vigila las
+  # dependencias transitivas, que es por donde entra el problema en una
+  # herramienta que toca credenciales, y no compila nada: cuesta menos de dos
+  # minutos. La configuración entera vive en `deny.toml`.
+  deny:
+    name: auditoría de dependencias
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Los tests que levantan contenedores: MinIO para el plugin de R2 y
+  # PostgreSQL para el suyo. Se separan de `check` porque necesitan un entorno
+  # preparado —cliente de PostgreSQL, demonio de contenedores, red hacia el
+  # registro de imágenes— y porque cuando ese entorno falla el error no debe
+  # leerse como un fallo del código.
+  integracion:
+    name: tests de integración con Docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      # `pg_dump` y `psql` para el plugin de PostgreSQL.
+      - name: instalar postgresql-client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          pg_dump --version
+      # Los runners de GitHub traen Docker; si algún día dejaran de traerlo,
+      # los tests de testcontainers se saltarían solos y este job daría verde
+      # sin haber probado nada. Mejor fallar aquí.
+      - name: comprobar Docker
+        run: docker info > /dev/null
+      # `shell: bash` para tener `pipefail`: con el shell por defecto el código
+      # de salida sería el de `tee` y un test roto pasaría por verde.
+      - name: suite completa
+        shell: bash
+        run: cargo test --all-features --workspace -- --test-threads=1 --nocapture 2>&1 | tee resultado.txt
+      # Los tests de contenedores se saltan solos, por diseño, cuando no hay
+      # Docker: avisan por stderr y devuelven verde. Aquí un salto es un fallo
+      # del entorno, y sin esto pasaría inadvertido.
+      - name: ningún test saltado
+        run: |
+          if grep -q "^SALTADO " resultado.txt; then
+            echo "::error::algún test de contenedores se saltó en el job que existe para ejecutarlos"
+            grep "^SALTADO " resultado.txt
+            exit 1
+          fi
+
+  # La MSRV declarada (`rust-version` en el workspace) y la toolchain fijada
+  # (`rust-toolchain.toml`) tienen que ser la misma versión.
+  #
+  # No hay aquí una compilación con 1.92: sería copiar el job `check`.
+  # `rust-toolchain.toml` fuerza 1.92 en todos los jobs y en la máquina de
+  # cualquiera que clone el repositorio, así que usar sin querer una API más
+  # nueva ya rompe la build normal. Lo que ese fichero *no* detecta es que
+  # alguien suba el canal a una versión más nueva y se deje `rust-version` en
+  # 1.92: a partir de ahí el crate anuncia una MSRV que nadie comprueba y que
+  # probablemente ya no se cumple. Eso es lo que mira este job, y por eso son
+  # segundos y no una build entera.
+  msrv:
+    name: MSRV declarada
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust-version y rust-toolchain.toml coinciden
+        run: |
+          declarada=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+          fijada=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          echo "Cargo.toml rust-version = $declarada"
+          echo "rust-toolchain.toml channel = $fijada"
+          if [ "$declarada" != "$fijada" ]; then
+            echo "::error::la MSRV declarada ($declarada) no coincide con la toolchain fijada ($fijada); la CI no está probando la versión que el crate promete soportar"
+            exit 1
+          fi
+
+  # Los tests de memoria mueven ~9 GiB por el disco: en cada push serían un
+  # impuesto que nadie quiere pagar, y lo que vigilan —que el pipeline de
+  # streaming no acumule el backup entero en RAM— cambia con poca frecuencia.
+  # Semanal, más disparo manual para cuando se toca ese pipeline.
+  memoria:
+    name: uso de memoria con backups grandes
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      # Espacio libre antes de empezar: si el runner no lo tiene, el fallo se
+      # ve aquí y no a mitad de un test de veinte minutos.
+      - run: df -h /
+      # En release: en debug estos tests tardan de más y miden otra cosa.
+      - run: cargo test --release --all-features -p sb-cli --test memoria -- --ignored --nocapture --test-threads=1

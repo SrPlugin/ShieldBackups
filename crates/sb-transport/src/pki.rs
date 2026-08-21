@@ -1,5 +1,9 @@
 use std::sync::Arc;
 
+// El parseo de PEM vive en `rustls-pki-types` desde su 1.9: `rustls-pemfile`
+// quedó archivado en agosto de 2025 (RUSTSEC-2025-0134) y su última versión
+// no era más que una envoltura sobre este mismo código.
+use rustls::pki_types::pem::{Error as PemError, PemObject as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -247,15 +251,20 @@ fn root_store(ca_pem: &str) -> Result<RootCertStore, PkiError> {
 }
 
 fn parse_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, PkiError> {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| PkiError::Material(e.to_string()))
 }
 
 fn parse_key(pem: &str) -> Result<PrivateKeyDer<'static>, PkiError> {
-    rustls_pemfile::private_key(&mut pem.as_bytes())
-        .map_err(|e| PkiError::Material(e.to_string()))?
-        .ok_or_else(|| PkiError::Material("no se encontró clave privada en el PEM".into()))
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|e| match e {
+        // El PEM no traía ninguna clave. Merece su propio mensaje: es el error
+        // que ve quien se equivoca de fichero, y «no items found» no ayuda.
+        PemError::NoItemsFound => {
+            PkiError::Material("no se encontró clave privada en el PEM".into())
+        }
+        otro => PkiError::Material(otro.to_string()),
+    })
 }
 
 #[cfg(test)]

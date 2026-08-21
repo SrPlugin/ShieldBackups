@@ -9,13 +9,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-sb-proto = { path = "../sb-proto" }
+sb-proto = { version = "0.1.0", path = "../sb-proto" }
 tonic = "0.14"
 tokio = { workspace = true }
 tokio-stream = "0.1"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 rcgen = "0.13"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"

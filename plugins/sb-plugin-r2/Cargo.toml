@@ -22,8 +22,19 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-sb-plugin-sdk = { path = "../../crates/sb-plugin-sdk" }
-aws-sdk-s3 = "1"
+sb-plugin-sdk = { version = "0.1.0", path = "../../crates/sb-plugin-sdk" }
+# Sin `default-features`: el conjunto por defecto incluye la feature `rustls`,
+# que en el SDK de AWS no es el cliente de TLS moderno sino el *legacy*
+# (hyper 0.14 + rustls 0.21 + h2 0.3). Ese árbol paralelo se compila, se
+# enlaza, no se usa —el cliente real sale de `default-https-client`— y arrastra
+# RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101) y RUSTSEC-2026-0258 (h2
+# 0.3). Aquí se repite el resto del conjunto por defecto y se deja fuera esa.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-config = "1"
 aws-credential-types = "1"
 tokio = { workspace = true }
@@ -33,7 +44,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 # Solo los tests necesitan el transporte: ahí se hace de núcleo —crear el canal
 # de datos y el sobre de arranque—, no de plugin.
-sb-transport = { path = "../../crates/sb-transport" }
+sb-transport = { version = "0.1.0", path = "../../crates/sb-transport" }
 tempfile = "3"
 # MinIO habla el protocolo de S3 y corre en Docker, así que permite ejercitar el
 # plugin entero sin credenciales de Cloudflare ni coste. Lo que **no** valida es

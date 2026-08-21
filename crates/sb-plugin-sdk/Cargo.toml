@@ -16,8 +16,8 @@ path = "tests/bin/smoke_plugin.rs"
 workspace = true
 
 [dependencies]
-sb-proto = { path = "../sb-proto" }
-sb-transport = { path = "../sb-transport" }
+sb-proto = { version = "0.1.0", path = "../sb-proto" }
+sb-transport = { version = "0.1.0", path = "../sb-transport" }
 tonic = "0.14"
 # `io-std` no está en las features del workspace: solo el SDK lee stdin de forma
 # asíncrona, porque solo un plugin recibe su sobre de arranque por ahí.

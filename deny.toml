@@ -1,0 +1,106 @@
+# Auditoría de la cadena de suministro.
+#
+# ShieldBackups mueve credenciales de bases de datos y volcados completos de
+# datos. Lo que entra en el árbol de dependencias acaba, en la práctica, en el
+# mismo proceso que esos secretos: un aviso de seguridad en una dependencia
+# transitiva no es un detalle de mantenimiento, es una vía de entrada. Por eso
+# aquí se falla, no se avisa.
+#
+# Se ejecuta con `cargo deny check`, y en el job `deny` de la CI.
+
+[graph]
+# Los objetivos que de verdad se compilan y se distribuyen. Sin esto el árbol
+# arrastra dependencias exclusivas de Windows y de wasm que ni se construyen, y
+# cualquier aviso sobre ellas sería ruido.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# La CI compila y prueba con `--all-features`; la auditoría mira exactamente
+# ese mismo grafo, incluidas las dependencias de desarrollo. Auditar menos de
+# lo que se compila deja fuera justo lo que sí se ejecuta.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Avisos de seguridad (RustSec)
+# ---------------------------------------------------------------------------
+
+[advisories]
+# Sin excepciones. Si algún día hace falta una, va aquí con el identificador,
+# el motivo por el que no nos afecta y la fecha o versión en que hay que
+# volver a mirarlo; nunca a secas.
+ignore = []
+
+# Un crate retirado de crates.io se retira por algo: publicación errónea,
+# secretos dentro del paquete, versión rota. No se acepta.
+yanked = "deny"
+
+# Todo el árbol, no solo las dependencias directas. Hoy está limpio, y
+# mantenerlo así sale más barato que descubrir el crate abandonado el día que
+# le salga un CVE. Si algún transitivo se archiva y no hay recambio, se
+# documenta en `ignore` con fecha de revisión.
+unmaintained = "all"
+
+# ---------------------------------------------------------------------------
+# Licencias
+# ---------------------------------------------------------------------------
+
+[licenses]
+# Lista sacada de recorrer el árbol de verdad, no de copiar una plantilla.
+# Todas permisivas: `shieldbk` y los plugins se distribuyen como binarios, y
+# una copyleft fuerte ahí obligaría a publicar el fuente de todo lo enlazado.
+#
+# Hay dos crates con copyleft en su expresión —`r-efi` (MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later) y `self_cell` (Apache-2.0 OR GPL-2.0-only)—, pero en los
+# dos casos es un OR con una alternativa permisiva, así que el resolvedor toma
+# esa y no hay obligación de copyleft. No hace falta excepción.
+confidence-threshold = 0.93
+
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",   # zerocopy (parte de un OR con MIT)
+    "BSD-3-Clause",   # curve25519-dalek, x25519-dalek, subtle, matchit
+    "ISC",            # ring, untrusted, rustls-webpki
+    "MIT-0",          # aws-lc-sys, dentro de su expresión compuesta
+    "Unicode-3.0",    # la familia icu_* y unicode-ident, vía idna
+    "Zlib",           # foldhash
+]
+
+# ---------------------------------------------------------------------------
+# Procedencia
+# ---------------------------------------------------------------------------
+
+[sources]
+# Solo crates.io. Un registro alternativo o un `git = ...` en el árbol de una
+# herramienta que maneja secretos es código sin revisar, sin checksum en el
+# lockfile del registro público y sin su garantía de inmutabilidad: una rama
+# se reescribe, una versión publicada no.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ---------------------------------------------------------------------------
+# Grafo de dependencias
+# ---------------------------------------------------------------------------
+
+[bans]
+# Con tokio, tonic, rustls, `age` y el SDK de AWS en el mismo árbol, tener dos
+# versiones del mismo crate es inevitable y perseguirlo sería trabajo perdido.
+# Aviso, para verlo cuando se pueda unificar; no error.
+multiple-versions = "warn"
+
+# `version = "*"` significa «lo que se publique mañana»: se salta la revisión
+# de cualquier cambio de mayor. Aviso porque a las dependencias internas por
+# `path` cargo-deny las cuenta como comodín aunque no lo sean.
+wildcards = "warn"
+
+deny = []
+skip = []
+skip-tree = []

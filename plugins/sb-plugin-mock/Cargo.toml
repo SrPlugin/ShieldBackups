@@ -22,7 +22,7 @@ workspace = true
 [dependencies]
 # El SDK es la única dependencia del plugin: reexporta sb-proto, tonic y
 # `connect_data`, que es todo lo que hace falta para hablar con el núcleo.
-sb-plugin-sdk = { path = "../../crates/sb-plugin-sdk" }
+sb-plugin-sdk = { version = "0.1.0", path = "../../crates/sb-plugin-sdk" }
 tokio = { workspace = true }
 # `ArtifactMeta.modified_at` es RFC-3339 UTC por contrato, y convertir segundos
 # desde el epoch a fecha civil tiene reglas —bisiestos, la excepción de los
@@ -35,5 +35,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 # Solo los tests necesitan el transporte: ahí se hace de núcleo —montar el
 # sobre, la PKI efímera y los canales de datos—, no de plugin.
-sb-transport = { path = "../../crates/sb-transport" }
+sb-transport = { version = "0.1.0", path = "../../crates/sb-transport" }
 tempfile = "3"

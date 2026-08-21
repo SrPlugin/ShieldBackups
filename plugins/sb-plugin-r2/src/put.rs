@@ -9,10 +9,11 @@
 //! 2. **Un multipart que falla hay que abortarlo.** Las partes ya subidas no
 //!    aparecen en un `ListObjects` —el objeto no existe todavía— pero ocupan y
 //!    **se facturan indefinidamente**. Por eso, en cuanto existe un
-//!    `upload_id`, todo lo demás ocurre dentro de [`subir_partes`] y el único
-//!    camino de vuelta pasa por el `match` de [`subir`], que aborta ante
-//!    cualquier `Err`. Un `?` suelto por encima de ese `match` sería
-//!    exactamente el fallo que esta estructura impide.
+//!    `upload_id`, todo lo demás ocurre dentro de `subir_partes` —privada, de
+//!    ahí que aquí no vaya enlazada— y el único camino de vuelta pasa por el
+//!    `match` de [`subir`], que aborta ante cualquier `Err`. Un `?` suelto por
+//!    encima de ese `match` sería exactamente el fallo que esta estructura
+//!    impide.
 //!
 //! ## Memoria
 //!
