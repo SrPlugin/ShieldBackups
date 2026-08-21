@@ -5,9 +5,11 @@
 //! núcleo entero para poder hablar el protocolo.
 
 pub mod control;
+pub mod handshake;
 pub mod pki;
 
 pub use control::{ControlError, connect_control, serve_control};
+pub use handshake::{Bootstrap, HandshakeError, MAGIC, Ready};
 pub use pki::{
     CLIENT_NAME, EphemeralPki, PkiError, SERVER_NAME, ServerBundle, server_config_from_bundle,
 };
