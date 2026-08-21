@@ -44,3 +44,4 @@ tracing.workspace = true
 # motor dijo haber producido y comparar digests en vez de creerle.
 sb-plugin-mock = { version = "0.1.0", path = "../../plugins/sb-plugin-mock" }
 tempfile = "3.27.0"
+proptest = { workspace = true }

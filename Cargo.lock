@@ -4003,6 +4003,7 @@ name = "sb-config"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "proptest",
  "sb-crypto",
  "sb-proto",
  "serde",
@@ -4017,6 +4018,7 @@ dependencies = [
 name = "sb-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rustix",
  "sb-crypto",
  "sb-plugin-mock",
@@ -4112,6 +4114,7 @@ dependencies = [
  "async-stream",
  "http 1.5.0",
  "hyper-util",
+ "proptest",
  "rcgen",
  "rustls 0.23.43",
  "rustls-pemfile",

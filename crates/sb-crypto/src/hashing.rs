@@ -27,19 +27,45 @@ impl Digest {
 
     /// Parsea un digest desde su representación hexadecimal.
     ///
+    /// Trabaja sobre los **bytes** de `s` y no sobre sus caracteres. La
+    /// diferencia importa: la longitud se mide en bytes, así que una cadena de
+    /// 21 signos de euro y una letra ocupa exactamente 64 bytes sin ser hex, y
+    /// trocearla en pares de bytes con `&s[i*2..i*2+2]` caería en mitad de un
+    /// carácter multibyte y entraría en pánico. Este parser lee cadenas que
+    /// vienen de un manifiesto descargado del destino, así que esa entrada es
+    /// perfectamente alcanzable.
+    ///
     /// # Errors
     ///
-    /// Devuelve [`DigestParseError`] si `s` no tiene exactamente 64
-    /// caracteres o si alguno de ellos no es hexadecimal.
+    /// Devuelve [`DigestParseError`] si `s` no ocupa exactamente 64 bytes o si
+    /// alguno de ellos no es un dígito hexadecimal ASCII.
     pub fn from_hex(s: &str) -> Result<Self, DigestParseError> {
-        if s.len() != 64 {
+        let bytes = s.as_bytes();
+        if bytes.len() != 64 {
             return Err(DigestParseError);
         }
         let mut out = [0_u8; 32];
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| DigestParseError)?;
+        for (byte, par) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            let alto = valor_hex(par[0])?;
+            let bajo = valor_hex(par[1])?;
+            *byte = alto * 16 + bajo;
         }
         Ok(Self(out))
+    }
+}
+
+/// Valor numérico de un dígito hexadecimal ASCII.
+///
+/// Deliberadamente sobre `u8` y no sobre `char`: es lo que permite recorrer la
+/// cadena por bytes sin arriesgarse a cortar un carácter multibyte por la
+/// mitad. Cualquier byte que no sea `0-9`, `a-f` o `A-F` —incluido el primer
+/// byte de una secuencia UTF-8 más larga— es un error, no un pánico.
+fn valor_hex(b: u8) -> Result<u8, DigestParseError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(DigestParseError),
     }
 }
 
@@ -218,6 +244,25 @@ mod tests {
     fn un_hex_invalido_se_rechaza() {
         assert!(Digest::from_hex("no-es-hex").is_err());
         assert!(Digest::from_hex("ab").is_err()); // longitud incorrecta
+    }
+
+    #[test]
+    fn una_cadena_de_64_bytes_con_caracteres_multibyte_se_rechaza() {
+        // Regresión: la longitud se mide en bytes, así que 21 signos de euro
+        // (3 bytes cada uno) más una letra ocupan exactamente 64 bytes y
+        // pasaban la comprobación de longitud. Trocear eso en pares de bytes
+        // con `&s[i*2..i*2+2]` cortaba un carácter por la mitad y entraba en
+        // pánico. Esta cadena llega dentro del manifiesto que se descarga del
+        // destino: es entrada externa, no un caso teórico.
+        let s = format!("{}a", "\u{20ac}".repeat(21));
+        assert_eq!(s.len(), 64, "la trampa es que mide 64 bytes");
+        assert!(Digest::from_hex(&s).is_err());
+    }
+
+    #[test]
+    fn el_hex_en_mayusculas_tambien_se_acepta() {
+        let d = Digest::from_hex(&SHA256_ABC.to_uppercase()).unwrap();
+        assert_eq!(d.to_hex(), SHA256_ABC);
     }
 
     #[tokio::test]
