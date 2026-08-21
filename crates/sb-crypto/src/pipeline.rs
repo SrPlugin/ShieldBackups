@@ -3,8 +3,8 @@
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    AgeError, CompressionLevel, Digest, Recipient, Sha256Reader, Sha256Writer, compressor,
-    encrypt_to,
+    AgeError, CompressionLevel, Digest, Identity, Recipient, Sha256Reader, Sha256Writer,
+    compressor, decompressor, decrypt_from, encrypt_to,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +83,71 @@ where
         plaintext_sha256: fuente.digest(),
         ciphertext_sha256,
     })
+}
+
+pub struct RestoreOptions<'a> {
+    pub identity: &'a Identity,
+    /// Si se aporta, se comprueba contra el digest del artefacto leído y el
+    /// restore falla si no coincide.
+    pub expected_ciphertext_sha256: Option<Digest>,
+}
+
+/// Lee un artefacto de `source`, descifra, descomprime y escribe en `sink`.
+///
+/// # Integridad, y por qué hacen falta dos comprobaciones
+///
+/// El AEAD de age verifica cada bloque durante la lectura, así que un
+/// ciphertext manipulado falla al leer. La comprobación adicional del digest
+/// detecta algo distinto: que el destino haya servido un artefacto **diferente**
+/// del que registró el manifiesto.
+///
+/// El digest solo se puede comprobar **después** de leer todo el flujo, porque
+/// hasta entonces no está completo. Para entonces `sink` ya ha recibido datos.
+///
+/// # Advertencia para quien consuma esta función
+///
+/// age entrega los bloques AEAD ya verificados de forma incremental. Ante un
+/// artefacto truncado, la lectura falla **después** de haber escrito en `sink`
+/// todo lo que venía antes del corte — plaintext legítimo, pero parcial.
+///
+/// Por tanto: **si esta función devuelve `Err`, hay que descartar todo lo
+/// escrito en `sink`, no solo dejar de escribir.** Quedarse con lo que llegó
+/// antes del fallo significa quedarse con media base de datos sin ninguna
+/// señal de que lo es.
+///
+/// # Errors
+/// Devuelve error si el artefacto no está dirigido a `identity`, si está
+/// corrupto o truncado, o si el digest no coincide con el esperado.
+pub async fn restore<R, W>(
+    source: R,
+    sink: W,
+    opts: &RestoreOptions<'_>,
+) -> Result<u64, PipelineError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut fuente = Sha256Reader::new(source);
+    let mut sink = sink;
+
+    let escritos = {
+        let descifrador = decrypt_from(&mut fuente, opts.identity).await?;
+        let mut descompresor = decompressor(descifrador);
+        tokio::io::copy(&mut descompresor, &mut sink).await?
+    };
+    sink.flush().await?;
+
+    if let Some(esperado) = opts.expected_ciphertext_sha256 {
+        let obtenido = fuente.digest();
+        if obtenido != esperado {
+            return Err(PipelineError::DigestNoCoincide {
+                esperado: esperado.to_hex(),
+                obtenido: obtenido.to_hex(),
+            });
+        }
+    }
+
+    Ok(escritos)
 }
 
 #[cfg(test)]
@@ -270,6 +335,203 @@ mod tests {
         assert!(
             alto.len() <= bajo.len(),
             "el nivel debe estar llegando de verdad a zstd"
+        );
+    }
+
+    #[tokio::test]
+    async fn ida_y_vuelta_completa() {
+        let id = Identity::generate();
+        let datos = b"cualquier contenido de base de datos ".repeat(2000);
+
+        let mut artefacto = Vec::new();
+        let resumen = backup(
+            &datos[..],
+            &mut artefacto,
+            &BackupOptions {
+                recipient: id.to_recipient(),
+                level: CompressionLevel::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut restaurado = Vec::new();
+        restore(
+            &artefacto[..],
+            &mut restaurado,
+            &RestoreOptions {
+                identity: &id,
+                expected_ciphertext_sha256: Some(resumen.ciphertext_sha256),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restaurado, datos);
+    }
+
+    #[tokio::test]
+    async fn ida_y_vuelta_de_entrada_vacia() {
+        // El caso que revela un cierre de capa omitido: un artefacto truncado
+        // tiene forma correcta pero no restaura.
+        let id = Identity::generate();
+        let mut artefacto = Vec::new();
+        let resumen = backup(
+            &b""[..],
+            &mut artefacto,
+            &BackupOptions {
+                recipient: id.to_recipient(),
+                level: CompressionLevel::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut restaurado = Vec::new();
+        let escritos = restore(
+            &artefacto[..],
+            &mut restaurado,
+            &RestoreOptions {
+                identity: &id,
+                expected_ciphertext_sha256: Some(resumen.ciphertext_sha256),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(escritos, 0);
+        assert!(restaurado.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ida_y_vuelta_con_volumen_y_varios_niveles() {
+        // Fuerza varios bloques AEAD y varios frames zstd.
+        let id = Identity::generate();
+        let datos: Vec<u8> = (0..400_000_u32).map(|i| (i % 251) as u8).collect();
+
+        for nivel in [1_i32, 3, 19] {
+            let mut artefacto = Vec::new();
+            let resumen = backup(
+                &datos[..],
+                &mut artefacto,
+                &BackupOptions {
+                    recipient: id.to_recipient(),
+                    level: CompressionLevel::new(nivel).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let mut restaurado = Vec::new();
+            restore(
+                &artefacto[..],
+                &mut restaurado,
+                &RestoreOptions {
+                    identity: &id,
+                    expected_ciphertext_sha256: Some(resumen.ciphertext_sha256),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(restaurado, datos, "falló con nivel {nivel}");
+        }
+    }
+
+    #[tokio::test]
+    async fn un_digest_que_no_coincide_aborta_el_restore() {
+        let id = Identity::generate();
+        let mut artefacto = Vec::new();
+        backup(
+            &b"datos"[..],
+            &mut artefacto,
+            &BackupOptions {
+                recipient: id.to_recipient(),
+                level: CompressionLevel::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let falso =
+            Digest::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+
+        let mut restaurado = Vec::new();
+        let err = restore(
+            &artefacto[..],
+            &mut restaurado,
+            &RestoreOptions {
+                identity: &id,
+                expected_ciphertext_sha256: Some(falso),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, PipelineError::DigestNoCoincide { .. }));
+    }
+
+    #[tokio::test]
+    async fn un_artefacto_truncado_falla() {
+        let id = Identity::generate();
+        let mut artefacto = Vec::new();
+        backup(
+            &vec![3_u8; 200_000][..],
+            &mut artefacto,
+            &BackupOptions {
+                recipient: id.to_recipient(),
+                level: CompressionLevel::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        artefacto.truncate(artefacto.len() / 2);
+
+        let mut restaurado = Vec::new();
+        assert!(
+            restore(
+                &artefacto[..],
+                &mut restaurado,
+                &RestoreOptions {
+                    identity: &id,
+                    expected_ciphertext_sha256: None,
+                }
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn una_identidad_ajena_no_puede_restaurar() {
+        let id = Identity::generate();
+        let intrusa = Identity::generate();
+        let mut artefacto = Vec::new();
+        backup(
+            &b"secreto"[..],
+            &mut artefacto,
+            &BackupOptions {
+                recipient: id.to_recipient(),
+                level: CompressionLevel::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut restaurado = Vec::new();
+        assert!(
+            restore(
+                &artefacto[..],
+                &mut restaurado,
+                &RestoreOptions {
+                    identity: &intrusa,
+                    expected_ciphertext_sha256: None,
+                }
+            )
+            .await
+            .is_err()
         );
     }
 }
