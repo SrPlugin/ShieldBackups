@@ -19,6 +19,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11.0"
 thiserror = { workspace = true }
+# Convertir segundos desde el epoch a fecha civil UTC tiene reglas (años
+# bisiestos, la excepción de los múltiplos de 400) que no merece la pena
+# reimplementar en un camino que decide dónde se escribe un artefacto. Solo se
+# usan los accesores (`year`, `month`, ...) y la marca se compone con
+# `format!`, así que no hacen falta las features `formatting`/`parsing`/`macros`
+# ni la dependencia de proc-macros que arrastran.
+time = "0.3.55"
 # El tokio del workspace ya trae `process`, `io-util`, `time`, `net`, `macros`
 # y `rt-multi-thread`, que es todo lo que necesita el arranque de plugins: no
 # hace falta activar nada extra solo para este crate.
