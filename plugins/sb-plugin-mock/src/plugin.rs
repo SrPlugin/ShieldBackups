@@ -52,7 +52,7 @@ impl Plugin for PluginMock {
             size = config.size,
             "plugin mock configurado"
         );
-        self.estado.guardar(config);
+        self.estado.store(config);
         Ok(Response::new(ConfigureResponse {}))
     }
 
@@ -63,7 +63,7 @@ impl Plugin for PluginMock {
         // Preflight **no** devuelve `failed_precondition` sin configuración: es
         // el RPC de diagnóstico, y `doctor` necesita un informe que explique
         // qué falta, no un error que lo interrumpa.
-        let check = match self.estado.resuelta() {
+        let check = match self.estado.resolved() {
             Ok(config) => comprobar_directorio(&config),
             Err(_) => Check {
                 name: "configuración".into(),

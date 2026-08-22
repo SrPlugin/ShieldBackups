@@ -55,7 +55,7 @@ use sb_plugin_sdk::sb_proto::{
 };
 use sb_plugin_sdk::tonic::transport::Channel;
 use sb_plugin_sdk::tonic::{Code, Request, Status};
-use sb_plugin_sdk::{EmisorProgreso, stream_de_progreso};
+use sb_plugin_sdk::{ProgressEmitter, progress_stream};
 use sb_transport::{Bootstrap, DataChannel, EphemeralPki, Ready, connect_control};
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
@@ -225,30 +225,30 @@ fn contexto_sin_bucket(
 
 /// El destino, montado sobre un contexto ya configurado.
 fn destino(contexto: &Contexto) -> DestinoR2 {
-    let estado = Estado::nuevo("r2");
-    estado.guardar(contexto.clone());
+    let estado = Estado::new("r2");
+    estado.store(contexto.clone());
     DestinoR2::new(estado)
 }
 
 /// El servicio `Plugin`, ya configurado.
 fn servicio(contexto: &Contexto) -> PluginR2 {
-    let estado = Estado::nuevo("r2");
-    estado.guardar(contexto.clone());
+    let estado = Estado::new("r2");
+    estado.store(contexto.clone());
     PluginR2::new(estado)
 }
 
-/// Ejecuta un trabajo que necesita un [`EmisorProgreso`] y devuelve su
+/// Ejecuta un trabajo que necesita un [`ProgressEmitter`] y devuelve su
 /// resultado.
 ///
-/// Un `EmisorProgreso` solo lo crea `stream_de_progreso`, porque un emisor sin
+/// Un `ProgressEmitter` solo lo crea `progress_stream`, porque un emisor sin
 /// flujo al otro lado no emitiría a nadie. Esta función hace lo que hace el
 /// núcleo: consumir el flujo hasta el final y quedarse con el error si lo hubo.
 async fn con_progreso<F, Fut>(trabajo: F) -> Result<(), Status>
 where
-    F: FnOnce(EmisorProgreso) -> Fut + Send + 'static,
+    F: FnOnce(ProgressEmitter) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), Status>> + Send + 'static,
 {
-    let mut recibidor = stream_de_progreso(trabajo).into_inner().into_inner();
+    let mut recibidor = progress_stream(trabajo).into_inner().into_inner();
     let mut resultado = Ok(());
     while let Some(mensaje) = recibidor.recv().await {
         if let Err(e) = mensaje {
@@ -263,7 +263,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Consume el flujo de progreso de un RPC de datos hasta el final.
-async fn agotar(flujo: sb_plugin_sdk::ProgresoStream) -> Result<(), Status> {
+async fn agotar(flujo: sb_plugin_sdk::ProgressStream) -> Result<(), Status> {
     let mut recibidor = flujo.into_inner();
     while let Some(mensaje) = recibidor.recv().await {
         mensaje?;

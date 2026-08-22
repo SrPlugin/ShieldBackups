@@ -7,13 +7,13 @@ use sb_plugin_sdk::sb_proto::{
 use sb_plugin_sdk::tonic::{Request, Response, Status};
 
 #[derive(Default)]
-struct Minimo;
+struct Minimal;
 
 #[sb_plugin_sdk::tonic::async_trait]
-impl Plugin for Minimo {
+impl Plugin for Minimal {
     async fn info(&self, _: Request<InfoRequest>) -> Result<Response<InfoResponse>, Status> {
         Ok(Response::new(InfoResponse {
-            name: "minimo".into(),
+            name: "minimal".into(),
             version: "0.1.0".into(),
             protocol_version: sb_plugin_sdk::sb_proto::PROTOCOL_VERSION,
             capabilities: vec![Capability::Engine as i32],
@@ -44,6 +44,6 @@ impl Plugin for Minimo {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    PluginRuntime::new(Minimo).serve().await?;
+    PluginRuntime::new(Minimal).serve().await?;
     Ok(())
 }

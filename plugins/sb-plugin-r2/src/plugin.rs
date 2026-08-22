@@ -60,7 +60,7 @@ impl Plugin for PluginR2 {
             clase = config.storage_class.como_str(),
             "plugin r2 configurado"
         );
-        self.estado.guardar(Contexto { config, cliente });
+        self.estado.store(Contexto { config, cliente });
         Ok(Response::new(ConfigureResponse {}))
     }
 
@@ -71,7 +71,7 @@ impl Plugin for PluginR2 {
         // Preflight **no** devuelve `failed_precondition` sin configuración: es
         // el RPC de diagnóstico y `doctor` necesita un informe que explique qué
         // falta, no un error que lo interrumpa.
-        let Ok(contexto) = self.estado.resuelta() else {
+        let Ok(contexto) = self.estado.resolved() else {
             let check = Check {
                 name: "configuración".into(),
                 ok: false,

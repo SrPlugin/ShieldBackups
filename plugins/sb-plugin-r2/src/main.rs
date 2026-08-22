@@ -8,9 +8,9 @@ use sb_plugin_sdk::PluginRuntime;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Un único estado compartido: `Configure` llega por el servicio Plugin y lo
     // lee el destino. Guarda la configuración y el cliente ya construido.
-    let estado = cliente::Estado::nuevo(plugin::NOMBRE);
+    let estado = cliente::Estado::new(plugin::NOMBRE);
     PluginRuntime::new(plugin::PluginR2::new(estado.clone()))
-        .con_destino(storage::DestinoR2::new(estado))
+        .with_storage(storage::DestinoR2::new(estado))
         .serve()
         .await?;
     Ok(())

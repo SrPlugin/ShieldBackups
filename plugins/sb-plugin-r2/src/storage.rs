@@ -5,7 +5,7 @@
 //! ausencia del objeto— y delega el resto en el módulo que lleva lo delicado
 //! ([`crate::put`], [`crate::get`], [`crate::admin`]).
 //!
-//! Esa división no es estética. Una vez que [`stream_de_progreso`] responde al
+//! Esa división no es estética. Una vez que [`progress_stream`] responde al
 //! RPC, el error ya no puede volver como `Status` de la llamada: solo por el
 //! flujo de progreso, donde el núcleo lo trata como una transferencia cortada.
 //! «Ese artefacto no existe» y «la descarga se cortó» son cosas distintas para
@@ -20,7 +20,7 @@ use sb_plugin_sdk::sb_proto::{
     GetRequest, ListRequest, ListResponse, PutRequest,
 };
 use sb_plugin_sdk::tonic::{Request, Response, Status};
-use sb_plugin_sdk::{ProgresoStream, stream_de_progreso};
+use sb_plugin_sdk::{ProgressStream, progress_stream};
 
 use crate::cliente::Estado;
 use crate::{admin, get, put};
@@ -38,8 +38,8 @@ impl DestinoR2 {
 
 #[sb_plugin_sdk::tonic::async_trait]
 impl Storage for DestinoR2 {
-    type PutStream = ProgresoStream;
-    type GetStream = ProgresoStream;
+    type PutStream = ProgressStream;
+    type GetStream = ProgressStream;
 
     async fn put(
         &self,
@@ -48,15 +48,15 @@ impl Storage for DestinoR2 {
         // Lo que se puede saber antes de mover un byte se resuelve aquí, con un
         // `?`: una vez arranca el trabajo, la respuesta del RPC ya se envió y el
         // error solo tendría el flujo de progreso para volver.
-        let contexto = self.estado.resuelta()?;
+        let contexto = self.estado.resolved()?;
         let PutRequest { key, data_socket } = peticion.into_inner();
         let clave = contexto.config.clave(&key);
-        // `stream_de_progreso` responde al RPC **antes** de que el trabajo
+        // `progress_stream` responde al RPC **antes** de que el trabajo
         // toque el socket de datos, que es lo que el protocolo exige: el núcleo
         // espera esa respuesta para poner en marcha el otro extremo.
-        Ok(stream_de_progreso(move |mut progreso| async move {
+        Ok(progress_stream(move |mut progreso| async move {
             put::subir(&contexto, &clave, &data_socket, &mut progreso).await?;
-            progreso.terminar("artefacto almacenado").await;
+            progreso.finish("artefacto almacenado").await;
             tracing::info!(clave = %clave, bytes = progreso.bytes(), "artefacto almacenado en R2");
             Ok(())
         }))
@@ -66,7 +66,7 @@ impl Storage for DestinoR2 {
         &self,
         peticion: Request<GetRequest>,
     ) -> Result<Response<Self::GetStream>, Status> {
-        let contexto = self.estado.resuelta()?;
+        let contexto = self.estado.resolved()?;
         let GetRequest { key, data_socket } = peticion.into_inner();
         let clave = contexto.config.clave(&key);
         // El `GetObject` se pide **antes** de responder, y solo se piden las
@@ -76,16 +76,16 @@ impl Storage for DestinoR2 {
         // toca todavía el socket de datos, que es lo que el protocolo prohíbe
         // hacer antes de responder.
         let cuerpo = get::pedir(&contexto, &clave).await?;
-        Ok(stream_de_progreso(move |mut progreso| async move {
+        Ok(progress_stream(move |mut progreso| async move {
             get::volcar(cuerpo, &data_socket, &mut progreso).await?;
-            progreso.terminar("artefacto entregado").await;
+            progreso.finish("artefacto entregado").await;
             tracing::info!(clave = %clave, bytes = progreso.bytes(), "artefacto descargado de R2");
             Ok(())
         }))
     }
 
     async fn list(&self, peticion: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let contexto = self.estado.resuelta()?;
+        let contexto = self.estado.resolved()?;
         let prefijo = contexto.config.clave(&peticion.into_inner().prefix);
         // `admin::listar` recorre **todas** las páginas: una lista truncada no
         // se nota y haría que `verify --all` diera por buenos artefactos que ni
@@ -107,7 +107,7 @@ impl Storage for DestinoR2 {
         &self,
         peticion: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let contexto = self.estado.resuelta()?;
+        let contexto = self.estado.resolved()?;
         let clave = contexto.config.clave(&peticion.into_inner().key);
         admin::borrar(&contexto, &clave).await?;
         Ok(Response::new(DeleteResponse {}))
@@ -117,7 +117,7 @@ impl Storage for DestinoR2 {
         &self,
         peticion: Request<AbortIncompleteRequest>,
     ) -> Result<Response<AbortIncompleteResponse>, Status> {
-        let contexto = self.estado.resuelta()?;
+        let contexto = self.estado.resolved()?;
         let prefijo = contexto.config.clave(&peticion.into_inner().prefix);
         let abortadas = admin::abortar_incompletos(&contexto, &prefijo).await?;
         if abortadas > 0 {

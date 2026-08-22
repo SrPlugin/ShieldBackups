@@ -26,7 +26,7 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
-use sb_plugin_sdk::EmisorProgreso;
+use sb_plugin_sdk::ProgressEmitter;
 use sb_plugin_sdk::tonic::Status;
 use tokio::io::AsyncRead;
 use tokio::task::JoinSet;
@@ -50,7 +50,7 @@ pub async fn subir(
     contexto: &Contexto,
     clave: &str,
     socket: &str,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let datos = canal::conectar(socket).await?;
     subir_desde(contexto, clave, datos, progreso).await
@@ -73,7 +73,7 @@ pub async fn subir_desde<R: AsyncRead + Unpin>(
     contexto: &Contexto,
     clave: &str,
     datos: R,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let tamano_de_parte = contexto.config.part_size;
     let mut troceador = Troceador::new(datos, tamano_de_parte);
@@ -132,7 +132,7 @@ async fn directo(
     contexto: &Contexto,
     clave: &str,
     cuerpo: Vec<u8>,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let bytes = cuerpo.len();
     contexto
@@ -145,7 +145,7 @@ async fn directo(
         .send()
         .await
         .map_err(|e| traducir("PutObject", &e))?;
-    progreso.avanzar(bytes).await;
+    progreso.advance(bytes).await;
     tracing::debug!(clave = %clave, bytes, "artefacto subido en una sola llamada");
     Ok(())
 }
@@ -188,7 +188,7 @@ async fn subir_partes<R: AsyncRead + Unpin>(
     primera: Vec<u8>,
     mut troceador: Troceador<R>,
     tareas: &mut JoinSet<Result<ParteSubida, ErrorDeR2>>,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let concurrencia = contexto.config.concurrency.max(1);
     let mut completadas: Vec<CompletedPart> = Vec::new();
@@ -314,7 +314,7 @@ async fn subir_una(
 async fn recoger(
     tareas: &mut JoinSet<Result<ParteSubida, ErrorDeR2>>,
     completadas: &mut Vec<CompletedPart>,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let Some(union) = tareas.join_next().await else {
         return Ok(());
@@ -329,7 +329,7 @@ async fn recoger(
         })
     })?;
     let parte = resultado?;
-    progreso.avanzar(parte.bytes).await;
+    progreso.advance(parte.bytes).await;
     completadas.push(
         CompletedPart::builder()
             .part_number(parte.numero)

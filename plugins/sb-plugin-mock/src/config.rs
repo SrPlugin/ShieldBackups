@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use sb_plugin_sdk::Configurado;
+use sb_plugin_sdk::Configured;
 use sb_plugin_sdk::sb_proto::{Field, FieldType, Value, value::Kind};
 use sb_plugin_sdk::tonic::Status;
 
@@ -121,7 +121,7 @@ fn entero(mapa: &HashMap<String, Value>, nombre: &str) -> Result<Option<i64>, St
 /// silenciosos»: leerla sin configurar da `failed_precondition`, porque un
 /// volcado que se escribiera en un directorio que nadie pidió es peor que un
 /// error claro.
-pub type Estado = Configurado<Config>;
+pub type Estado = Configured<Config>;
 
 #[cfg(test)]
 mod tests {
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn sin_configure_el_estado_falla_con_failed_precondition() {
-        let e = Estado::default().resuelta().unwrap_err();
+        let e = Estado::default().resolved().unwrap_err();
         assert_eq!(e.code(), Code::FailedPrecondition);
     }
 
@@ -201,8 +201,8 @@ mod tests {
             (CAMPO_SEED.to_string(), numero(7)),
             (CAMPO_SIZE.to_string(), numero(10)),
         ]);
-        estado.guardar(Config::desde_mapa(&mapa).unwrap());
-        let c = estado.resuelta().unwrap();
+        estado.store(Config::desde_mapa(&mapa).unwrap());
+        let c = estado.resolved().unwrap();
         assert_eq!(c.dir, PathBuf::from("/tmp/mock"));
         assert_eq!(c.seed, 7);
         assert_eq!(c.size, 10);

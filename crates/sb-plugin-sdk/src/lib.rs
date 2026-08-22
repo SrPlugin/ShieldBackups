@@ -1,31 +1,32 @@
-//! Lo que necesita un plugin de `ShieldBackups` escrito en Rust.
+//! What a `ShieldBackups` plugin written in Rust needs.
 //!
-//! Un plugin completo son unas cien líneas: implementar los traits generados y
-//! llamar a [`PluginRuntime::serve`]. Lo que todos los plugins comparten está
-//! aquí para que ninguno lo reescriba:
+//! A complete plugin is about a hundred lines: implement the generated traits
+//! and call [`PluginRuntime::serve`]. What every plugin shares lives here so
+//! that none of them has to rewrite it:
 //!
-//! - [`PluginRuntime`] arranca el proceso y lo termina cuando el núcleo llama a
-//!   `Shutdown`, que el SDK intercepta.
-//! - [`Configurado`] guarda la configuración que `Configure` deja y que los
-//!   servicios de datos leen, con el `failed_precondition` ya escrito.
-//! - [`stream_de_progreso`] pone el armazón de los RPC que mueven bytes.
+//! - [`PluginRuntime`] starts the process and ends it when the core calls
+//!   `Shutdown`, which the SDK intercepts.
+//! - [`Configured`] holds the configuration that `Configure` leaves behind and
+//!   that the data services read, with the `failed_precondition` already
+//!   written.
+//! - [`progress_stream`] provides the scaffolding of the RPCs that move bytes.
 
-mod cierre;
-pub mod configurado;
-pub mod progreso;
+pub mod configured;
+pub mod progress;
 pub mod runtime;
+mod shutdown;
 
-pub use configurado::Configurado;
-pub use progreso::{EmisorProgreso, ProgresoStream, stream_de_progreso};
+pub use configured::Configured;
+pub use progress::{ProgressEmitter, ProgressStream, progress_stream};
 pub use runtime::{PluginRuntime, SdkError};
 
-// Reexportados para que un plugin no tenga que declarar sb-proto ni tonic.
+// Re-exported so a plugin does not have to declare sb-proto or tonic itself.
 pub use sb_proto;
 pub use tonic;
 
-/// Abre el canal de datos que el núcleo creó para una transferencia.
+/// Opens the data channel that the core created for a transfer.
 ///
-/// Se reexporta desde `sb-transport` porque la necesitan todos los plugins que
-/// mueven bytes, y hacerles declarar el crate del transporte por una sola
-/// función iría en contra de que el SDK sea lo único que un plugin depende.
+/// It is re-exported from `sb-transport` because every plugin that moves bytes
+/// needs it, and making them declare the transport crate for a single function
+/// would go against the SDK being the only thing a plugin depends on.
 pub use sb_transport::connect_data;

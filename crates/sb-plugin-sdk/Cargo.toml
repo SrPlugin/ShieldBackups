@@ -5,9 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# Plugin mínimo real, usado por tests/smoke.rs para ejercitar el arranque
-# completo: sobre por stdin, mTLS, anuncio por stdout y una llamada gRPC.
-# Vive bajo tests/ para no ensuciar src/ ni acabar en el paquete publicado.
+# A real minimal plugin, used by tests/smoke.rs to exercise the full startup:
+# envelope on stdin, mTLS, announcement on stdout and one gRPC call. It lives
+# under tests/ so it does not clutter src/ nor end up in the published package.
 [[bin]]
 name = "sb-plugin-smoke"
 path = "tests/bin/smoke_plugin.rs"
@@ -19,8 +19,8 @@ workspace = true
 sb-proto = { version = "0.1.0", path = "../sb-proto" }
 sb-transport = { version = "0.1.0", path = "../sb-transport" }
 tonic = "0.14"
-# `io-std` no está en las features del workspace: solo el SDK lee stdin de forma
-# asíncrona, porque solo un plugin recibe su sobre de arranque por ahí.
+# `io-std` is not in the workspace features: only the SDK reads stdin
+# asynchronously, because only a plugin receives its bootstrap envelope there.
 tokio = { workspace = true, features = ["io-std"] }
 tokio-stream = "0.1"
 thiserror = { workspace = true }

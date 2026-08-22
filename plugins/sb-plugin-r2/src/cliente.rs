@@ -180,7 +180,7 @@ pub struct Contexto {
 }
 
 /// El contexto compartido entre los servicios del plugin.
-pub type Estado = sb_plugin_sdk::Configurado<Contexto>;
+pub type Estado = sb_plugin_sdk::Configured<Contexto>;
 
 #[cfg(test)]
 mod tests {

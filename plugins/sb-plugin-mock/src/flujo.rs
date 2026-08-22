@@ -1,13 +1,13 @@
 //! Mover bytes entre el canal de datos y el disco.
 //!
 //! El armazón de los RPC que mueven bytes —la tarea de fondo y el flujo de
-//! `Progress`— lo pone el SDK con `stream_de_progreso`. Lo que queda aquí es lo
+//! `Progress`— lo pone el SDK con `progress_stream`. Lo que queda aquí es lo
 //! único que es de este plugin: bombear bytes entre el socket y un fichero.
 
 use std::path::Path;
 
 use sb_plugin_sdk::tonic::Status;
-use sb_plugin_sdk::{EmisorProgreso, connect_data};
+use sb_plugin_sdk::{ProgressEmitter, connect_data};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 
@@ -19,7 +19,7 @@ pub const TROZO: usize = 64 * 1024;
 
 /// El hito del SDK, atado con este nombre para poder compararlo con `TROZO`.
 #[cfg(test)]
-use sb_plugin_sdk::progreso::HITO as MIB;
+use sb_plugin_sdk::progress::MILESTONE as MIB;
 
 /// Se conecta al canal de datos que creó el núcleo.
 ///
@@ -44,7 +44,7 @@ pub async fn conectar(socket: &str) -> Result<UnixStream, Status> {
 pub async fn del_canal_al_fichero(
     socket: &str,
     destino: &Path,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     // Conectar primero: si el canal no está, no tiene sentido dejar atrás un
     // fichero vacío que luego parecería un artefacto de cero bytes.
@@ -70,7 +70,7 @@ pub async fn del_canal_al_fichero(
         fichero.write_all(&buffer[..leidos]).await.map_err(|e| {
             Status::internal(format!("fallo escribiendo {}: {e}", destino.display()))
         })?;
-        progreso.avanzar(leidos).await;
+        progreso.advance(leidos).await;
     }
     // Sin el flush explícito el fichero podría quedarse corto justo cuando el
     // núcleo ya cree que la transferencia terminó.
@@ -89,7 +89,7 @@ pub async fn del_canal_al_fichero(
 pub async fn del_fichero_al_canal(
     socket: &str,
     origen: &Path,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let mut fichero = tokio::fs::File::open(origen)
         .await
@@ -106,7 +106,7 @@ pub async fn del_fichero_al_canal(
             break;
         }
         escribir(&mut canal, &buffer[..leidos]).await?;
-        progreso.avanzar(leidos).await;
+        progreso.advance(leidos).await;
     }
     cerrar(&mut canal).await
 }

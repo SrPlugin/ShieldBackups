@@ -10,7 +10,7 @@ use sb_plugin_sdk::sb_proto::{
     GetRequest, ListRequest, ListResponse, PutRequest,
 };
 use sb_plugin_sdk::tonic::{Request, Response, Status};
-use sb_plugin_sdk::{ProgresoStream, stream_de_progreso};
+use sb_plugin_sdk::{ProgressStream, progress_stream};
 
 use crate::claves;
 use crate::config::Estado;
@@ -29,22 +29,22 @@ impl DestinoMock {
 
 #[sb_plugin_sdk::tonic::async_trait]
 impl Storage for DestinoMock {
-    type PutStream = ProgresoStream;
-    type GetStream = ProgresoStream;
+    type PutStream = ProgressStream;
+    type GetStream = ProgressStream;
 
     async fn put(
         &self,
         peticion: Request<PutRequest>,
     ) -> Result<Response<Self::PutStream>, Status> {
-        let config = self.estado.resuelta()?;
+        let config = self.estado.resolved()?;
         let PutRequest { key, data_socket } = peticion.into_inner();
         // La clave se valida **antes** de abrir nada: un `..` debe fallar como
         // error inmediato del RPC, no como un error a mitad del flujo cuando
         // ya se escribió algo fuera del directorio.
         let destino = claves::ruta_de(&config.dir, &key)?;
-        Ok(stream_de_progreso(move |mut progreso| async move {
+        Ok(progress_stream(move |mut progreso| async move {
             flujo::del_canal_al_fichero(&data_socket, &destino, &mut progreso).await?;
-            progreso.terminar("artefacto almacenado").await;
+            progreso.finish("artefacto almacenado").await;
             tracing::info!(clave = %key, "artefacto almacenado");
             Ok(())
         }))
@@ -54,7 +54,7 @@ impl Storage for DestinoMock {
         &self,
         peticion: Request<GetRequest>,
     ) -> Result<Response<Self::GetStream>, Status> {
-        let config = self.estado.resuelta()?;
+        let config = self.estado.resolved()?;
         let GetRequest { key, data_socket } = peticion.into_inner();
         let origen = claves::ruta_de(&config.dir, &key)?;
         // La ausencia también se comprueba antes: el núcleo debe poder
@@ -65,15 +65,15 @@ impl Storage for DestinoMock {
                 config.dir.display()
             )));
         }
-        Ok(stream_de_progreso(move |mut progreso| async move {
+        Ok(progress_stream(move |mut progreso| async move {
             flujo::del_fichero_al_canal(&data_socket, &origen, &mut progreso).await?;
-            progreso.terminar("artefacto entregado").await;
+            progreso.finish("artefacto entregado").await;
             Ok(())
         }))
     }
 
     async fn list(&self, peticion: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let config = self.estado.resuelta()?;
+        let config = self.estado.resolved()?;
         let prefijo = peticion.into_inner().prefix;
         let encontrados = claves::listar(&config.dir, &prefijo).map_err(|e| {
             Status::internal(format!("no se pudo recorrer {}: {e}", config.dir.display()))
@@ -94,7 +94,7 @@ impl Storage for DestinoMock {
         &self,
         peticion: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let config = self.estado.resuelta()?;
+        let config = self.estado.resolved()?;
         let clave = peticion.into_inner().key;
         let ruta = claves::ruta_de(&config.dir, &clave)?;
         match tokio::fs::remove_file(&ruta).await {
@@ -120,7 +120,7 @@ impl Storage for DestinoMock {
         // Se exige configuración igual que en el resto del destino, aunque la
         // respuesta no dependa de ella: un núcleo que se saltó `Configure`
         // debe enterarse por el primer RPC que haga, no por el segundo.
-        let _ = self.estado.resuelta()?;
+        let _ = self.estado.resolved()?;
         // Este destino escribe cada artefacto de una vez: no hay multipart que
         // abortar, y por eso siempre son cero.
         Ok(Response::new(AbortIncompleteResponse { aborted: 0 }))

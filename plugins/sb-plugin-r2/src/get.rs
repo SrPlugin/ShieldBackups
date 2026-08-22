@@ -14,7 +14,7 @@
 //! salió.
 
 use aws_sdk_s3::primitives::ByteStream;
-use sb_plugin_sdk::EmisorProgreso;
+use sb_plugin_sdk::ProgressEmitter;
 use sb_plugin_sdk::tonic::Status;
 
 use crate::canal;
@@ -60,7 +60,7 @@ pub async fn pedir(contexto: &Contexto, clave: &str) -> Result<ByteStream, Statu
 pub async fn volcar(
     mut cuerpo: ByteStream,
     socket: &str,
-    progreso: &mut EmisorProgreso,
+    progreso: &mut ProgressEmitter,
 ) -> Result<(), Status> {
     let mut destino = canal::conectar(socket).await?;
     // `next()` entrega el siguiente trozo tal y como llegó de la red. El objeto
@@ -73,7 +73,7 @@ pub async fn volcar(
             Status::unavailable("la descarga desde R2 se cortó antes de terminar")
         })?;
         canal::escribir(&mut destino, &trozo).await?;
-        progreso.avanzar(trozo.len()).await;
+        progreso.advance(trozo.len()).await;
     }
     // El cierre es la señal de fin de flujo para el núcleo. Sin él, el
     // `restore` espera bytes que ya no vienen.
