@@ -1,28 +1,27 @@
-//! Subir un artefacto a R2.
+//! Uploading an artifact to R2.
 //!
-//! Es la parte más delicada del plugin, y lo es por dos motivos que no se ven
-//! hasta que duelen:
+//! It is the plugin's most delicate part, and it is so for two reasons that are
+//! invisible until they hurt:
 //!
-//! 1. **Las partes tienen que medir todas lo mismo salvo la última.** S3 lo
-//!    tolera; R2 no. De eso se encarga [`Troceador`], que está aparte y
-//!    probado sin red.
-//! 2. **Un multipart que falla hay que abortarlo.** Las partes ya subidas no
-//!    aparecen en un `ListObjects` —el objeto no existe todavía— pero ocupan y
-//!    **se facturan indefinidamente**. Por eso, en cuanto existe un
-//!    `upload_id`, todo lo demás ocurre dentro de `subir_partes` —privada, de
-//!    ahí que aquí no vaya enlazada— y el único camino de vuelta pasa por el
-//!    `match` de [`subir`], que aborta ante cualquier `Err`. Un `?` suelto por
-//!    encima de ese `match` sería exactamente el fallo que esta estructura
-//!    impide.
+//! 1. **Every part must be the same size except the last.** S3 tolerates
+//!    otherwise; R2 does not. [`Chunker`] takes care of that, and it lives
+//!    apart and is tested without networking.
+//! 2. **A multipart that fails must be aborted.** The parts already uploaded do
+//!    not show up in a `ListObjects` -- the object does not exist yet -- but
+//!    they take up space and **are billed indefinitely**. That is why, as soon
+//!    as an `upload_id` exists, everything else happens inside `upload_parts`
+//!    -- private, hence not linked here -- and the only way back goes through
+//!    the `match` in [`upload_from`], which aborts on any `Err`. A stray `?`
+//!    above that `match` would be exactly the failure this structure prevents.
 //!
-//! ## Memoria
+//! ## Memory
 //!
-//! Cada parte se acumula entera en memoria mientras se sube, así que el techo
-//! de memoria de una subida es **`part_size` × `concurrency`**. Con los valores
-//! por defecto —64 MiB y 4 partes a la vez— son 256 MiB. Subir ambos números
-//! sin pensarlo contradice la promesa de memoria acotada del resto del
-//! programa: multiplicar la concurrencia por cuatro también multiplica por
-//! cuatro la memoria, no solo la velocidad.
+//! Each part is accumulated whole in memory while it uploads, so an upload's
+//! memory ceiling is **`part_size` x `concurrency`**. With the default values
+//! -- 64 MiB and 4 parts at a time -- that is 256 MiB. Raising either number
+//! without thinking contradicts the bounded-memory promise of the rest of the
+//! program: multiplying the concurrency by four also multiplies the memory by
+//! four, not just the speed.
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, StorageClass};
@@ -31,354 +30,349 @@ use sb_plugin_sdk::tonic::Status;
 use tokio::io::AsyncRead;
 use tokio::task::JoinSet;
 
-use crate::canal;
-use crate::cliente::{Contexto, ErrorDeR2, traducir};
-use crate::config::PARTES_MAXIMAS;
-use crate::trozos::Troceador;
+use crate::channel;
+use crate::chunks::Chunker;
+use crate::client::{Context, R2Error, translate};
+use crate::config::MAX_PARTS;
 
-/// Sube el artefacto que llega por `socket` a la clave `clave`, ya prefijada.
+/// Uploads the artifact arriving over `socket` to the already prefixed `key`.
 ///
-/// Elige entre `PutObject` y multipart según lo que quepa en una parte, y en el
-/// segundo caso garantiza que ningún fallo deje la subida abierta.
+/// It picks between `PutObject` and multipart depending on what fits in one
+/// part, and in the second case it guarantees that no failure leaves the upload
+/// open.
 ///
 /// # Errors
 ///
-/// [`Status`] con el motivo ya depurado: el error del SDK de AWS no se propaga
-/// nunca, porque arrastra la petición que lo provocó y con ella la cabecera de
-/// autorización.
-pub async fn subir(
-    contexto: &Contexto,
-    clave: &str,
+/// [`Status`] with the already scrubbed reason: the AWS SDK's error is never
+/// propagated, because it drags along the request that caused it and with it
+/// the authorization header.
+pub async fn upload(
+    context: &Context,
+    key: &str,
     socket: &str,
-    progreso: &mut ProgressEmitter,
+    progress: &mut ProgressEmitter,
 ) -> Result<(), Status> {
-    let datos = canal::conectar(socket).await?;
-    subir_desde(contexto, clave, datos, progreso).await
+    let data = channel::connect(socket).await?;
+    upload_from(context, key, data, progress).await
 }
 
-/// Lo mismo que [`subir`], pero leyendo de `datos` en vez del canal de datos.
+/// The same as [`upload`], but reading from `data` instead of the data channel.
 ///
-/// La separación existe por una razón concreta: **el aborto de un multipart
-/// solo se puede probar con una fuente que falle a mitad**, y un socket Unix no
-/// sabe fallar. Cerrarlo es un fin de flujo limpio, no un error, así que por el
-/// canal de datos no hay forma de provocar el fallo cuyo manejo es lo más
-/// delicado de este módulo. `tests/integracion.rs` le pasa por aquí una fuente
-/// que entrega una parte y luego devuelve un error de E/S, y comprueba contra
-/// el servidor que no queda ninguna subida abierta.
+/// The separation exists for a concrete reason: **aborting a multipart can only
+/// be tested with a source that fails halfway**, and a Unix socket does not
+/// know how to fail. Closing it is a clean end of stream, not an error, so
+/// through the data channel there is no way to provoke the failure whose
+/// handling is the most delicate part of this module. `tests/integration.rs`
+/// pushes through here a source that delivers one part and then returns an I/O
+/// error, and checks against the server that no upload is left open.
 ///
 /// # Errors
 ///
-/// Igual que [`subir`].
-pub async fn subir_desde<R: AsyncRead + Unpin>(
-    contexto: &Contexto,
-    clave: &str,
-    datos: R,
-    progreso: &mut ProgressEmitter,
+/// The same as [`upload`].
+pub async fn upload_from<R: AsyncRead + Unpin>(
+    context: &Context,
+    key: &str,
+    data: R,
+    progress: &mut ProgressEmitter,
 ) -> Result<(), Status> {
-    let tamano_de_parte = contexto.config.part_size;
-    let mut troceador = Troceador::new(datos, tamano_de_parte);
+    let part_size = context.config.part_size;
+    let mut chunker = Chunker::new(data, part_size);
 
-    // La primera parte decide el camino. Leerla es obligatorio de todas formas,
-    // así que no cuesta nada.
-    let primera = troceador
-        .siguiente()
+    // The first part decides the path. Reading it is mandatory anyway, so it
+    // costs nothing.
+    let first = chunker
+        .next_chunk()
         .await
-        .map_err(|e| canal::fallo_de_lectura(&e))?
+        .map_err(|e| channel::read_failure(&e))?
         .unwrap_or_default();
 
-    // Objeto pequeño: una llamada en vez de tres, y ningún multipart que se
-    // pueda quedar huérfano. Los manifiestos, que son diminutos y se escriben
-    // en cada backup, pasan siempre por aquí.
-    if primera.len() < tamano_de_parte {
-        return directo(contexto, clave, primera, progreso).await;
+    // Small object: one call instead of three, and no multipart that could be
+    // left orphaned. Manifests, which are tiny and written on every backup,
+    // always come through here.
+    if first.len() < part_size {
+        return single_shot(context, key, first, progress).await;
     }
 
-    let upload_id = crear(contexto, clave).await?;
+    let upload_id = create(context, key).await?;
 
-    // A partir de esta línea existe una subida abierta en R2 que **no puede
-    // quedarse abierta**. Todo lo que falta vive dentro de `subir_partes`, cuyo
-    // único camino de salida es este `match`: no hay forma de saltarse el
-    // aborto sin borrar el `match` entero.
+    // From this line on there is an open upload in R2 that **must not stay
+    // open**. Everything that remains lives inside `upload_parts`, whose only
+    // way out is this `match`: there is no way to skip the abort without
+    // deleting the whole `match`.
     //
-    // Las tareas de las partes se crean aquí, y no dentro, para poder pararlas
-    // antes de abortar.
-    let mut tareas = JoinSet::new();
-    match subir_partes(
-        contexto,
-        clave,
-        &upload_id,
-        primera,
-        troceador,
-        &mut tareas,
-        progreso,
+    // The part tasks are created here, and not inside, so they can be stopped
+    // before aborting.
+    let mut tasks = JoinSet::new();
+    match upload_parts(
+        context, key, &upload_id, first, chunker, &mut tasks, progress,
     )
     .await
     {
         Ok(()) => Ok(()),
         Err(e) => {
-            // Primero se cancelan las partes que seguían en vuelo y se espera a
-            // que terminen; solo después se aborta. Al revés, una parte que
-            // llegara a R2 después del aborto se quedaría huérfana igualmente,
-            // que es justo lo que el aborto viene a evitar.
-            tareas.shutdown().await;
-            abortar(contexto, clave, &upload_id).await;
+            // First the parts still in flight are cancelled and waited for;
+            // only afterwards is the upload aborted. The other way round, a
+            // part reaching R2 after the abort would be orphaned all the same,
+            // which is exactly what the abort is there to prevent.
+            tasks.shutdown().await;
+            abort(context, key, &upload_id).await;
             Err(e)
         }
     }
 }
 
-/// El objeto entero de una vez.
-async fn directo(
-    contexto: &Contexto,
-    clave: &str,
-    cuerpo: Vec<u8>,
-    progreso: &mut ProgressEmitter,
+/// The whole object in one go.
+async fn single_shot(
+    context: &Context,
+    key: &str,
+    body: Vec<u8>,
+    progress: &mut ProgressEmitter,
 ) -> Result<(), Status> {
-    let bytes = cuerpo.len();
-    contexto
-        .cliente
+    let bytes = body.len();
+    context
+        .client
         .put_object()
-        .bucket(&contexto.config.bucket)
-        .key(clave)
-        .set_storage_class(clase(contexto))
-        .body(ByteStream::from(cuerpo))
+        .bucket(&context.config.bucket)
+        .key(key)
+        .set_storage_class(storage_class(context))
+        .body(ByteStream::from(body))
         .send()
         .await
-        .map_err(|e| traducir("PutObject", &e))?;
-    progreso.advance(bytes).await;
-    tracing::debug!(clave = %clave, bytes, "artefacto subido en una sola llamada");
+        .map_err(|e| translate("PutObject", &e))?;
+    progress.advance(bytes).await;
+    tracing::debug!(key = %key, bytes, "artifact uploaded in a single call");
     Ok(())
 }
 
-/// Abre la subida multipart y devuelve su identificador.
-async fn crear(contexto: &Contexto, clave: &str) -> Result<String, Status> {
-    let salida = contexto
-        .cliente
+/// Opens the multipart upload and returns its identifier.
+async fn create(context: &Context, key: &str) -> Result<String, Status> {
+    let output = context
+        .client
         .create_multipart_upload()
-        .bucket(&contexto.config.bucket)
-        .key(clave)
-        .set_storage_class(clase(contexto))
+        .bucket(&context.config.bucket)
+        .key(key)
+        .set_storage_class(storage_class(context))
         .send()
         .await
-        .map_err(|e| traducir("CreateMultipartUpload", &e))?;
-    // Sin `upload_id` no hay nada que abortar desde aquí: o la subida no llegó
-    // a existir, o existe y R2 no nos dijo su identificador, y en ese segundo
-    // caso el único remedio posible es `shieldbk storage gc`, que lista las
-    // incompletas del bucket. Por eso este error puede salir por `?` sin más.
-    salida.upload_id().map(ToString::to_string).ok_or_else(|| {
-        Status::internal("R2 aceptó `CreateMultipartUpload` pero no devolvió un `upload_id`")
+        .map_err(|e| translate("CreateMultipartUpload", &e))?;
+    // Without an `upload_id` there is nothing to abort from here: either the
+    // upload never came to exist, or it exists and R2 did not tell us its
+    // identifier, and in that second case the only possible remedy is
+    // `shieldbk storage gc`, which lists the bucket's incomplete uploads. That
+    // is why this error can just come out through `?`.
+    output.upload_id().map(ToString::to_string).ok_or_else(|| {
+        Status::internal("R2 accepted `CreateMultipartUpload` but returned no `upload_id`")
     })
 }
 
-/// Sube todas las partes y cierra el multipart.
+/// Uploads every part and closes the multipart.
 ///
-/// **Toda la función puede fallar libremente**: quien la llama aborta la subida
-/// ante cualquier `Err`, incluido el de `CompleteMultipartUpload`.
+/// **The whole function may fail freely**: its caller aborts the upload on any
+/// `Err`, including the one from `CompleteMultipartUpload`.
 ///
-/// Mantiene hasta `concurrency` partes subiéndose a la vez. El hueco se espera
-/// **antes** de leer la siguiente parte, no después: así nunca hay más de
-/// `concurrency` partes vivas en memoria a la vez.
+/// It keeps up to `concurrency` parts uploading at a time. The slot is awaited
+/// **before** reading the next part, not after: that way there are never more
+/// than `concurrency` parts alive in memory at once.
 ///
-/// `tareas` viene de fuera para que quien llama pueda pararlas antes de
-/// abortar, incluso —y sobre todo— cuando esta función sale por un error.
-async fn subir_partes<R: AsyncRead + Unpin>(
-    contexto: &Contexto,
-    clave: &str,
+/// `tasks` comes from outside so the caller can stop them before aborting, even
+/// -- and above all -- when this function exits through an error.
+async fn upload_parts<R: AsyncRead + Unpin>(
+    context: &Context,
+    key: &str,
     upload_id: &str,
-    primera: Vec<u8>,
-    mut troceador: Troceador<R>,
-    tareas: &mut JoinSet<Result<ParteSubida, ErrorDeR2>>,
-    progreso: &mut ProgressEmitter,
+    first: Vec<u8>,
+    mut chunker: Chunker<R>,
+    tasks: &mut JoinSet<Result<UploadedPart, R2Error>>,
+    progress: &mut ProgressEmitter,
 ) -> Result<(), Status> {
-    let concurrencia = contexto.config.concurrency.max(1);
-    let mut completadas: Vec<CompletedPart> = Vec::new();
-    let mut pendiente = Some(primera);
-    let mut indice: u64 = 0;
+    let concurrency = context.config.concurrency.max(1);
+    let mut completed: Vec<CompletedPart> = Vec::new();
+    let mut pending = Some(first);
+    let mut index: u64 = 0;
 
     loop {
-        // Primero el hueco, después la lectura: al revés habría `concurrency`
-        // partes en vuelo más la que se está leyendo.
-        while tareas.len() >= concurrencia {
-            recoger(tareas, &mut completadas, progreso).await?;
+        // The slot first, the read afterwards: the other way round there would
+        // be `concurrency` parts in flight plus the one being read.
+        while tasks.len() >= concurrency {
+            collect_one(tasks, &mut completed, progress).await?;
         }
 
-        let parte = match pendiente.take() {
+        let part = match pending.take() {
             Some(p) => p,
-            None => match troceador
-                .siguiente()
+            None => match chunker
+                .next_chunk()
                 .await
-                .map_err(|e| canal::fallo_de_lectura(&e))?
+                .map_err(|e| channel::read_failure(&e))?
             {
                 Some(p) => p,
                 None => break,
             },
         };
 
-        indice += 1;
-        if indice > PARTES_MAXIMAS {
-            // La configuración valida esto contra `max_object_gb`, pero el
-            // artefacto real puede ser mayor de lo que nadie esperaba. Mejor
-            // pararlo aquí que dejar que R2 rechace la parte 10 001.
+        index += 1;
+        if index > MAX_PARTS {
+            // The configuration validates this against `max_object_gb`, but the
+            // real artifact may be bigger than anyone expected. Better to stop
+            // it here than to let R2 reject part 10 001.
             return Err(Status::out_of_range(format!(
-                "el artefacto no cabe en las {PARTES_MAXIMAS} partes que admite una subida multipart con partes de {} bytes: sube `part_size_mb`",
-                contexto.config.part_size
+                "the artifact does not fit in the {MAX_PARTS} parts a multipart upload with {} byte parts admits: raise `part_size_mb`",
+                context.config.part_size
             )));
         }
-        // Tras la comprobación de arriba el índice nunca pasa de 10 000.
-        let numero = i32::try_from(indice).unwrap_or(i32::MAX);
+        // After the check above the index never goes past 10 000.
+        let number = i32::try_from(index).unwrap_or(i32::MAX);
 
-        tareas.spawn(subir_una(
-            contexto.cliente.clone(),
-            contexto.config.bucket.clone(),
-            clave.to_string(),
+        tasks.spawn(upload_one(
+            context.client.clone(),
+            context.config.bucket.clone(),
+            key.to_string(),
             upload_id.to_string(),
-            numero,
-            parte,
+            number,
+            part,
         ));
     }
 
-    while !tareas.is_empty() {
-        recoger(tareas, &mut completadas, progreso).await?;
+    while !tasks.is_empty() {
+        collect_one(tasks, &mut completed, progress).await?;
     }
 
-    // Las partes terminan en el orden en que R2 las conteste, que no es el
-    // orden en que se mandaron. `CompleteMultipartUpload` exige la lista
-    // ordenada por número de parte.
-    completadas.sort_by_key(CompletedPart::part_number);
+    // The parts finish in the order R2 answers them, which is not the order
+    // they were sent in. `CompleteMultipartUpload` requires the list sorted by
+    // part number.
+    completed.sort_by_key(CompletedPart::part_number);
 
-    contexto
-        .cliente
+    context
+        .client
         .complete_multipart_upload()
-        .bucket(&contexto.config.bucket)
-        .key(clave)
+        .bucket(&context.config.bucket)
+        .key(key)
         .upload_id(upload_id)
         .multipart_upload(
             CompletedMultipartUpload::builder()
-                .set_parts(Some(completadas))
+                .set_parts(Some(completed))
                 .build(),
         )
         .send()
         .await
-        .map_err(|e| traducir("CompleteMultipartUpload", &e))?;
+        .map_err(|e| translate("CompleteMultipartUpload", &e))?;
 
     tracing::debug!(
-        clave = %clave,
-        partes = indice,
-        bytes = troceador.total(),
-        "artefacto subido por multipart"
+        key = %key,
+        parts = index,
+        bytes = chunker.total(),
+        "artifact uploaded via multipart"
     );
     Ok(())
 }
 
-/// Lo que una parte deja al terminar.
-struct ParteSubida {
-    numero: i32,
-    /// El `ETag` que R2 devolvió. `CompleteMultipartUpload` lo exige de vuelta.
-    etiqueta: Option<String>,
+/// What a part leaves behind when it finishes.
+struct UploadedPart {
+    number: i32,
+    /// The `ETag` R2 returned. `CompleteMultipartUpload` requires it back.
+    etag: Option<String>,
     bytes: usize,
 }
 
-/// Sube una parte. Se ejecuta en su propia tarea, de ahí que reciba todo en
-/// propiedad; el `Client` se clona barato porque comparte el pool de
-/// conexiones.
-async fn subir_una(
-    cliente: aws_sdk_s3::Client,
+/// Uploads one part. It runs in its own task, hence it takes everything by
+/// value; the `Client` clones cheaply because it shares the connection pool.
+async fn upload_one(
+    client: aws_sdk_s3::Client,
     bucket: String,
-    clave: String,
+    key: String,
     upload_id: String,
-    numero: i32,
-    parte: Vec<u8>,
-) -> Result<ParteSubida, ErrorDeR2> {
-    let bytes = parte.len();
-    let salida = cliente
+    number: i32,
+    part: Vec<u8>,
+) -> Result<UploadedPart, R2Error> {
+    let bytes = part.len();
+    let output = client
         .upload_part()
         .bucket(bucket)
-        .key(clave)
+        .key(key)
         .upload_id(upload_id)
-        .part_number(numero)
-        .body(ByteStream::from(parte))
+        .part_number(number)
+        .body(ByteStream::from(part))
         .send()
         .await
-        .map_err(|e| traducir("UploadPart", &e))?;
-    Ok(ParteSubida {
-        numero,
-        etiqueta: salida.e_tag().map(ToString::to_string),
+        .map_err(|e| translate("UploadPart", &e))?;
+    Ok(UploadedPart {
+        number,
+        etag: output.e_tag().map(ToString::to_string),
         bytes,
     })
 }
 
-/// Espera a que termine una parte cualquiera y la anota.
+/// Waits for any part to finish and records it.
 ///
-/// El progreso se emite aquí y no al leer: lo que le interesa al operador es lo
-/// que ya está en R2, no lo que se leyó del socket.
-async fn recoger(
-    tareas: &mut JoinSet<Result<ParteSubida, ErrorDeR2>>,
-    completadas: &mut Vec<CompletedPart>,
-    progreso: &mut ProgressEmitter,
+/// Progress is emitted here and not on reading: what the operator cares about
+/// is what is already in R2, not what was read from the socket.
+async fn collect_one(
+    tasks: &mut JoinSet<Result<UploadedPart, R2Error>>,
+    completed: &mut Vec<CompletedPart>,
+    progress: &mut ProgressEmitter,
 ) -> Result<(), Status> {
-    let Some(union) = tareas.join_next().await else {
+    let Some(joined) = tasks.join_next().await else {
         return Ok(());
     };
-    // El motivo del `JoinError` se resume en vez de imprimirse: su `Display`
-    // incluye el mensaje del pánico, que es texto ajeno a este módulo.
-    let resultado = union.map_err(|e| {
+    // The `JoinError`'s reason is summarised instead of printed: its `Display`
+    // includes the panic message, which is text foreign to this module.
+    let result = joined.map_err(|e| {
         Status::internal(if e.is_panic() {
-            "la subida de una parte entró en pánico"
+            "a part's upload panicked"
         } else {
-            "la subida de una parte fue cancelada"
+            "a part's upload was cancelled"
         })
     })?;
-    let parte = resultado?;
-    progreso.advance(parte.bytes).await;
-    completadas.push(
+    let part = result?;
+    progress.advance(part.bytes).await;
+    completed.push(
         CompletedPart::builder()
-            .part_number(parte.numero)
-            .set_e_tag(parte.etiqueta)
+            .part_number(part.number)
+            .set_e_tag(part.etag)
             .build(),
     );
     Ok(())
 }
 
-/// Aborta la subida multipart. No devuelve error a propósito: se la llama
-/// **desde un camino que ya falló**, y el fallo que se le va a contar al núcleo
-/// es el original, no este.
+/// Aborts the multipart upload. It deliberately returns no error: it is called
+/// **from a path that already failed**, and the failure the core is going to be
+/// told about is the original one, not this one.
 ///
-/// Si el aborto tampoco sale, lo único que queda es dejarlo dicho en el log:
-/// las partes ya subidas siguen ahí, invisibles en un `ListObjects`, y se
-/// facturan hasta que alguien las quite.
-async fn abortar(contexto: &Contexto, clave: &str, upload_id: &str) {
-    match contexto
-        .cliente
+/// If the abort does not work either, the only thing left is to say so in the
+/// log: the parts already uploaded are still there, invisible in a
+/// `ListObjects`, and are billed until someone removes them.
+async fn abort(context: &Context, key: &str, upload_id: &str) {
+    match context
+        .client
         .abort_multipart_upload()
-        .bucket(&contexto.config.bucket)
-        .key(clave)
+        .bucket(&context.config.bucket)
+        .key(key)
         .upload_id(upload_id)
         .send()
         .await
     {
         Ok(_) => {
-            tracing::warn!(clave = %clave, "subida multipart abortada tras un fallo");
+            tracing::warn!(key = %key, "multipart upload aborted after a failure");
         }
         Err(e) => {
-            let motivo = traducir("AbortMultipartUpload", &e);
+            let reason = translate("AbortMultipartUpload", &e);
             tracing::error!(
-                clave = %clave,
-                error = %motivo,
-                "no se pudo abortar la subida multipart: las partes ya subidas quedan huérfanas, \
-                 no aparecen al listar el bucket y se facturan indefinidamente. \
-                 Ejecuta `shieldbk storage gc <destino>` para eliminarlas"
+                key = %key,
+                error = %reason,
+                "could not abort the multipart upload: the parts already uploaded are left \
+                 orphaned, do not show up when listing the bucket and are billed indefinitely. \
+                 Run `shieldbk storage gc <target>` to remove them"
             );
         }
     }
 }
 
-/// La clase de almacenamiento configurada, en el tipo que espera el SDK, o
-/// `None` cuando no hay que mandar la cabecera. Ver
-/// [`ClaseDeAlmacenamiento::cabecera`](crate::config::ClaseDeAlmacenamiento::cabecera).
-fn clase(contexto: &Contexto) -> Option<StorageClass> {
-    contexto
+/// The configured storage class, in the type the SDK expects, or `None` when
+/// the header must not be sent. See
+/// [`R2StorageClass::header`](crate::config::R2StorageClass::header).
+fn storage_class(context: &Context) -> Option<StorageClass> {
+    context
         .config
         .storage_class
-        .cabecera()
+        .header()
         .map(StorageClass::from)
 }

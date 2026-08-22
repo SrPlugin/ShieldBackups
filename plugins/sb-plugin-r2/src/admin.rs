@@ -1,89 +1,90 @@
-//! Listar, borrar y limpiar subidas incompletas.
+//! Listing, deleting and cleaning up incomplete uploads.
 //!
-//! Los tres RPC administrativos del destino. Lo que tienen en común, y lo que
-//! justifica que estén juntos, es que **los tres tienen que paginar o mentir**:
-//! la API de S3 corta las respuestas y devuelve un marcador para seguir.
+//! The storage target's three administrative RPCs. What they have in common,
+//! and what justifies keeping them together, is that **all three must paginate
+//! or lie**: the S3 API cuts responses short and returns a marker to continue.
 //!
-//! ## Por qué la paginación no es un detalle
+//! ## Why pagination is not a detail
 //!
-//! `ListObjectsV2` devuelve como mucho 1000 claves por página. Un destino que
-//! se quedara con la primera no daría un error: daría una lista **corta y
-//! silenciosa**. Con ella, `verify --all` diría que todo está bien tras mirar
-//! los mil primeros artefactos, y una retención borraría creyendo que no hay
-//! nada más. Una lista truncada es peor que un fallo, porque un fallo se ve.
+//! `ListObjectsV2` returns at most 1000 keys per page. A storage target that
+//! kept only the first one would not give an error: it would give a **short and
+//! silent** list. With it, `verify --all` would say everything is fine after
+//! looking at the first thousand artifacts, and a retention pass would delete
+//! believing there is nothing else. A truncated list is worse than a failure,
+//! because a failure is visible.
 //!
-//! Igual con `ListMultipartUploads`: las subidas que se dejan sin abortar no
-//! aparecen al listar el bucket y se facturan indefinidamente, así que la
-//! limpieza que solo mira la primera página deja pagando lo que no vio.
+//! Same with `ListMultipartUploads`: the uploads left unaborted do not show up
+//! when listing the bucket and are billed indefinitely, so a cleanup that only
+//! looks at the first page leaves you paying for what it did not see.
 
 use aws_sdk_s3::primitives::{DateTime, DateTimeFormat};
 use aws_sdk_s3::types::Object;
 use sb_plugin_sdk::tonic::Status;
 
-use crate::claves;
-use crate::cliente::{Contexto, traducir};
+use crate::client::{Context, translate};
+use crate::keys;
 
-/// Un artefacto tal y como lo ve `List`.
-pub struct Artefacto {
-    /// La clave **sin** el prefijo interno: es la que el núcleo usó al
-    /// guardarlo y la única con la que puede volver a pedirlo.
-    pub clave: String,
-    pub tamano: u64,
-    /// Fecha de última modificación en **RFC-3339 UTC con precisión de
-    /// segundo**: `2026-08-21T09:30:00Z`, veinte caracteres exactos. Es lo que
-    /// exige el `.proto` para `ArtifactMeta.modified_at`. Cadena vacía si R2 no
-    /// la devolvió.
-    pub modificado: String,
+/// An artifact as `List` sees it.
+pub struct Artifact {
+    /// The key **without** the internal prefix: it is the one the core used
+    /// when storing it and the only one it can request it back with.
+    pub key: String,
+    pub size: u64,
+    /// Last modification date in **RFC-3339 UTC with second precision**:
+    /// `2026-08-21T09:30:00Z`, exactly twenty characters. That is what the
+    /// `.proto` requires for `ArtifactMeta.modified_at`. Empty string if R2 did
+    /// not return it.
+    pub modified_at: String,
 }
 
-/// Todos los artefactos bajo `prefijo`, **paginando hasta el final**.
+/// Every artifact under `prefix`, **paginating to the end**.
 ///
-/// El prefijo llega ya completo —con el prefijo interno delante—; las claves
-/// que salen van sin él.
+/// The prefix arrives already complete -- with the internal prefix in front --;
+/// the keys that come out go without it.
 ///
 /// # Errors
 ///
-/// El motivo ya depurado si R2 falla en cualquiera de las páginas. Una página
-/// que falla aborta el listado entero a propósito: devolver lo que se llevaba
-/// sería exactamente la lista truncada que este módulo existe para evitar.
-pub async fn listar(contexto: &Contexto, prefijo: &str) -> Result<Vec<Artefacto>, Status> {
-    let mut encontrados = Vec::new();
+/// The already scrubbed reason if R2 fails on any of the pages. A page that
+/// fails aborts the whole listing on purpose: returning what had been gathered
+/// would be exactly the truncated list this module exists to prevent.
+pub async fn list(context: &Context, prefix: &str) -> Result<Vec<Artifact>, Status> {
+    let mut found = Vec::new();
     let mut token: Option<String> = None;
-    let mut paginas = 0_u64;
+    let mut pages = 0_u64;
 
     loop {
-        let pagina = contexto
-            .cliente
+        let page = context
+            .client
             .list_objects_v2()
-            .bucket(&contexto.config.bucket)
-            .prefix(prefijo)
+            .bucket(&context.config.bucket)
+            .prefix(prefix)
             .set_continuation_token(token.clone())
             .send()
             .await
-            .map_err(|e| traducir("ListObjectsV2", &e))?;
-        paginas += 1;
+            .map_err(|e| translate("ListObjectsV2", &e))?;
+        pages += 1;
 
-        for objeto in pagina.contents() {
-            if let Some(artefacto) = artefacto_de(contexto, objeto) {
-                encontrados.push(artefacto);
+        for object in page.contents() {
+            if let Some(artifact) = artifact_from(context, object) {
+                found.push(artifact);
             }
         }
 
-        // El marcador de la página siguiente es la única condición de parada
-        // fiable: `is_truncated` es opcional en la respuesta y hay servidores
-        // compatibles con S3 que no lo mandan.
-        let siguiente = pagina
+        // The next page's marker is the only reliable stopping condition:
+        // `is_truncated` is optional in the response and there are
+        // S3-compatible servers that do not send it.
+        let next = page
             .next_continuation_token()
             .map(ToString::to_string)
             .filter(|t| !t.is_empty());
-        match siguiente {
+        match next {
             None => break,
-            // Un servidor que repitiera el marcador dejaría este bucle pidiendo
-            // la misma página para siempre. Es lo mismo que hace el paginador
-            // del SDK con `stop_on_duplicate_token`.
+            // A server that repeated the marker would leave this loop asking
+            // for the same page forever. It is the same thing the SDK's
+            // paginator does with `stop_on_duplicate_token`.
             Some(t) if Some(&t) == token.as_ref() => {
                 tracing::warn!(
-                    "R2 repitió el marcador de continuación al listar: se corta el listado aquí"
+                    "R2 repeated the continuation marker while listing: the listing is cut off here"
                 );
                 break;
             }
@@ -92,175 +93,179 @@ pub async fn listar(contexto: &Contexto, prefijo: &str) -> Result<Vec<Artefacto>
     }
 
     tracing::debug!(
-        prefijo = %prefijo,
-        paginas,
-        artefactos = encontrados.len(),
-        "listado completado"
+        prefix = %prefix,
+        pages,
+        artifacts = found.len(),
+        "listing complete"
     );
-    Ok(encontrados)
+    Ok(found)
 }
 
-/// Traduce un objeto de S3 a un artefacto. `None` si no trae clave, que no
-/// debería pasar y que no da nada que devolverle al núcleo.
-fn artefacto_de(contexto: &Contexto, objeto: &Object) -> Option<Artefacto> {
-    let clave = objeto.key()?;
-    Some(Artefacto {
-        clave: claves::sin_prefijo(clave, contexto.config.prefix()),
-        // Un tamaño negativo no existe en S3; si llegara, cero es más honesto
-        // que un número enorme por dar la vuelta.
-        tamano: u64::try_from(objeto.size().unwrap_or(0)).unwrap_or(0),
-        modificado: objeto.last_modified().map(fecha).unwrap_or_default(),
+/// Translates an S3 object into an artifact. `None` if it carries no key, which
+/// should not happen and gives nothing to return to the core.
+fn artifact_from(context: &Context, object: &Object) -> Option<Artifact> {
+    let key = object.key()?;
+    Some(Artifact {
+        key: keys::without_prefix(key, context.config.prefix()),
+        // A negative size does not exist in S3; if one arrived, zero is more
+        // honest than a huge number from wrapping around.
+        size: u64::try_from(object.size().unwrap_or(0)).unwrap_or(0),
+        modified_at: object.last_modified().map(timestamp).unwrap_or_default(),
     })
 }
 
-/// La fecha en el formato que fija el `.proto`: RFC-3339 UTC **sin fracción de
-/// segundo**.
+/// The date in the format the `.proto` fixes: RFC-3339 UTC **without
+/// fractional seconds**.
 ///
-/// El truncado a segundos no es cosmético. R2 devuelve milisegundos y el
-/// destino de pruebas no los tiene, así que sin truncar los dos destinos
-/// producen cadenas que **no se pueden ordenar entre sí**: `…:15Z` y
-/// `…:15.983Z` se comparan en el carácter 19, donde `Z` es mayor que `.`, y el
-/// artefacto más antiguo sale por delante del más nuevo. Lo destapó el test de
-/// integración contra `MinIO`, comparando lo que devuelve este plugin con lo
-/// que promete el contrato.
-fn fecha(momento: &DateTime) -> String {
-    DateTime::from_secs(momento.secs())
+/// Truncating to seconds is not cosmetic. R2 returns milliseconds and the test
+/// storage target does not have them, so without truncating the two targets
+/// produce strings that **cannot be sorted against each other**: `...:15Z` and
+/// `...:15.983Z` compare at character 19, where `Z` is greater than `.`, and
+/// the older artifact comes out ahead of the newer one. The integration test
+/// against `MinIO` uncovered it, comparing what this plugin returns with what
+/// the contract promises.
+fn timestamp(instant: &DateTime) -> String {
+    DateTime::from_secs(instant.secs())
         .fmt(DateTimeFormat::DateTime)
         .unwrap_or_default()
 }
 
-/// Borra `clave`. **Es idempotente**: borrar lo que ya no está no es un error.
+/// Deletes `key`. **It is idempotent**: deleting what is already gone is not an
+/// error.
 ///
-/// La retención se reintenta, y un reintento que acierta —porque la pasada
-/// anterior ya borró la mitad— no puede convertirse en un fallo de la
-/// operación entera.
+/// Retention is retried, and a retry that succeeds -- because the previous pass
+/// already deleted half of it -- cannot turn into a failure of the whole
+/// operation.
 ///
 /// # Errors
 ///
-/// El motivo ya depurado si R2 falla por algo que no sea la ausencia del
-/// objeto.
-pub async fn borrar(contexto: &Contexto, clave: &str) -> Result<(), Status> {
-    match contexto
-        .cliente
+/// The already scrubbed reason if R2 fails for something other than the
+/// object's absence.
+pub async fn delete(context: &Context, key: &str) -> Result<(), Status> {
+    match context
+        .client
         .delete_object()
-        .bucket(&contexto.config.bucket)
-        .key(clave)
+        .bucket(&context.config.bucket)
+        .key(key)
         .send()
         .await
     {
         Ok(_) => Ok(()),
         Err(e) => {
-            let motivo = traducir("DeleteObject", &e);
-            // S3 contesta 204 al borrar algo que no existe, pero no todos los
-            // servidores compatibles lo hacen; el que conteste 404 tampoco
-            // debe hacer fallar la retención.
-            if motivo.es_ausencia() {
-                tracing::debug!(clave = %clave, "borrado de un artefacto que ya no estaba");
+            let reason = translate("DeleteObject", &e);
+            // S3 answers 204 when deleting something that does not exist, but
+            // not every compatible server does; one that answers 404 must not
+            // make the retention pass fail either.
+            if reason.is_missing() {
+                tracing::debug!(key = %key, "deletion of an artifact that was already gone");
                 return Ok(());
             }
-            Err(motivo.into())
+            Err(reason.into())
         }
     }
 }
 
-/// Aborta todas las subidas multipart incompletas bajo `prefijo` y devuelve
-/// cuántas eran. Es lo que respalda `shieldbk storage gc`.
+/// Aborts every incomplete multipart upload under `prefix` and returns how many
+/// there were. It is what backs `shieldbk storage gc`.
 ///
-/// Pagina con la pareja de marcadores que usa `ListMultipartUploads` —clave y
-/// `upload_id`—, porque una misma clave puede tener varias subidas abiertas y
-/// la clave sola no las distingue.
+/// It paginates with the pair of markers `ListMultipartUploads` uses -- key and
+/// `upload_id` -- because one key may have several open uploads and the key
+/// alone does not tell them apart.
 ///
-/// El filtro por prefijo lo aplica **este código**, no el servidor: ver el
-/// comentario dentro del bucle.
+/// The prefix filter is applied by **this code**, not by the server: see the
+/// comment inside the loop.
 ///
 /// # Errors
 ///
-/// El motivo ya depurado si falla el listado o alguno de los abortos.
-pub async fn abortar_incompletos(contexto: &Contexto, prefijo: &str) -> Result<u32, Status> {
-    let mut abortadas = 0_u32;
-    // La pareja de marcadores viaja junta: `upload_id_marker` sin su
-    // `key_marker` no significa nada.
-    let mut marcador: Option<(String, Option<String>)> = None;
+/// The already scrubbed reason if the listing or any of the aborts fails.
+pub async fn abort_incomplete(context: &Context, prefix: &str) -> Result<u32, Status> {
+    let mut aborted = 0_u32;
+    // The pair of markers travels together: `upload_id_marker` without its
+    // `key_marker` means nothing.
+    let mut marker: Option<(String, Option<String>)> = None;
 
     loop {
-        let (clave_desde, id_desde) = match &marcador {
-            Some((clave, id)) => (Some(clave.clone()), id.clone()),
+        let (key_from, id_from) = match &marker {
+            Some((key, id)) => (Some(key.clone()), id.clone()),
             None => (None, None),
         };
-        // **Sin `prefix` en la petición, a propósito.** El parámetro existe en
-        // la API, pero no todos los servidores compatibles con S3 lo
-        // implementan: `MinIO` solo devuelve algo cuando el prefijo es el
-        // nombre completo del objeto, y con cualquier prefijo parcial contesta
-        // una lista vacía. Confiar en él convierte `shieldbk storage gc` en una
-        // operación que **dice que abortó cero y se queda tan ancha** mientras
-        // las partes huérfanas se siguen facturando. Un filtro que no filtra se
-        // ve; uno que devuelve vacío, no.
+        // **No `prefix` in the request, on purpose.** The parameter exists in
+        // the API, but not every S3-compatible server implements it: `MinIO`
+        // only returns something when the prefix is the object's full name, and
+        // with any partial prefix it answers an empty list. Trusting it turns
+        // `shieldbk storage gc` into an operation that **says it aborted zero
+        // and stays perfectly happy** while the orphaned parts keep being
+        // billed. A filter that does not filter is visible; one that returns
+        // empty is not.
         //
-        // El filtrado se hace aquí abajo, sobre la clave. Cuesta traer las
-        // subidas de todo el bucket, pero las subidas en curso son pocas por
-        // definición: las que sobreviven son fallos, no tráfico normal.
-        let pagina = contexto
-            .cliente
+        // The filtering happens down below, on the key. Fetching the uploads
+        // for the whole bucket costs something, but uploads in progress are few
+        // by definition: the ones that survive are failures, not normal
+        // traffic.
+        let page = context
+            .client
             .list_multipart_uploads()
-            .bucket(&contexto.config.bucket)
-            .set_key_marker(clave_desde)
-            .set_upload_id_marker(id_desde)
+            .bucket(&context.config.bucket)
+            .set_key_marker(key_from)
+            .set_upload_id_marker(id_from)
             .send()
             .await
-            .map_err(|e| traducir("ListMultipartUploads", &e))?;
+            .map_err(|e| translate("ListMultipartUploads", &e))?;
 
-        for subida in pagina.uploads() {
-            let (Some(clave), Some(id)) = (subida.key(), subida.upload_id()) else {
+        for upload in page.uploads() {
+            let (Some(key), Some(id)) = (upload.key(), upload.upload_id()) else {
                 continue;
             };
-            // Lo que no está bajo el prefijo no es nuestro. En un bucket
-            // compartido, abortar la subida de otro sería destruir su backup a
-            // mitad.
-            if !clave.starts_with(prefijo) {
+            // What is not under the prefix is not ours. In a shared bucket,
+            // aborting somebody else's upload would destroy their backup
+            // halfway through.
+            if !key.starts_with(prefix) {
                 continue;
             }
-            contexto
-                .cliente
+            context
+                .client
                 .abort_multipart_upload()
-                .bucket(&contexto.config.bucket)
-                .key(clave)
+                .bucket(&context.config.bucket)
+                .key(key)
                 .upload_id(id)
                 .send()
                 .await
-                .map_err(|e| traducir("AbortMultipartUpload", &e))?;
-            abortadas = abortadas.saturating_add(1);
-            tracing::info!(clave = %clave, "subida multipart incompleta abortada");
+                .map_err(|e| translate("AbortMultipartUpload", &e))?;
+            aborted = aborted.saturating_add(1);
+            tracing::info!(key = %key, "incomplete multipart upload aborted");
         }
 
-        if pagina.is_truncated() != Some(true) {
+        if page.is_truncated() != Some(true) {
             break;
         }
-        let siguiente = pagina.next_key_marker().map(|clave| {
+        let next = page.next_key_marker().map(|key| {
             (
-                clave.to_string(),
-                pagina.next_upload_id_marker().map(ToString::to_string),
+                key.to_string(),
+                page.next_upload_id_marker().map(ToString::to_string),
             )
         });
-        match siguiente {
-            // Truncado pero sin marcador: no hay forma de pedir la página
-            // siguiente. Se corta y se deja dicho, porque quedan subidas sin
-            // abortar y siguen facturándose.
+        match next {
+            // Truncated but with no marker: there is no way to ask for the next
+            // page. It is cut off and said out loud, because there are uploads
+            // left unaborted and they keep being billed.
             None => {
                 tracing::warn!(
-                    "R2 dijo que el listado de subidas incompletas seguía pero no mandó marcador: \
-                     puede quedar alguna sin abortar"
+                    "R2 said the listing of incomplete uploads continued but sent no marker: \
+                     some may be left unaborted"
                 );
                 break;
             }
-            Some(s) if Some(&s) == marcador.as_ref() => {
-                tracing::warn!("R2 repitió el marcador de subidas incompletas: se corta aquí");
+            Some(s) if Some(&s) == marker.as_ref() => {
+                tracing::warn!(
+                    "R2 repeated the incomplete-uploads marker: the listing is cut off here"
+                );
                 break;
             }
-            Some(s) => marcador = Some(s),
+            Some(s) => marker = Some(s),
         }
     }
 
-    Ok(abortadas)
+    Ok(aborted)
 }
 
 #[cfg(test)]
@@ -268,23 +273,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn la_fecha_sale_en_rfc3339_utc_con_precision_de_segundo() {
+    fn the_date_comes_out_as_rfc3339_utc_with_second_precision() {
         // 1 771 234 200 = 2026-02-16T09:30:00Z.
         assert_eq!(
-            fecha(&DateTime::from_secs(1_771_234_200)),
+            timestamp(&DateTime::from_secs(1_771_234_200)),
             "2026-02-16T09:30:00Z"
         );
     }
 
     #[test]
-    fn los_milisegundos_que_manda_r2_se_recortan() {
-        // Sin recortar saldría `2026-02-16T09:30:00.983Z`, que ordena **por
-        // detrás** de un `2026-02-16T09:30:00Z` de otro destino aunque sea
-        // posterior: en el carácter 19 se compara `.` contra `Z`.
-        let con_milisegundos = DateTime::from_secs_and_nanos(1_771_234_200, 983_000_000);
-        let recortada = fecha(&con_milisegundos);
-        assert_eq!(recortada, "2026-02-16T09:30:00Z");
-        assert_eq!(recortada.len(), 20);
-        assert!(recortada > fecha(&DateTime::from_secs(1_771_234_199)));
+    fn the_milliseconds_r2_sends_are_trimmed() {
+        // Without trimming it would come out as `2026-02-16T09:30:00.983Z`,
+        // which sorts **behind** a `2026-02-16T09:30:00Z` from another target
+        // even though it is later: at character 19 `.` is compared against `Z`.
+        let with_millis = DateTime::from_secs_and_nanos(1_771_234_200, 983_000_000);
+        let trimmed = timestamp(&with_millis);
+        assert_eq!(trimmed, "2026-02-16T09:30:00Z");
+        assert_eq!(trimmed.len(), 20);
+        assert!(trimmed > timestamp(&DateTime::from_secs(1_771_234_199)));
     }
 }

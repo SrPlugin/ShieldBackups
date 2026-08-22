@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# La lógica del plugin se expone también como librería para que
-# `tests/integracion.rs` pueda ejercitarla contra un MinIO real: por gRPC no se
-# puede mirar dentro del bucket, y las partes de un multipart a medio subir
-# solo se ven desde dentro.
+# The plugin's logic is also exposed as a library so that
+# `tests/integration.rs` can exercise it against a real MinIO: over gRPC there
+# is no way to look inside the bucket, and the parts of a half-uploaded
+# multipart are only visible from the inside.
 [lib]
 name = "sb_plugin_r2"
 path = "src/lib.rs"
@@ -23,12 +23,12 @@ workspace = true
 
 [dependencies]
 sb-plugin-sdk = { version = "0.1.0", path = "../../crates/sb-plugin-sdk" }
-# Sin `default-features`: el conjunto por defecto incluye la feature `rustls`,
-# que en el SDK de AWS no es el cliente de TLS moderno sino el *legacy*
-# (hyper 0.14 + rustls 0.21 + h2 0.3). Ese árbol paralelo se compila, se
-# enlaza, no se usa —el cliente real sale de `default-https-client`— y arrastra
-# RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101) y RUSTSEC-2026-0258 (h2
-# 0.3). Aquí se repite el resto del conjunto por defecto y se deja fuera esa.
+# Without `default-features`: the default set includes the `rustls` feature,
+# which in the AWS SDK is not the modern TLS client but the *legacy* one
+# (hyper 0.14 + rustls 0.21 + h2 0.3). That parallel tree compiles, links, goes
+# unused -- the real client comes from `default-https-client` -- and drags in
+# RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101) and RUSTSEC-2026-0258 (h2
+# 0.3). Here the rest of the default set is repeated and that one is left out.
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "sigv4a",
     "http-1x",
@@ -42,17 +42,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Solo los tests necesitan el transporte: ahí se hace de núcleo —crear el canal
-# de datos y el sobre de arranque—, no de plugin.
+# Only the tests need the transport: there they play the role of the core --
+# creating the data channel and the bootstrap envelope -- not of a plugin.
 sb-transport = { version = "0.1.0", path = "../../crates/sb-transport" }
 tempfile = "3"
-# MinIO habla el protocolo de S3 y corre en Docker, así que permite ejercitar el
-# plugin entero sin credenciales de Cloudflare ni coste. Lo que **no** valida es
-# la regla de R2 de que todas las partes de un multipart salvo la última midan
-# lo mismo: MinIO es más permisivo. Esa regla la fija igualmente
-# `tests/integracion.rs`, y se comprueba contra R2 real en otra tarea.
+# MinIO speaks the S3 protocol and runs in Docker, so it allows exercising the
+# whole plugin without Cloudflare credentials and at no cost. What it does
+# **not** validate is R2's rule that every part of a multipart except the last
+# must be the same size: MinIO is more permissive. That rule is pinned down by
+# `tests/integration.rs` anyway, and is checked against real R2 in another task.
 #
-# `testcontainers-modules` 0.15 exige `testcontainers` ^0.27, así que aquí no se
-# puede subir a 0.28 mientras no salga el módulo correspondiente.
+# `testcontainers-modules` 0.15 requires `testcontainers` ^0.27, so it cannot be
+# bumped to 0.28 here until the corresponding module is released.
 testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["minio"] }

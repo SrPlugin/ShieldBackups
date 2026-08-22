@@ -1,28 +1,28 @@
-//! `sb-plugin-r2`: el destino de backups sobre Cloudflare R2.
+//! `sb-plugin-r2`: the backup storage target on top of Cloudflare R2.
 //!
-//! R2 habla el protocolo de S3, y de ahí que el plugin use el SDK de AWS. Lo
-//! que no es de S3 —la región `auto`, el endpoint de cuenta, los checksums y
-//! el tamaño uniforme de las partes— está aislado en [`cliente`] y [`config`],
-//! con el motivo escrito al lado.
+//! R2 speaks the S3 protocol, which is why the plugin uses the AWS SDK. What is
+//! not S3 -- the `auto` region, the account endpoint, the checksums and the
+//! uniform part size -- is isolated in [`client`] and [`config`], with the
+//! reason written next to it.
 //!
-//! ## Por qué esto es una librería y no solo un binario
+//! ## Why this is a library and not just a binary
 //!
-//! El binario `sb-plugin-r2` es cuatro líneas y toda la lógica vive aquí. La
-//! razón es que los módulos hay que poder ejercitarlos **contra un servidor de
-//! verdad**: `tests/integracion.rs` levanta un `MinIO` en Docker, monta un
-//! [`cliente::Contexto`] apuntando a él y llama a [`put::subir`],
-//! [`admin::listar`] y compañía. Con los módulos privados dentro del binario,
-//! esas pruebas solo podrían hablar por gRPC y no podrían mirar el bucket por
-//! dentro —las partes de un multipart a medio subir, por ejemplo, que es
-//! justamente lo que hay que comprobar—.
+//! The `sb-plugin-r2` binary is four lines and all the logic lives here. The
+//! reason is that the modules must be exercisable **against a real server**:
+//! `tests/integration.rs` brings up a `MinIO` in Docker, builds a
+//! [`client::Context`] pointing at it and calls [`put::upload`],
+//! [`admin::list`] and friends. With the modules private inside the binary,
+//! those tests could only talk over gRPC and could not look inside the bucket
+//! -- the parts of a half-uploaded multipart, for instance, which is exactly
+//! what needs checking.
 
 pub mod admin;
-pub mod canal;
-pub mod claves;
-pub mod cliente;
+pub mod channel;
+pub mod chunks;
+pub mod client;
 pub mod config;
 pub mod get;
+pub mod keys;
 pub mod plugin;
 pub mod put;
 pub mod storage;
-pub mod trozos;

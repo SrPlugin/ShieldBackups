@@ -1,81 +1,82 @@
-//! Descargar un artefacto de R2 y volcarlo en el canal de datos.
+//! Downloading an artifact from R2 and pouring it into the data channel.
 //!
-//! Lo único delicado aquí es lo que **no** se hace: no se llama a
-//! `body.collect()`. Esa llamada, que es la que sale en todos los ejemplos del
-//! SDK, junta el objeto entero en memoria antes de devolverlo. Un artefacto de
-//! este programa puede pesar cientos de gigabytes, y la promesa de memoria
-//! acotada se rompería aquí y en ningún otro sitio. El cuerpo se
-//! consume trozo a trozo, según llega de la red, y cada trozo se escribe y se
-//! suelta.
+//! The only delicate thing here is what is **not** done: `body.collect()` is
+//! never called. That call, the one that shows up in every SDK example, gathers
+//! the whole object in memory before returning it. An artifact from this
+//! program can weigh hundreds of gigabytes, and the promise of bounded memory
+//! would break here and nowhere else. The body is consumed chunk by chunk, as
+//! it arrives from the network, and each chunk is written and released.
 //!
-//! La ausencia se detecta **antes** de responder al RPC: el núcleo distingue
-//! «ese artefacto no existe» de «la transferencia se cortó», y esa distinción
-//! se pierde si el error llega por el flujo de progreso cuando la respuesta ya
-//! salió.
+//! Absence is detected **before** answering the RPC: the core tells "that
+//! artifact does not exist" from "the transfer was cut off", and that
+//! distinction is lost if the error arrives through the progress stream once
+//! the response has already gone out.
 
 use aws_sdk_s3::primitives::ByteStream;
 use sb_plugin_sdk::ProgressEmitter;
 use sb_plugin_sdk::tonic::Status;
 
-use crate::canal;
-use crate::cliente::{Contexto, traducir};
+use crate::channel;
+use crate::client::{Context, translate};
 
-/// Pide el objeto a R2 y devuelve su cuerpo **sin leer**.
+/// Asks R2 for the object and returns its body **unread**.
 ///
-/// Se llama desde el cuerpo del RPC, no desde la tarea de fondo: así un
-/// artefacto que no está se contesta como un error de la llamada y no como un
-/// corte a mitad del flujo.
+/// It is called from the RPC's body, not from the background task: that way a
+/// missing artifact is answered as an error of the call and not as a mid-stream
+/// cut.
 ///
 /// # Errors
 ///
-/// [`Status::not_found`] con la clave dentro si el objeto no existe, y el
-/// motivo ya depurado en cualquier otro fallo contra R2.
-pub async fn pedir(contexto: &Contexto, clave: &str) -> Result<ByteStream, Status> {
-    let salida = contexto
-        .cliente
+/// [`Status::not_found`] with the key inside if the object does not exist, and
+/// the already scrubbed reason for any other failure against R2.
+pub async fn fetch(context: &Context, key: &str) -> Result<ByteStream, Status> {
+    let output = context
+        .client
         .get_object()
-        .bucket(&contexto.config.bucket)
-        .key(clave)
+        .bucket(&context.config.bucket)
+        .key(key)
         .send()
         .await
         .map_err(|e| {
-            let motivo = traducir("GetObject", &e);
-            if motivo.es_ausencia() {
+            let reason = translate("GetObject", &e);
+            if reason.is_missing() {
                 return Status::not_found(format!(
-                    "el artefacto `{clave}` no existe en el bucket `{}`",
-                    contexto.config.bucket
+                    "the artifact `{key}` does not exist in bucket `{}`",
+                    context.config.bucket
                 ));
             }
-            Status::from(motivo)
+            Status::from(reason)
         })?;
-    Ok(salida.body)
+    Ok(output.body)
 }
 
-/// Vuelca `cuerpo` en el canal de datos, trozo a trozo, y lo cierra.
+/// Pours `body` into the data channel, chunk by chunk, and closes it.
 ///
 /// # Errors
 ///
-/// [`Status::unavailable`] si falla la red de R2 o el canal de datos: en ambos
-/// casos el artefacto no llegó entero y el núcleo tiene que enterarse.
-pub async fn volcar(
-    mut cuerpo: ByteStream,
+/// [`Status::unavailable`] if R2's network or the data channel fails: in either
+/// case the artifact did not arrive whole and the core has to find out.
+pub async fn drain(
+    mut body: ByteStream,
     socket: &str,
-    progreso: &mut ProgressEmitter,
+    progress: &mut ProgressEmitter,
 ) -> Result<(), Status> {
-    let mut destino = canal::conectar(socket).await?;
-    // `next()` entrega el siguiente trozo tal y como llegó de la red. El objeto
-    // entero no está nunca en memoria: solo el trozo que se está escribiendo.
-    while let Some(trozo) = cuerpo.next().await {
-        let trozo = trozo.map_err(|e| {
-            // El error del cuerpo es del SDK y podría arrastrar la petición que
-            // lo provocó; solo se dice que la descarga se cortó.
-            tracing::debug!(error = %e, "el cuerpo de GetObject se cortó");
-            Status::unavailable("la descarga desde R2 se cortó antes de terminar")
+    let mut dest = channel::connect(socket).await?;
+    // `next()` hands over the next chunk exactly as it arrived from the
+    // network. The whole object is never in memory: only the chunk being
+    // written.
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| {
+            // The body's error belongs to the SDK and could drag along the
+            // request that caused it; all that is said is that the download was
+            // cut off.
+            tracing::debug!(error = %e, "the GetObject body was cut off");
+            Status::unavailable("the download from R2 was cut off before finishing")
         })?;
-        canal::escribir(&mut destino, &trozo).await?;
-        progreso.advance(trozo.len()).await;
+        channel::write(&mut dest, &chunk).await?;
+        progress.advance(chunk.len()).await;
     }
-    // El cierre es la señal de fin de flujo para el núcleo. Sin él, el
-    // `restore` espera bytes que ya no vienen.
-    canal::cerrar(&mut destino).await
+    // Closing is the end-of-stream signal for the core. Without it, the
+    // `restore` waits for bytes that are not coming.
+    channel::close(&mut dest).await
 }

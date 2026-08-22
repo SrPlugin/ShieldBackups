@@ -1,18 +1,18 @@
-//! El destino R2.
+//! The R2 storage target.
 //!
-//! Los cinco RPC son finos a propósito: cada uno resuelve con un `?` lo que se
-//! puede saber **antes** de mover un byte —la configuración, la clave, la
-//! ausencia del objeto— y delega el resto en el módulo que lleva lo delicado
-//! ([`crate::put`], [`crate::get`], [`crate::admin`]).
+//! The five RPCs are deliberately thin: each one resolves with a `?` whatever
+//! can be known **before** moving a byte -- the configuration, the key, the
+//! object's absence -- and delegates the rest to the module that carries the
+//! delicate part ([`crate::put`], [`crate::get`], [`crate::admin`]).
 //!
-//! Esa división no es estética. Una vez que [`progress_stream`] responde al
-//! RPC, el error ya no puede volver como `Status` de la llamada: solo por el
-//! flujo de progreso, donde el núcleo lo trata como una transferencia cortada.
-//! «Ese artefacto no existe» y «la descarga se cortó» son cosas distintas para
-//! quien restaura, así que la primera se decide arriba.
+//! That division is not aesthetic. Once [`progress_stream`] has answered the
+//! RPC, the error can no longer come back as the call's `Status`: only through
+//! the progress stream, where the core treats it as a cut transfer. "That
+//! artifact does not exist" and "the download was cut off" are different things
+//! for whoever is restoring, so the first one is decided up here.
 //!
-//! Cada RPC exige antes la configuración, así que un núcleo que se saltara
-//! `Configure` se entera por el primer RPC que haga y no por el segundo.
+//! Every RPC requires the configuration first, so a core that skipped
+//! `Configure` finds out on the first RPC it makes and not on the second.
 
 use sb_plugin_sdk::sb_proto::storage_server::Storage;
 use sb_plugin_sdk::sb_proto::{
@@ -22,82 +22,76 @@ use sb_plugin_sdk::sb_proto::{
 use sb_plugin_sdk::tonic::{Request, Response, Status};
 use sb_plugin_sdk::{ProgressStream, progress_stream};
 
-use crate::cliente::Estado;
+use crate::client::State;
 use crate::{admin, get, put};
 
-pub struct DestinoR2 {
-    estado: Estado,
+pub struct R2Storage {
+    state: State,
 }
 
-impl DestinoR2 {
+impl R2Storage {
     #[must_use]
-    pub fn new(estado: Estado) -> Self {
-        Self { estado }
+    pub fn new(state: State) -> Self {
+        Self { state }
     }
 }
 
 #[sb_plugin_sdk::tonic::async_trait]
-impl Storage for DestinoR2 {
+impl Storage for R2Storage {
     type PutStream = ProgressStream;
     type GetStream = ProgressStream;
 
-    async fn put(
-        &self,
-        peticion: Request<PutRequest>,
-    ) -> Result<Response<Self::PutStream>, Status> {
-        // Lo que se puede saber antes de mover un byte se resuelve aquí, con un
-        // `?`: una vez arranca el trabajo, la respuesta del RPC ya se envió y el
-        // error solo tendría el flujo de progreso para volver.
-        let contexto = self.estado.resolved()?;
-        let PutRequest { key, data_socket } = peticion.into_inner();
-        let clave = contexto.config.clave(&key);
-        // `progress_stream` responde al RPC **antes** de que el trabajo
-        // toque el socket de datos, que es lo que el protocolo exige: el núcleo
-        // espera esa respuesta para poner en marcha el otro extremo.
-        Ok(progress_stream(move |mut progreso| async move {
-            put::subir(&contexto, &clave, &data_socket, &mut progreso).await?;
-            progreso.finish("artefacto almacenado").await;
-            tracing::info!(clave = %clave, bytes = progreso.bytes(), "artefacto almacenado en R2");
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<Self::PutStream>, Status> {
+        // What can be known before moving a byte is resolved here, with a `?`:
+        // once the work starts, the RPC's response has already been sent and
+        // the error would only have the progress stream to come back through.
+        let context = self.state.resolved()?;
+        let PutRequest { key, data_socket } = request.into_inner();
+        let key = context.config.key(&key);
+        // `progress_stream` answers the RPC **before** the work touches the
+        // data socket, which is what the protocol requires: the core waits for
+        // that response to start up the other end.
+        Ok(progress_stream(move |mut progress| async move {
+            put::upload(&context, &key, &data_socket, &mut progress).await?;
+            progress.finish("artifact stored").await;
+            tracing::info!(key = %key, bytes = progress.bytes(), "artifact stored in R2");
             Ok(())
         }))
     }
 
-    async fn get(
-        &self,
-        peticion: Request<GetRequest>,
-    ) -> Result<Response<Self::GetStream>, Status> {
-        let contexto = self.estado.resolved()?;
-        let GetRequest { key, data_socket } = peticion.into_inner();
-        let clave = contexto.config.clave(&key);
-        // El `GetObject` se pide **antes** de responder, y solo se piden las
-        // cabeceras: el cuerpo llega perezoso y se vuelca luego. Así un
-        // artefacto que no está se contesta como `not_found` de la llamada, que
-        // es lo que el núcleo sabe distinguir de un corte a mitad. Nada de esto
-        // toca todavía el socket de datos, que es lo que el protocolo prohíbe
-        // hacer antes de responder.
-        let cuerpo = get::pedir(&contexto, &clave).await?;
-        Ok(progress_stream(move |mut progreso| async move {
-            get::volcar(cuerpo, &data_socket, &mut progreso).await?;
-            progreso.finish("artefacto entregado").await;
-            tracing::info!(clave = %clave, bytes = progreso.bytes(), "artefacto descargado de R2");
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<Self::GetStream>, Status> {
+        let context = self.state.resolved()?;
+        let GetRequest { key, data_socket } = request.into_inner();
+        let key = context.config.key(&key);
+        // The `GetObject` is requested **before** answering, and only the
+        // headers are requested: the body arrives lazily and is poured out
+        // afterwards. That way a missing artifact is answered as the call's
+        // `not_found`, which is what the core knows how to tell from a
+        // mid-stream cut. None of this touches the data socket yet, which is
+        // what the protocol forbids doing before answering.
+        let body = get::fetch(&context, &key).await?;
+        Ok(progress_stream(move |mut progress| async move {
+            get::drain(body, &data_socket, &mut progress).await?;
+            progress.finish("artifact delivered").await;
+            tracing::info!(key = %key, bytes = progress.bytes(), "artifact downloaded from R2");
             Ok(())
         }))
     }
 
-    async fn list(&self, peticion: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let contexto = self.estado.resolved()?;
-        let prefijo = contexto.config.clave(&peticion.into_inner().prefix);
-        // `admin::listar` recorre **todas** las páginas: una lista truncada no
-        // se nota y haría que `verify --all` diera por buenos artefactos que ni
-        // siquiera miró.
-        let encontrados = admin::listar(&contexto, &prefijo).await?;
+    async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        let context = self.state.resolved()?;
+        let prefix = context.config.key(&request.into_inner().prefix);
+        // `admin::list` walks **every** page: a truncated list goes unnoticed
+        // and would make `verify --all` bless artifacts it never even looked
+        // at.
+        let found = admin::list(&context, &prefix).await?;
         Ok(Response::new(ListResponse {
-            artifacts: encontrados
+            artifacts: found
                 .into_iter()
                 .map(|a| ArtifactMeta {
-                    key: a.clave,
-                    size: a.tamano,
-                    modified_at: a.modificado,
+                    key: a.key,
+                    size: a.size,
+                    modified_at: a.modified_at,
                 })
                 .collect(),
         }))
@@ -105,30 +99,28 @@ impl Storage for DestinoR2 {
 
     async fn delete(
         &self,
-        peticion: Request<DeleteRequest>,
+        request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let contexto = self.estado.resolved()?;
-        let clave = contexto.config.clave(&peticion.into_inner().key);
-        admin::borrar(&contexto, &clave).await?;
+        let context = self.state.resolved()?;
+        let key = context.config.key(&request.into_inner().key);
+        admin::delete(&context, &key).await?;
         Ok(Response::new(DeleteResponse {}))
     }
 
     async fn abort_incomplete(
         &self,
-        peticion: Request<AbortIncompleteRequest>,
+        request: Request<AbortIncompleteRequest>,
     ) -> Result<Response<AbortIncompleteResponse>, Status> {
-        let contexto = self.estado.resolved()?;
-        let prefijo = contexto.config.clave(&peticion.into_inner().prefix);
-        let abortadas = admin::abortar_incompletos(&contexto, &prefijo).await?;
-        if abortadas > 0 {
+        let context = self.state.resolved()?;
+        let prefix = context.config.key(&request.into_inner().prefix);
+        let aborted = admin::abort_incomplete(&context, &prefix).await?;
+        if aborted > 0 {
             tracing::warn!(
-                abortadas,
-                prefijo = %prefijo,
-                "subidas multipart incompletas eliminadas: dejaban de facturarse ahora"
+                aborted,
+                prefix = %prefix,
+                "incomplete multipart uploads removed: they stop being billed now"
             );
         }
-        Ok(Response::new(AbortIncompleteResponse {
-            aborted: abortadas,
-        }))
+        Ok(Response::new(AbortIncompleteResponse { aborted }))
     }
 }
