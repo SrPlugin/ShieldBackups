@@ -1,22 +1,22 @@
-//! Resolución de secretos: convierte una [`SecretRef`] en su valor.
+//! Secret resolution: turns a [`SecretRef`] into its value.
 //!
-//! # Por qué vive aquí y no en cada plugin
+//! # Why it lives here and not in each plugin
 //!
-//! El núcleo es el único que toca las fuentes de secretos —entorno, archivo,
-//! llavero del sistema o comando externo—. El plugin recibe el valor ya
-//! resuelto por el canal gRPC autenticado y nunca sabe de dónde salió. La
-//! política de secretos queda así en un solo sitio auditable en vez de
-//! reinventarse, con distinto criterio, en cada plugin.
+//! The core is the only one that touches the secret sources —environment, file,
+//! system keyring or external command—. The plugin receives the already resolved
+//! value over the authenticated gRPC channel and never knows where it came from.
+//! The secret policy thus stays in a single auditable place instead of being
+//! reinvented, with different criteria, in every plugin.
 //!
-//! # Los errores no filtran
+//! # The errors do not leak
 //!
-//! Ningún [`SecretError`] contiene el valor leído, ni la salida del comando
-//! ejecutado (ni `stdout` ni `stderr`), ni los bytes que el llavero devolvió.
-//! Un error que filtra la credencial que no pudo interpretar es peor que
-//! inútil: acaba en un log, en un ticket y en una captura de pantalla. Las
-//! variantes de abajo nombran el *origen* del secreto (una ruta, una variable,
-//! un programa), que es lo que el operador necesita para arreglarlo, y nunca
-//! su contenido.
+//! No [`SecretError`] contains the value that was read, nor the output of the
+//! command that was run (neither `stdout` nor `stderr`), nor the bytes the
+//! keyring returned. An error that leaks the credential it could not parse is
+//! worse than useless: it ends up in a log, in a ticket and in a screenshot. The
+//! variants below name the *origin* of the secret (a path, a variable, a
+//! program), which is what the operator needs in order to fix it, and never its
+//! contents.
 
 use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -27,319 +27,316 @@ use zeroize::Zeroize as _;
 
 use crate::model::SecretRef;
 
-/// Usuario que se asume cuando la entrada del llavero no lleva `servicio/usuario`.
+/// User assumed when the keyring entry does not carry `service/user`.
 ///
-/// Quien provisione la entrada a mano necesita saberlo:
-/// `secret-tool store --label=… service <servicio> username shieldbk`.
-const USUARIO_POR_DEFECTO: &str = "shieldbk";
+/// Whoever provisions the entry by hand needs to know it:
+/// `secret-tool store --label=… service <service> username shieldbk`.
+const DEFAULT_USER: &str = "shieldbk";
 
-/// Máscara de los permisos de grupo y de «otros».
+/// Mask of the group and "others" permissions.
 ///
-/// Cualquier bit encendido aquí significa que alguien que no es el dueño puede
-/// leer, escribir o ejecutar el archivo.
-const PERMISOS_AJENOS: u32 = 0o077;
+/// Any bit set here means somebody who is not the owner can read, write or
+/// execute the file.
+const OTHERS_PERMISSIONS: u32 = 0o077;
 
-/// Bits de permiso dentro del `st_mode` que devuelve `stat(2)`.
+/// Permission bits inside the `st_mode` returned by `stat(2)`.
 ///
-/// [`std::fs::Permissions::mode`] incluye también el tipo de archivo
-/// (`0o100000` para un fichero regular); sin esta máscara el modo que se
-/// muestra en el error no se parecería al que el operador pasó a `chmod`.
-const BITS_DE_PERMISO: u32 = 0o7777;
+/// [`std::fs::Permissions::mode`] also includes the file type (`0o100000` for a
+/// regular file); without this mask the mode shown in the error would not look
+/// like the one the operator passed to `chmod`.
+const PERMISSION_BITS: u32 = 0o7777;
 
-/// Fallo al obtener el valor de un secreto.
+/// Failure while obtaining a secret's value.
 ///
-/// **Ninguna variante contiene el secreto.** Todas nombran su origen —una
-/// ruta, una variable de entorno, un programa, una entrada del llavero— porque
-/// es lo que hace falta para arreglar el problema, y ninguna incluye el valor
-/// leído ni la salida de un comando, que podría llevarlo dentro. Esto vale
-/// tanto para `Display` como para el `Debug` derivado: todos los campos son
-/// cadenas construidas aquí, nunca datos que vengan de la fuente.
+/// **No variant contains the secret.** They all name its origin —a path, an
+/// environment variable, a program, a keyring entry— because that is what is
+/// needed to fix the problem, and none includes the value that was read or the
+/// output of a command, which could carry it inside. This holds for `Display` as
+/// well as for the derived `Debug`: every field is a string built here, never
+/// data coming from the source.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
-    /// La variable de entorno referenciada no está definida en el proceso.
-    #[error("la variable de entorno «{0}» no está definida")]
-    VariableAusente(String),
+    /// The referenced environment variable is not defined in the process.
+    #[error("the environment variable \"{0}\" is not defined")]
+    MissingVariable(String),
 
-    /// El archivo no se pudo abrir o leer.
+    /// The file could not be opened or read.
     ///
-    /// `motivo` es el mensaje del sistema operativo (por ejemplo «No such file
-    /// or directory»): describe el fallo de E/S, nunca el contenido.
-    #[error("no se pudo leer el secreto de «{ruta}»: {motivo}")]
-    LecturaFallo {
-        /// Ruta del archivo que se intentó leer.
-        ruta: String,
-        /// Mensaje del sistema operativo.
-        motivo: String,
+    /// `reason` is the operating system's message (for example "No such file or
+    /// directory"): it describes the I/O failure, never the contents.
+    #[error("could not read the secret from \"{path}\": {reason}")]
+    ReadFailed {
+        /// Path of the file that was attempted.
+        path: String,
+        /// Operating system message.
+        reason: String,
     },
 
-    /// El archivo es accesible para el grupo o para el resto del mundo.
+    /// The file is accessible to the group or to the rest of the world.
     #[error(
-        "el archivo de secreto «{ruta}» tiene permisos {modo:04o} y es accesible para \
-         el grupo o para otros; corrígelo con «chmod 600 {ruta}», o usa \
-         `file_insecure` si lo monta un orquestador"
+        "the secret file \"{path}\" has permissions {mode:04o} and is accessible to the group or \
+         to others; fix it with \"chmod 600 {path}\", or use `file_insecure` if an orchestrator \
+         mounts it"
     )]
-    PermisosDemasiadoAbiertos {
-        /// Ruta del archivo rechazado.
-        ruta: String,
-        /// Permisos encontrados, en octal.
-        modo: u32,
+    PermissionsTooOpen {
+        /// Path of the rejected file.
+        path: String,
+        /// Permissions found, in octal.
+        mode: u32,
     },
 
-    /// La referencia `command` no trae ni siquiera el programa a ejecutar.
-    #[error("la referencia «command» está vacía: falta el programa a ejecutar")]
-    ComandoVacio,
+    /// The `command` reference does not even carry the program to run.
+    #[error("the \"command\" reference is empty: the program to run is missing")]
+    EmptyCommand,
 
-    /// El comando no se pudo lanzar, o terminó con un código distinto de cero.
+    /// The command could not be launched, or ended with a non-zero code.
     ///
-    /// El mensaje nombra el programa —que ya está escrito en el fichero de
-    /// configuración— pero **no** su salida: un comando que falla puede haber
-    /// escrito el secreto en `stdout` antes de fallar, o haberlo volcado en
-    /// `stderr` junto al diagnóstico. El motivo concreto (código de salida o
-    /// error de `exec`) se registra por `tracing`, donde no viaja el valor.
+    /// The message names the program —which is already written in the
+    /// configuration file— but **not** its output: a command that fails may have
+    /// written the secret to `stdout` before failing, or dumped it into `stderr`
+    /// next to the diagnosis. The specific reason (exit code or `exec` error) is
+    /// logged through `tracing`, where the value does not travel.
     #[error(
-        "el comando «{comando}» no se pudo ejecutar o terminó con error; \
-         su salida se omite a propósito porque podría contener el secreto"
+        "the command \"{command}\" could not be run or ended with an error; its output is \
+         deliberately omitted because it could contain the secret"
     )]
-    ComandoFallo {
-        /// Programa que se intentó ejecutar (`argv[0]`), sin sus argumentos.
-        comando: String,
+    CommandFailed {
+        /// Program that was attempted (`argv[0]`), without its arguments.
+        command: String,
     },
 
-    /// El llavero del sistema no devolvió la entrada.
+    /// The system keyring did not return the entry.
     ///
-    /// `motivo` es una descripción fija elegida aquí a partir de la variante
-    /// de error del llavero, no el `Display` ni el `Debug` de la biblioteca:
-    /// algunas de sus variantes llevan dentro los bytes crudos de la
-    /// credencial.
-    #[error("no se pudo leer la entrada «{entrada}» del llavero: {motivo}")]
-    KeyringFallo {
-        /// Entrada solicitada, en formato `servicio/usuario`.
-        entrada: String,
-        /// Descripción del fallo, sin datos de la credencial.
-        motivo: String,
+    /// `reason` is a fixed description chosen here from the keyring's error
+    /// variant, not the library's `Display` or `Debug`: some of its variants
+    /// carry the raw bytes of the credential inside.
+    #[error("could not read the entry \"{entry}\" from the keyring: {reason}")]
+    KeyringFailed {
+        /// Requested entry, in `service/user` format.
+        entry: String,
+        /// Description of the failure, with no credential data.
+        reason: String,
     },
 
-    /// El valor obtenido no es texto UTF-8 válido.
+    /// The value obtained is not valid UTF-8 text.
     ///
-    /// No se dice qué bytes fallaron ni en qué posición: eso ya sería una
-    /// filtración parcial del secreto.
-    #[error("el secreto no es UTF-8 válido")]
-    NoEsUtf8,
+    /// It does not say which bytes failed nor at which position: that would
+    /// already be a partial leak of the secret.
+    #[error("the secret is not valid UTF-8")]
+    NotUtf8,
 }
 
-/// Obtiene el valor de un secreto.
+/// Obtains a secret's value.
 ///
-/// Solo el núcleo llama a esto. El plugin recibe el resultado por el canal
-/// autenticado y nunca sabe de dónde salió.
+/// Only the core calls this. The plugin receives the result over the
+/// authenticated channel and never knows where it came from.
 ///
-/// El valor vuelve envuelto en [`Secret`], que se borra de memoria al
-/// destruirse y no implementa `Debug` ni `Display`.
+/// The value comes back wrapped in [`Secret`], which is wiped from memory when
+/// destroyed and implements neither `Debug` nor `Display`.
 ///
 /// # Errors
 ///
-/// Devuelve [`SecretError`] si la fuente no existe, no se puede leer, tiene
-/// permisos demasiado abiertos o no contiene texto UTF-8. Ningún error incluye
-/// el valor del secreto.
-pub fn resolver(referencia: &SecretRef) -> Result<Secret<String>, SecretError> {
-    match referencia {
-        SecretRef::Env(nombre) => desde_entorno(nombre),
-        SecretRef::File(ruta) => desde_archivo(ruta, Permisos::Exigidos),
-        SecretRef::FileInsecure(ruta) => desde_archivo(ruta, Permisos::Ignorados),
-        SecretRef::Keyring(entrada) => desde_llavero(entrada),
-        SecretRef::Command(argv) => desde_comando(argv),
+/// Returns [`SecretError`] if the source does not exist, cannot be read, has
+/// permissions that are too open, or does not contain UTF-8 text. No error
+/// includes the secret's value.
+pub fn resolve(reference: &SecretRef) -> Result<Secret<String>, SecretError> {
+    match reference {
+        SecretRef::Env(name) => from_env(name),
+        SecretRef::File(path) => from_file(path, PermissionCheck::Enforced),
+        SecretRef::FileInsecure(path) => from_file(path, PermissionCheck::Ignored),
+        SecretRef::Keyring(entry) => from_keyring(entry),
+        SecretRef::Command(argv) => from_command(argv),
     }
 }
 
-/// Si un archivo de secreto tiene que demostrar permisos restrictivos.
+/// Whether a secret file has to prove restrictive permissions.
 #[derive(Clone, Copy)]
-enum Permisos {
-    /// Se rechaza cualquier acceso de grupo o de otros.
-    Exigidos,
-    /// Se acepta lo que haya y se avisa. Ver [`SecretRef::FileInsecure`].
-    Ignorados,
+enum PermissionCheck {
+    /// Any group or others access is rejected.
+    Enforced,
+    /// Whatever is there is accepted and a warning is issued. See
+    /// [`SecretRef::FileInsecure`].
+    Ignored,
 }
 
-/// Lee el secreto de una variable de entorno del proceso.
+/// Reads the secret from an environment variable of the process.
 ///
-/// El valor **no** se recorta: a diferencia de un archivo, que un editor cierra
-/// con `\n`, una variable de entorno vale exactamente lo que el operador
-/// exportó, y recortarla podría estropear en silencio una contraseña.
-fn desde_entorno(nombre: &str) -> Result<Secret<String>, SecretError> {
-    match std::env::var(nombre) {
-        Ok(valor) => Ok(Secret::new(valor)),
-        Err(std::env::VarError::NotPresent) => Err(SecretError::VariableAusente(nombre.to_owned())),
-        // `VarError::NotUnicode` lleva dentro el valor y lo imprime en su
-        // `Display`. Se descarta aquí para que no llegue al mensaje de error.
-        Err(std::env::VarError::NotUnicode(_)) => Err(SecretError::NoEsUtf8),
+/// The value is **not** trimmed: unlike a file, which an editor closes with a
+/// `\n`, an environment variable is worth exactly what the operator exported, and
+/// trimming it could silently break a password.
+fn from_env(name: &str) -> Result<Secret<String>, SecretError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Secret::new(value)),
+        Err(std::env::VarError::NotPresent) => Err(SecretError::MissingVariable(name.to_owned())),
+        // `VarError::NotUnicode` carries the value inside and prints it in its
+        // `Display`. It is discarded here so it never reaches the error message.
+        Err(std::env::VarError::NotUnicode(_)) => Err(SecretError::NotUtf8),
     }
 }
 
-/// Lee el secreto del contenido de un archivo.
+/// Reads the secret from a file's contents.
 ///
-/// Los permisos se comprueban sobre el descriptor ya abierto, no sobre la ruta:
-/// mirar con `stat` y abrir después deja una ventana en la que alguien puede
-/// cambiar el archivo entre las dos operaciones.
-fn desde_archivo(ruta: &str, permisos: Permisos) -> Result<Secret<String>, SecretError> {
-    let fallo = |motivo: &std::io::Error| SecretError::LecturaFallo {
-        ruta: ruta.to_owned(),
-        motivo: motivo.to_string(),
+/// Permissions are checked on the already open descriptor, not on the path:
+/// looking with `stat` and opening afterwards leaves a window in which somebody
+/// can swap the file between the two operations.
+fn from_file(path: &str, check: PermissionCheck) -> Result<Secret<String>, SecretError> {
+    let failure = |reason: &std::io::Error| SecretError::ReadFailed {
+        path: path.to_owned(),
+        reason: reason.to_string(),
     };
 
-    let mut archivo = std::fs::File::open(ruta).map_err(|e| fallo(&e))?;
-    let modo = archivo
+    let mut file = std::fs::File::open(path).map_err(|e| failure(&e))?;
+    let mode = file
         .metadata()
-        .map_err(|e| fallo(&e))?
+        .map_err(|e| failure(&e))?
         .permissions()
         .mode()
-        & BITS_DE_PERMISO;
+        & PERMISSION_BITS;
 
-    match permisos {
-        Permisos::Exigidos if modo & PERMISOS_AJENOS != 0 => {
-            return Err(SecretError::PermisosDemasiadoAbiertos {
-                ruta: ruta.to_owned(),
-                modo,
+    match check {
+        PermissionCheck::Enforced if mode & OTHERS_PERMISSIONS != 0 => {
+            return Err(SecretError::PermissionsTooOpen {
+                path: path.to_owned(),
+                mode,
             });
         }
-        Permisos::Exigidos => {}
-        Permisos::Ignorados => tracing::warn!(
-            ruta = %ruta,
-            modo = %format!("{modo:04o}"),
-            "secreto leído sin comprobar permisos (`file_insecure`); \
-             prefiere `defaultMode: 0400` en el volumen que lo monta"
+        PermissionCheck::Enforced => {}
+        PermissionCheck::Ignored => tracing::warn!(
+            path = %path,
+            mode = %format!("{mode:04o}"),
+            "secret read without checking permissions (`file_insecure`); \
+             prefer `defaultMode: 0400` in the volume that mounts it"
         ),
     }
 
     let mut bytes = Vec::new();
-    let leido = archivo.read_to_end(&mut bytes).map_err(|e| fallo(&e));
-    let resultado = leido.and_then(|_| {
+    let read = file.read_to_end(&mut bytes).map_err(|e| failure(&e));
+    let result = read.and_then(|_| {
         std::str::from_utf8(&bytes)
-            .map(|texto| recortar_saltos_finales(texto).to_owned())
-            .map_err(|_| SecretError::NoEsUtf8)
+            .map(|text| trim_trailing_newlines(text).to_owned())
+            .map_err(|_| SecretError::NotUtf8)
     });
-    // El buffer intermedio tuvo el secreto en claro; se borra aquí porque `Vec`
-    // no lo hace al destruirse.
+    // The intermediate buffer held the secret in the clear; it is wiped here
+    // because `Vec` does not do it when destroyed.
     bytes.zeroize();
 
-    resultado.map(Secret::new)
+    result.map(Secret::new)
 }
 
-/// Lee el secreto del llavero del sistema.
+/// Reads the secret from the system keyring.
 ///
-/// `entrada` es `servicio/usuario`; sin barra, el servicio es la entrada entera
-/// y el usuario es [`USUARIO_POR_DEFECTO`].
+/// `entry` is `service/user`; without a slash, the service is the whole entry and
+/// the user is [`DEFAULT_USER`].
 ///
-/// # Dentro de un contenedor no funciona
+/// # Inside a container it does not work
 ///
-/// El llavero se consulta por el Secret Service de D-Bus, que un contenedor no
-/// tiene: no hay bus de sesión ni agente que lo sirva. Ahí se usan `env` o
-/// `file` —normalmente `file_insecure` sobre el secreto que monta el
-/// orquestador—. Tampoco funciona por SSH sin sesión gráfica, ni desde `cron`,
-/// por la misma razón: el llavero está cerrado y nadie puede desbloquearlo.
-fn desde_llavero(entrada: &str) -> Result<Secret<String>, SecretError> {
-    let (servicio, usuario) = entrada
-        .split_once('/')
-        .unwrap_or((entrada, USUARIO_POR_DEFECTO));
+/// The keyring is queried through D-Bus's Secret Service, which a container does
+/// not have: there is no session bus and no agent to serve it. There `env` or
+/// `file` is used —usually `file_insecure` over the secret the orchestrator
+/// mounts—. It does not work over SSH without a graphical session, nor from
+/// `cron`, for the same reason: the keyring is locked and nobody can unlock it.
+fn from_keyring(entry: &str) -> Result<Secret<String>, SecretError> {
+    let (service, user) = entry.split_once('/').unwrap_or((entry, DEFAULT_USER));
 
-    let fallo = |motivo: &str| SecretError::KeyringFallo {
-        entrada: entrada.to_owned(),
-        motivo: motivo.to_owned(),
+    let failure = |reason: &str| SecretError::KeyringFailed {
+        entry: entry.to_owned(),
+        reason: reason.to_owned(),
     };
 
-    let credencial =
-        keyring::Entry::new(servicio, usuario).map_err(|e| fallo(&motivo_del_llavero(&e)))?;
-    let valor = credencial
+    let credential =
+        keyring::Entry::new(service, user).map_err(|e| failure(&keyring_reason(&e)))?;
+    let value = credential
         .get_password()
-        .map_err(|e| fallo(&motivo_del_llavero(&e)))?;
+        .map_err(|e| failure(&keyring_reason(&e)))?;
 
-    Ok(Secret::new(valor))
+    Ok(Secret::new(value))
 }
 
-/// Traduce un error del llavero a una descripción que no lleva datos dentro.
+/// Translates a keyring error into a description that carries no data inside.
 ///
-/// No se usa el `Display` ni el `Debug` de `keyring`: su variante `BadEncoding`
-/// guarda los bytes crudos de la credencial y el `Debug` derivado los
-/// imprimiría enteros.
-fn motivo_del_llavero(error: &keyring::Error) -> String {
-    let descripcion = match error {
-        keyring::Error::NoEntry => "la entrada no existe en el llavero",
+/// `keyring`'s `Display` and `Debug` are not used: its `BadEncoding` variant
+/// stores the raw bytes of the credential and the derived `Debug` would print
+/// them whole.
+fn keyring_reason(error: &keyring::Error) -> String {
+    let description = match error {
+        keyring::Error::NoEntry => "the entry does not exist in the keyring",
         keyring::Error::NoDefaultStore => {
-            "no hay llavero disponible; dentro de un contenedor no existe D-Bus, usa `env` o `file`"
+            "no keyring is available; inside a container there is no D-Bus, use `env` or `file`"
         }
-        keyring::Error::NoStorageAccess(_) => "el llavero está bloqueado o no es accesible",
-        keyring::Error::BadEncoding(_) => "el valor guardado en el llavero no es UTF-8",
-        keyring::Error::Ambiguous(_) => "la entrada coincide con más de una credencial",
-        keyring::Error::Invalid(atributo, _) => {
-            return format!("el atributo «{atributo}» de la entrada no es válido");
+        keyring::Error::NoStorageAccess(_) => "the keyring is locked or not accessible",
+        keyring::Error::BadEncoding(_) => "the value stored in the keyring is not UTF-8",
+        keyring::Error::Ambiguous(_) => "the entry matches more than one credential",
+        keyring::Error::Invalid(attribute, _) => {
+            return format!("the entry's attribute \"{attribute}\" is not valid");
         }
-        _ => "fallo del llavero del sistema",
+        _ => "system keyring failure",
     };
-    descripcion.to_owned()
+    description.to_owned()
 }
 
-/// Ejecuta un comando y toma su `stdout` como secreto.
+/// Runs a command and takes its `stdout` as the secret.
 ///
-/// **Nunca hay shell.** El programa y sus argumentos van por separado a
-/// [`Command`], así que un argumento con `;`, `$(…)` o `&&` dentro es texto
-/// literal para el programa y no otra orden. La inyección de comandos queda
-/// eliminada por construcción, no filtrada por una lista de caracteres
-/// prohibidos.
+/// **There is never a shell.** The program and its arguments go separately to
+/// [`Command`], so an argument containing `;`, `$(…)` or `&&` is literal text for
+/// the program and not another order. Command injection is eliminated by
+/// construction, not filtered out by a list of forbidden characters.
 ///
-/// `stdout` y `stderr` se capturan —no se heredan— para que el secreto no
-/// aparezca en la terminal ni en los logs de `shieldbk` si el comando lo
-/// escribe donde no debe. `stdin` se cierra para que un programa que quiera
-/// preguntar algo falle en vez de quedarse colgado esperando.
-fn desde_comando(argv: &[String]) -> Result<Secret<String>, SecretError> {
-    let (programa, argumentos) = argv.split_first().ok_or(SecretError::ComandoVacio)?;
+/// `stdout` and `stderr` are captured —not inherited— so that the secret does not
+/// show up in the terminal nor in `shieldbk`'s logs if the command writes it
+/// where it should not. `stdin` is closed so that a program that wants to ask
+/// something fails instead of hanging while it waits.
+fn from_command(argv: &[String]) -> Result<Secret<String>, SecretError> {
+    let (program, arguments) = argv.split_first().ok_or(SecretError::EmptyCommand)?;
 
-    let salida = Command::new(programa)
-        .args(argumentos)
+    let output = Command::new(program)
+        .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| {
-            // El error de `exec` (ENOENT, EACCES…) no puede contener el
-            // secreto: el programa ni siquiera llegó a arrancar. Va al log,
-            // donde sirve para diagnosticar, y no al error, cuya forma es fija.
-            tracing::warn!(programa = %programa, error = %e, "no se pudo ejecutar el comando de secreto");
-            SecretError::ComandoFallo {
-                comando: programa.clone(),
+            // The `exec` error (ENOENT, EACCES…) cannot contain the secret: the
+            // program did not even get to start. It goes to the log, where it is
+            // useful for diagnosis, and not to the error, whose shape is fixed.
+            tracing::warn!(program = %program, error = %e, "could not run the secret command");
+            SecretError::CommandFailed {
+                command: program.clone(),
             }
         })?;
 
-    let mut bytes = salida.stdout;
-    // `stderr` no se mira siquiera: el comando pudo volcar ahí el secreto
-    // junto al diagnóstico. Se borra sin leerlo.
-    let mut descartado = salida.stderr;
-    descartado.zeroize();
+    let mut bytes = output.stdout;
+    // `stderr` is not even looked at: the command may have dumped the secret
+    // there next to the diagnosis. It is wiped without being read.
+    let mut discarded = output.stderr;
+    discarded.zeroize();
 
-    let resultado = if salida.status.success() {
+    let result = if output.status.success() {
         std::str::from_utf8(&bytes)
-            .map(|texto| recortar_saltos_finales(texto).to_owned())
-            .map_err(|_| SecretError::NoEsUtf8)
+            .map(|text| trim_trailing_newlines(text).to_owned())
+            .map_err(|_| SecretError::NotUtf8)
     } else {
         tracing::warn!(
-            programa = %programa,
-            estado = %salida.status,
-            "el comando de secreto terminó con error; su salida se descarta sin leerla"
+            program = %program,
+            status = %output.status,
+            "the secret command ended with an error; its output is discarded without reading it"
         );
-        Err(SecretError::ComandoFallo {
-            comando: programa.clone(),
+        Err(SecretError::CommandFailed {
+            command: program.clone(),
         })
     };
     bytes.zeroize();
 
-    resultado.map(Secret::new)
+    result.map(Secret::new)
 }
 
-/// Recorta los saltos de línea del final, y solo eso.
+/// Trims the trailing line breaks, and nothing else.
 ///
-/// Un editor añade `\n` al guardar y `echo` lo pone siempre, así que un
-/// secreto de archivo o de comando casi nunca termina donde el usuario cree.
-/// Los espacios sí se respetan, incluidos los del final: una contraseña puede
-/// llevarlos y recortarlos sería corromperla en silencio.
-fn recortar_saltos_finales(texto: &str) -> &str {
-    texto.trim_end_matches(['\n', '\r'])
+/// An editor adds `\n` when saving and `echo` always puts one, so a secret from a
+/// file or from a command almost never ends where the user thinks it does. Spaces
+/// are respected, including trailing ones: a password may carry them and trimming
+/// them would silently corrupt it.
+fn trim_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches(['\n', '\r'])
 }
 
 #[cfg(test)]
@@ -347,195 +344,197 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    /// Escribe un fichero de secreto con los permisos indicados.
-    fn fichero(dir: &std::path::Path, nombre: &str, contenido: &[u8], modo: u32) -> String {
+    /// Writes a secret file with the given permissions.
+    fn secret_file(dir: &std::path::Path, name: &str, contents: &[u8], mode: u32) -> String {
         use std::os::unix::fs::PermissionsExt;
-        let ruta = dir.join(nombre);
-        let mut f = std::fs::File::create(&ruta).unwrap();
-        f.write_all(contenido).unwrap();
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
         drop(f);
-        std::fs::set_permissions(&ruta, std::fs::Permissions::from_mode(modo)).unwrap();
-        ruta.to_string_lossy().into_owned()
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path.to_string_lossy().into_owned()
     }
 
     #[test]
-    fn resuelve_desde_una_variable_de_entorno_existente() {
-        // PATH siempre existe y no hace falta modificar el entorno, que en
-        // edition 2024 requeriría `unsafe`.
-        let r = resolver(&SecretRef::Env("PATH".into())).unwrap();
+    fn resolves_from_an_existing_environment_variable() {
+        // PATH always exists and there is no need to modify the environment,
+        // which in edition 2024 would require `unsafe`.
+        let r = resolve(&SecretRef::Env("PATH".into())).unwrap();
         assert!(!r.expose().is_empty());
     }
 
     #[test]
-    fn una_variable_ausente_da_un_error_que_la_nombra() {
-        let err = resolver(&SecretRef::Env("SB_NO_EXISTE_XYZ_123".into()))
+    fn a_missing_variable_gives_an_error_that_names_it() {
+        let err = resolve(&SecretRef::Env("SB_DOES_NOT_EXIST_XYZ_123".into()))
             .err()
             .unwrap();
-        assert!(err.to_string().contains("SB_NO_EXISTE_XYZ_123"));
+        assert!(err.to_string().contains("SB_DOES_NOT_EXIST_XYZ_123"));
     }
 
     #[test]
-    fn resuelve_desde_un_archivo_con_permisos_correctos() {
+    fn resolves_from_a_file_with_correct_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "secreto", b"del-archivo\n", 0o600);
-        let r = resolver(&SecretRef::File(ruta)).unwrap();
+        let path = secret_file(dir.path(), "secret", b"from-the-file\n", 0o600);
+        let r = resolve(&SecretRef::File(path)).unwrap();
         assert_eq!(
             r.expose(),
-            "del-archivo",
-            "el salto de línea final se recorta"
+            "from-the-file",
+            "the trailing line break is trimmed"
         );
     }
 
     #[test]
-    fn se_recortan_los_saltos_finales_pero_no_los_espacios_internos() {
-        // Un editor añade \n al guardar; una contraseña puede llevar espacios.
+    fn trailing_newlines_are_trimmed_but_not_the_inner_spaces() {
+        // An editor adds \n when saving; a password may carry spaces.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "s", b"con espacios dentro  \r\n", 0o600);
+        let path = secret_file(dir.path(), "s", b"with spaces inside  \r\n", 0o600);
         assert_eq!(
-            resolver(&SecretRef::File(ruta)).unwrap().expose(),
-            "con espacios dentro  "
+            resolve(&SecretRef::File(path)).unwrap().expose(),
+            "with spaces inside  "
         );
     }
 
     #[test]
-    fn se_rechaza_un_archivo_legible_por_el_grupo() {
+    fn a_file_readable_by_the_group_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "s", b"x", 0o640);
+        let path = secret_file(dir.path(), "s", b"x", 0o640);
         assert!(matches!(
-            resolver(&SecretRef::File(ruta)).err().unwrap(),
-            SecretError::PermisosDemasiadoAbiertos { .. }
+            resolve(&SecretRef::File(path)).err().unwrap(),
+            SecretError::PermissionsTooOpen { .. }
         ));
     }
 
     #[test]
-    fn se_rechaza_un_archivo_legible_por_todo_el_mundo() {
+    fn a_world_readable_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "s", b"x", 0o644);
-        let err = resolver(&SecretRef::File(ruta)).err().unwrap();
-        assert!(matches!(err, SecretError::PermisosDemasiadoAbiertos { .. }));
+        let path = secret_file(dir.path(), "s", b"x", 0o644);
+        let err = resolve(&SecretRef::File(path)).err().unwrap();
+        assert!(matches!(err, SecretError::PermissionsTooOpen { .. }));
         assert!(
             err.to_string().contains("chmod"),
-            "debe decir cómo arreglarlo"
+            "it must say how to fix it"
         );
     }
 
     #[test]
-    fn un_secreto_montado_por_el_orquestador_se_acepta_con_el_opt_out() {
-        // Docker monta /run/secrets con 0444 y Kubernetes los suyos con 0644.
-        // Rechazarlos sin alternativa impediría el caso de uso más común en
-        // contenedor; relajar la comprobación por defecto sería peor.
+    fn a_secret_mounted_by_the_orchestrator_is_accepted_with_the_opt_out() {
+        // Docker mounts /run/secrets with 0444 and Kubernetes its own with 0644.
+        // Rejecting them without an alternative would rule out the most common
+        // use case in a container; relaxing the check by default would be worse.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "montado", b"del-orquestador\n", 0o444);
+        let path = secret_file(dir.path(), "mounted", b"from-the-orchestrator\n", 0o444);
 
         assert!(
-            resolver(&SecretRef::File(ruta.clone())).is_err(),
-            "sin opt-out se rechaza"
+            resolve(&SecretRef::File(path.clone())).is_err(),
+            "without the opt-out it is rejected"
         );
         assert_eq!(
-            resolver(&SecretRef::FileInsecure(ruta)).unwrap().expose(),
-            "del-orquestador"
+            resolve(&SecretRef::FileInsecure(path)).unwrap().expose(),
+            "from-the-orchestrator"
         );
     }
 
     #[test]
-    fn el_opt_out_sigue_fallando_si_el_archivo_no_existe() {
-        // Relaja los permisos, no la existencia.
-        assert!(resolver(&SecretRef::FileInsecure("/no/existe/nada".into())).is_err());
+    fn the_opt_out_still_fails_if_the_file_does_not_exist() {
+        // It relaxes the permissions, not the existence.
+        assert!(resolve(&SecretRef::FileInsecure("/does/not/exist".into())).is_err());
     }
 
     #[test]
-    fn resuelve_ejecutando_un_comando() {
-        let r = resolver(&SecretRef::Command(vec![
+    fn resolves_by_running_a_command() {
+        let r = resolve(&SecretRef::Command(vec![
             "/bin/echo".into(),
-            "desde-comando".into(),
+            "from-the-command".into(),
         ]))
         .unwrap();
-        assert_eq!(r.expose(), "desde-comando");
+        assert_eq!(r.expose(), "from-the-command");
     }
 
     #[test]
-    fn un_comando_que_falla_da_error() {
+    fn a_command_that_fails_gives_an_error() {
         assert!(matches!(
-            resolver(&SecretRef::Command(vec!["/bin/false".into()]))
+            resolve(&SecretRef::Command(vec!["/bin/false".into()]))
                 .err()
                 .unwrap(),
-            SecretError::ComandoFallo { .. }
+            SecretError::CommandFailed { .. }
         ));
     }
 
     #[test]
-    fn un_comando_vacio_se_rechaza() {
+    fn an_empty_command_is_rejected() {
         assert!(matches!(
-            resolver(&SecretRef::Command(vec![])).err().unwrap(),
-            SecretError::ComandoVacio
+            resolve(&SecretRef::Command(vec![])).err().unwrap(),
+            SecretError::EmptyCommand
         ));
     }
 
     #[test]
-    fn un_comando_inexistente_da_error_y_no_panico() {
-        assert!(resolver(&SecretRef::Command(vec!["/no/existe/comando".into()])).is_err());
+    fn a_nonexistent_command_gives_an_error_and_not_a_panic() {
+        assert!(resolve(&SecretRef::Command(vec!["/does/not/exist/command".into()])).is_err());
     }
 
     #[test]
-    fn el_comando_no_pasa_por_un_shell() {
-        // Si hubiera shell, esto ejecutaría dos comandos o interpretaría el
-        // punto y coma. Sin shell, «;» y «echo» son argumentos literales de
-        // /bin/echo. Es lo que elimina por construcción la inyección.
-        let r = resolver(&SecretRef::Command(vec![
+    fn the_command_does_not_go_through_a_shell() {
+        // If there were a shell, this would run two commands or interpret the
+        // semicolon. Without a shell, ";" and "echo" are literal arguments of
+        // /bin/echo. That is what eliminates injection by construction.
+        let r = resolve(&SecretRef::Command(vec![
             "/bin/echo".into(),
-            "uno; echo dos".into(),
+            "one; echo two".into(),
         ]))
         .unwrap();
-        assert_eq!(r.expose(), "uno; echo dos");
+        assert_eq!(r.expose(), "one; echo two");
     }
 
     #[test]
-    fn el_error_nunca_incluye_el_valor_del_secreto() {
-        // Un error que filtra la credencial que no pudo leer es peor que inútil.
+    fn the_error_never_includes_the_secret_value() {
+        // An error that leaks the credential it could not read is worse than
+        // useless.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "s", b"CONTENIDO-ULTRASECRETO", 0o644);
-        let texto = resolver(&SecretRef::File(ruta)).err().unwrap().to_string();
-        assert!(!texto.contains("ULTRASECRETO"));
+        let path = secret_file(dir.path(), "s", b"ULTRASECRET-CONTENTS", 0o644);
+        let text = resolve(&SecretRef::File(path)).err().unwrap().to_string();
+        assert!(!text.contains("ULTRASECRET"));
     }
 
     #[test]
-    fn el_error_de_comando_no_incluye_su_salida() {
+    fn the_command_error_does_not_include_its_output() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Un comando que falla puede haber escrito el secreto en stdout antes
-        // de fallar, o volcarlo en stderr.
+        // A command that fails may have written the secret to stdout before
+        // failing, or dumped it into stderr.
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fuga.sh");
+        let script = dir.path().join("leak.sh");
         std::fs::write(
             &script,
-            b"#!/bin/sh\necho SECRETO-EN-STDOUT\necho SECRETO-EN-STDERR >&2\nexit 1\n",
+            b"#!/bin/sh\necho SECRET-ON-STDOUT\necho SECRET-ON-STDERR >&2\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let texto = resolver(&SecretRef::Command(vec![
+        let text = resolve(&SecretRef::Command(vec![
             script.to_string_lossy().into_owned(),
         ]))
         .err()
         .unwrap()
         .to_string();
-        assert!(!texto.contains("SECRETO-EN-STDOUT"));
-        assert!(!texto.contains("SECRETO-EN-STDERR"));
+        assert!(!text.contains("SECRET-ON-STDOUT"));
+        assert!(!text.contains("SECRET-ON-STDERR"));
     }
 
     #[test]
-    fn un_secreto_que_no_es_utf8_da_error_claro() {
+    fn a_secret_that_is_not_utf8_gives_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "binario", &[0xff, 0xfe, 0xfd], 0o600);
-        assert!(resolver(&SecretRef::File(ruta)).is_err());
+        let path = secret_file(dir.path(), "binary", &[0xff, 0xfe, 0xfd], 0o600);
+        assert!(resolve(&SecretRef::File(path)).is_err());
     }
 
     #[test]
-    fn un_secreto_vacio_se_acepta_pero_es_vacio() {
-        // No es tarea de esta capa decidir si una contraseña vacía es válida:
-        // eso lo dirá el plugin al usarla. Aquí solo se lee lo que hay.
+    fn an_empty_secret_is_accepted_but_it_is_empty() {
+        // It is not this layer's job to decide whether an empty password is
+        // valid: the plugin will say so when it uses it. Here only what is there
+        // is read.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = fichero(dir.path(), "vacio", b"", 0o600);
-        assert_eq!(resolver(&SecretRef::File(ruta)).unwrap().expose(), "");
+        let path = secret_file(dir.path(), "empty", b"", 0o600);
+        assert_eq!(resolve(&SecretRef::File(path)).unwrap().expose(), "");
     }
 }

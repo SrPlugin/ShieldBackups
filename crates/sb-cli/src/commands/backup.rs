@@ -95,7 +95,7 @@ async fn intentar(ctx: &Contexto, target: &Target) -> Result<Resultado, CliError
     })?;
 
     let nivel =
-        CompressionLevel::new(target.nivel_efectivo(&ctx.config.defaults)).map_err(|fuente| {
+        CompressionLevel::new(target.effective_level(&ctx.config.defaults)).map_err(|fuente| {
             CliError::config(format!(
                 "el nivel de compresión del target «{}» no vale: {fuente}",
                 target.name
@@ -109,7 +109,7 @@ async fn intentar(ctx: &Contexto, target: &Target) -> Result<Resultado, CliError
         &target.storage,
         ahora.unix_timestamp(),
     );
-    let clave = render(target.plantilla_efectiva(&ctx.config.defaults), &contexto)?;
+    let clave = render(target.effective_template(&ctx.config.defaults), &contexto)?;
 
     let motor = plugins::arrancar_para(ctx, target, Papel::Motor).await?;
     let destino = match plugins::arrancar_para(ctx, target, Papel::Destino).await {

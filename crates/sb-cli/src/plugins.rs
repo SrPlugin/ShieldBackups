@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use sb_config::{ConfigTable, Target, validar_y_convertir};
+use sb_config::{ConfigTable, Target, validate_and_convert};
 use sb_core::lockfile::Lockfile;
 use sb_core::plugin::{Capability, PluginClient};
 
@@ -183,7 +183,7 @@ pub async fn arrancar_para(
 async fn configurar(cliente: &PluginClient, target: &Target, papel: Papel) -> Result<(), CliError> {
     let esquema = cliente.schema().await?;
     let seccion = papel.seccion();
-    let valores = validar_y_convertir(papel.configuracion_en(target), &esquema, seccion).map_err(
+    let valores = validate_and_convert(papel.configuracion_en(target), &esquema, seccion).map_err(
         |fuente| {
             CliError::config(format!(
                 "la configuración de `{seccion}` del target «{}» no es válida: {fuente}",

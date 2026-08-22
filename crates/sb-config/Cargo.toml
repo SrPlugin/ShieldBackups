@@ -15,9 +15,9 @@ toml = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sb-crypto = { version = "0.1.0", path = "../sb-crypto" }
-# La validación de la configuración se hace contra el esquema que el plugin
-# declara por gRPC, y produce los `Value` del protocolo que viajan en
-# `Configure`: ambos tipos viven en el contrato.
+# Configuration validation is done against the schema the plugin declares over
+# gRPC, and it produces the protocol's `Value`s that travel in `Configure`: both
+# types live in the contract.
 sb-proto = { version = "0.1.0", path = "../sb-proto" }
 keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
 zeroize = "1.9.0"

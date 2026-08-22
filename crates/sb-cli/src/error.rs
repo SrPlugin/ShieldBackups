@@ -232,9 +232,9 @@ mod tests {
     fn un_fallo_de_validacion_se_cuenta_como_configuracion() {
         // Hace falta un plugin vivo para descubrirlo, pero lo que hay que
         // arreglar es el fichero: reintentarlo no lo va a cambiar.
-        let error = CliError::from(ValidationError::CampoRequeridoAusente {
-            seccion: "engine".into(),
-            campo: "host".into(),
+        let error = CliError::from(ValidationError::MissingRequiredField {
+            section: "engine".into(),
+            field: "host".into(),
         });
         assert_eq!(error.codigo(), CODIGO_CONFIG);
         assert_eq!(error.clase(), "config");

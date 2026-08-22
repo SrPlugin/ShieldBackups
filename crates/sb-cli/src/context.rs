@@ -52,7 +52,7 @@ impl Contexto {
     /// # Errors
     /// Los mismos que [`Contexto::cargar`] menos «no hay targets».
     pub fn cargar_sin_exigir_targets(cli: &Cli) -> Result<Self, CliError> {
-        Self::leer(cli, sb_config::Config::parse_sin_exigir_targets)
+        Self::leer(cli, sb_config::Config::parse_without_requiring_targets)
     }
 
     /// El cuerpo común: localizar el fichero, leerlo, interpretarlo con el

@@ -1,200 +1,200 @@
-//! Validación de una tabla de configuración contra el esquema del plugin.
+//! Validation of a configuration table against the plugin's schema.
 //!
-//! Aquí se cierra el círculo de la arquitectura de plugins: el núcleo no sabe
-//! qué campos necesita un motor de base de datos ni un destino en la nube, así
-//! que toma el esquema que el plugin declaró por gRPC y comprueba contra él lo que
-//! el usuario escribió en el TOML. Lo que sale son los [`Value`] del
-//! protocolo, listos para viajar en `Configure`.
+//! This is where the plugin architecture closes its circle: the core does not
+//! know which fields a database engine or a cloud destination needs, so it takes
+//! the schema the plugin declared over gRPC and checks against it what the user
+//! wrote in the TOML. What comes out are the protocol's [`Value`]s, ready to
+//! travel in `Configure`.
 //!
-//! Dos reglas simétricas gobiernan los secretos:
+//! Two symmetric rules govern secrets:
 //!
-//! 1. **Un campo secreto no admite un valor literal.** Si el plugin dice que
-//!    un campo es sensible, en el fichero solo cabe una referencia a su origen
-//!    (`env`, `file`, `keyring`, `command`). Permitir el literal convertiría el
-//!    fichero de configuración —que se versiona y se copia— en un almacén de
-//!    contraseñas.
-//! 2. **Un campo público no admite una referencia a secreto.** Resolverla
-//!    gastaría una lectura del llavero o una ejecución de comando para algo
-//!    que no es sensible, y sobre todo despistaría a quien lea la
-//!    configuración sobre qué datos hay que proteger de verdad.
+//! 1. **A secret field does not accept a literal value.** If the plugin says a
+//!    field is sensitive, only a reference to its origin (`env`, `file`,
+//!    `keyring`, `command`) fits in the file. Allowing the literal would turn the
+//!    configuration file —which is kept under version control and copied— into a
+//!    password store.
+//! 2. **A public field does not accept a secret reference.** Resolving it would
+//!    spend a keyring read or a command execution on something that is not
+//!    sensitive, and above all it would mislead whoever reads the configuration
+//!    about which data really has to be protected.
 //!
-//! El secreto se resuelve *aquí*, no en el plugin: el plugin recibe el valor y
-//! nunca sabe de dónde salió. Ningún mensaje de error de este módulo contiene
-//! el valor de un secreto, ni siquiera el encadenado como `source`.
+//! The secret is resolved *here*, not in the plugin: the plugin receives the
+//! value and never knows where it came from. No error message of this module
+//! contains a secret's value, not even the one chained as `source`.
 
 use std::collections::HashMap;
 
 use sb_proto::{Field, FieldType, StringList, Value, value::Kind};
 
 use crate::model::{ConfigTable, ConfigValue, SecretRef};
-use crate::secrets::{SecretError, resolver};
+use crate::secrets::{SecretError, resolve};
 
-/// Distancia de edición máxima para considerar que un campo desconocido es una
-/// errata de otro.
+/// Maximum edit distance for considering that an unknown field is a typo of
+/// another.
 ///
-/// Con 1 se escapan las transposiciones más un carácter de más; con 3 empieza
-/// a sugerir cosas que no tienen nada que ver («ssl» por «url»), y una
-/// sugerencia equivocada cuesta más tiempo que ninguna.
-const DISTANCIA_MAXIMA: usize = 2;
+/// With 1, transpositions plus one extra character slip through; with 3 it starts
+/// suggesting things that have nothing to do with each other ("ssl" for "url"),
+/// and a wrong suggestion costs more time than none.
+const MAX_DISTANCE: usize = 2;
 
-/// Por qué se rechaza una configuración.
+/// Why a configuration is rejected.
 ///
-/// **Ninguna variante contiene el valor de un secreto.** Las que hablan de uno
-/// nombran el campo o el origen —lo que hace falta para arreglarlo— y la
-/// única que encadena otro error lo hace sobre [`SecretError`], que tiene la
-/// misma garantía.
+/// **No variant contains a secret's value.** Those that talk about one name the
+/// field or the origin —what is needed to fix it— and the only one that chains
+/// another error does so over [`SecretError`], which carries the same guarantee.
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
-    /// El esquema declara el campo como obligatorio y no está en la tabla.
-    #[error("falta el campo obligatorio «{campo}» en la sección «{seccion}»")]
-    CampoRequeridoAusente {
-        /// Sección del fichero: `engine` o `storage`.
-        seccion: String,
-        /// Campo que el plugin exige.
-        campo: String,
+    /// The schema declares the field as mandatory and it is not in the table.
+    #[error("the mandatory field \"{field}\" is missing in the \"{section}\" section")]
+    MissingRequiredField {
+        /// Section of the file: `engine` or `storage`.
+        section: String,
+        /// Field the plugin requires.
+        field: String,
     },
 
-    /// La tabla trae un campo que el plugin no declara.
+    /// The table carries a field the plugin does not declare.
     ///
-    /// Se rechaza en vez de ignorarse: un campo que el plugin no lee es casi
-    /// siempre una errata, y aceptarlo en silencio deja al usuario creyendo
-    /// que ha configurado algo que no está en efecto.
-    #[error("el campo «{campo}» no existe en la sección «{seccion}»; {sugerencia}")]
-    CampoDesconocido {
-        /// Sección del fichero: `engine` o `storage`.
-        seccion: String,
-        /// Campo desconocido, tal como lo escribió el usuario.
-        campo: String,
-        /// Pista: el campo parecido, o la lista de los que sí existen.
-        sugerencia: String,
+    /// It is rejected instead of ignored: a field the plugin does not read is
+    /// almost always a typo, and accepting it in silence leaves the user
+    /// believing they configured something that is not in effect.
+    #[error("the field \"{field}\" does not exist in the \"{section}\" section; {suggestion}")]
+    UnknownField {
+        /// Section of the file: `engine` or `storage`.
+        section: String,
+        /// Unknown field, exactly as the user wrote it.
+        field: String,
+        /// Hint: the similar field, or the list of the ones that do exist.
+        suggestion: String,
     },
 
-    /// El valor escrito no encaja con el tipo que declara el esquema.
-    #[error("el campo «{campo}» de la sección «{seccion}» debe ser {esperado}")]
-    TipoIncorrecto {
-        /// Sección del fichero: `engine` o `storage`.
-        seccion: String,
-        /// Campo con el valor mal tipado.
-        campo: String,
-        /// Descripción del tipo que esperaba el plugin.
-        esperado: String,
+    /// The written value does not match the type the schema declares.
+    #[error("the field \"{field}\" of the \"{section}\" section must be {expected}")]
+    WrongType {
+        /// Section of the file: `engine` or `storage`.
+        section: String,
+        /// Field with the badly typed value.
+        field: String,
+        /// Description of the type the plugin expected.
+        expected: String,
     },
 
-    /// Un campo secreto trae un valor literal.
+    /// A secret field carries a literal value.
     ///
-    /// El mensaje enumera las formas válidas y **no** incluye el valor
-    /// rechazado: sería filtrar por el error justo lo que se intenta proteger.
+    /// The message enumerates the valid forms and does **not** include the
+    /// rejected value: that would leak through the error exactly what it is
+    /// trying to protect.
     #[error(
-        "el campo «{campo}» de la sección «{seccion}» es secreto y no admite un valor \
-         literal en el fichero de configuración; escribe de dónde sacarlo: \
-         {{ env = \"VARIABLE\" }}, {{ file = \"/ruta/al/secreto\" }}, \
-         {{ keyring = \"servicio/usuario\" }} o {{ command = [\"programa\", \"argumento\"] }}"
+        "the field \"{field}\" of the \"{section}\" section is secret and does not accept a \
+         literal value in the configuration file; write where to get it from: \
+         {{ env = \"VARIABLE\" }}, {{ file = \"/path/to/the/secret\" }}, \
+         {{ keyring = \"service/user\" }} or {{ command = [\"program\", \"argument\"] }}"
     )]
-    SecretoLiteral {
-        /// Sección del fichero: `engine` o `storage`.
-        seccion: String,
-        /// Campo secreto que traía el literal.
-        campo: String,
+    LiteralSecret {
+        /// Section of the file: `engine` or `storage`.
+        section: String,
+        /// Secret field that carried the literal.
+        field: String,
     },
 
-    /// Un campo que no es secreto trae una referencia a secreto.
+    /// A field that is not secret carries a secret reference.
     #[error(
-        "el campo «{campo}» de la sección «{seccion}» no es secreto: escribe su valor \
-         directamente, sin una referencia a env, file, keyring o command"
+        "the field \"{field}\" of the \"{section}\" section is not secret: write its value \
+         directly, without a reference to env, file, keyring or command"
     )]
-    ReferenciaEnCampoPublico {
-        /// Sección del fichero: `engine` o `storage`.
-        seccion: String,
-        /// Campo público que traía la referencia.
-        campo: String,
+    SecretRefInPublicField {
+        /// Section of the file: `engine` or `storage`.
+        section: String,
+        /// Public field that carried the reference.
+        field: String,
     },
 
-    /// La referencia era correcta, pero el secreto no se pudo obtener.
+    /// The reference was correct, but the secret could not be obtained.
     ///
-    /// El campo va en el mensaje porque una configuración puede tener varios
-    /// secretos y «la variable no está definida» sin más obliga a adivinar
-    /// cuál. La causa se encadena como `source`.
-    #[error("no se pudo resolver el secreto del campo «{campo}»")]
-    SecretoNoResuelto {
-        /// Campo cuyo secreto no se pudo obtener.
-        campo: String,
-        /// Fallo de la resolución. Nunca contiene el valor.
+    /// The field goes in the message because a configuration can have several
+    /// secrets and "the variable is not defined" on its own forces you to guess
+    /// which one. The cause is chained as `source`.
+    #[error("could not resolve the secret of the field \"{field}\"")]
+    SecretNotResolved {
+        /// Field whose secret could not be obtained.
+        field: String,
+        /// Failure of the resolution. It never contains the value.
         #[source]
-        fuente: SecretError,
+        source: SecretError,
     },
 }
 
-/// Comprueba la configuración contra el esquema del plugin y la convierte a
-/// los [`Value`] del protocolo, resolviendo los secretos por el camino.
+/// Checks the configuration against the plugin's schema and converts it into the
+/// protocol's [`Value`]s, resolving the secrets along the way.
 ///
-/// `seccion` es `"engine"` o `"storage"`, y solo alimenta los mensajes de
-/// error: en un backup hay dos plugins configurados, y «falta el campo host»
-/// sin decir de cuál es obliga a adivinar.
+/// `section` is `"engine"` or `"storage"`, and it only feeds the error messages:
+/// in a backup there are two configured plugins, and "the field host is missing"
+/// without saying whose it is forces you to guess.
 ///
-/// Los campos opcionales ausentes no aparecen en el resultado: el plugin
-/// aplica su propio valor por defecto, que es quien lo conoce.
+/// Optional fields that are absent do not appear in the result: the plugin
+/// applies its own default, which is who knows it.
 ///
 /// # Errors
 ///
-/// Devuelve [`ValidationError`] si sobra un campo, falta uno obligatorio, un
-/// valor no encaja con su tipo, un secreto se escribió como literal, un campo
-/// público trae una referencia a secreto, o un secreto no se pudo resolver.
-pub fn validar_y_convertir(
+/// Returns [`ValidationError`] if a field is left over, a mandatory one is
+/// missing, a value does not match its type, a secret was written as a literal, a
+/// public field carries a secret reference, or a secret could not be resolved.
+pub fn validate_and_convert(
     cfg: &ConfigTable,
-    esquema: &[Field],
-    seccion: &str,
+    schema: &[Field],
+    section: &str,
 ) -> Result<HashMap<String, Value>, ValidationError> {
-    // Primero lo que sobra: un campo desconocido suele ser una errata del
-    // campo que el usuario cree haber puesto, así que avisar de que «falta
-    // host» cuando escribió «hosst» sería contarle la mitad de la historia.
-    for nombre in cfg.keys() {
-        if !esquema.iter().any(|campo| &campo.name == nombre) {
-            return Err(ValidationError::CampoDesconocido {
-                seccion: seccion.to_owned(),
-                campo: nombre.clone(),
-                sugerencia: sugerir(nombre, esquema),
+    // First what is left over: an unknown field is usually a typo of the field
+    // the user believes they wrote, so warning that "host is missing" when they
+    // wrote "hosst" would be telling half the story.
+    for name in cfg.keys() {
+        if !schema.iter().any(|field| &field.name == name) {
+            return Err(ValidationError::UnknownField {
+                section: section.to_owned(),
+                field: name.clone(),
+                suggestion: suggest(name, schema),
             });
         }
     }
 
-    let mut salida = HashMap::with_capacity(cfg.len());
+    let mut out = HashMap::with_capacity(cfg.len());
 
-    for campo in esquema {
-        let Some(valor) = cfg.get(&campo.name) else {
-            if campo.required {
-                return Err(ValidationError::CampoRequeridoAusente {
-                    seccion: seccion.to_owned(),
-                    campo: campo.name.clone(),
+    for field in schema {
+        let Some(value) = cfg.get(&field.name) else {
+            if field.required {
+                return Err(ValidationError::MissingRequiredField {
+                    section: section.to_owned(),
+                    field: field.name.clone(),
                 });
             }
             continue;
         };
 
-        salida.insert(campo.name.clone(), convertir(campo, valor, seccion)?);
+        out.insert(field.name.clone(), convert(field, value, section)?);
     }
 
-    Ok(salida)
+    Ok(out)
 }
 
-/// Convierte un valor ya emparejado con su campo del esquema.
-fn convertir(campo: &Field, valor: &ConfigValue, seccion: &str) -> Result<Value, ValidationError> {
-    if campo.secret {
-        return convertir_secreto(campo, valor, seccion);
+/// Converts a value already paired with its schema field.
+fn convert(field: &Field, value: &ConfigValue, section: &str) -> Result<Value, ValidationError> {
+    if field.secret {
+        return convert_secret(field, value, section);
     }
 
-    if let ConfigValue::Secret(_) = valor {
-        return Err(ValidationError::ReferenciaEnCampoPublico {
-            seccion: seccion.to_owned(),
-            campo: campo.name.clone(),
+    if let ConfigValue::Secret(_) = value {
+        return Err(ValidationError::SecretRefInPublicField {
+            section: section.to_owned(),
+            field: field.name.clone(),
         });
     }
 
-    let tipo = FieldType::try_from(campo.r#type).unwrap_or(FieldType::Unspecified);
+    let field_type = FieldType::try_from(field.r#type).unwrap_or(FieldType::Unspecified);
 
-    let kind = match (tipo, valor) {
-        // `Path` y `Duration` viajan como texto: su semántica —qué es una ruta
-        // válida, cómo se escribe «30s»— la interpreta el plugin, que es quien
-        // la conoce. El núcleo solo transporta.
+    let kind = match (field_type, value) {
+        // `Path` and `Duration` travel as text: their semantics —what a valid
+        // path is, how "30s" is written— are interpreted by the plugin, which is
+        // the one that knows them. The core only transports.
         (FieldType::String | FieldType::Path | FieldType::Duration, ConfigValue::String(s)) => {
             Kind::StringValue(s.clone())
         }
@@ -204,10 +204,10 @@ fn convertir(campo: &Field, valor: &ConfigValue, seccion: &str) -> Result<Value,
             Kind::ListValue(StringList { values: l.clone() })
         }
         _ => {
-            return Err(ValidationError::TipoIncorrecto {
-                seccion: seccion.to_owned(),
-                campo: campo.name.clone(),
-                esperado: descripcion(tipo).to_owned(),
+            return Err(ValidationError::WrongType {
+                section: section.to_owned(),
+                field: field.name.clone(),
+                expected: type_description(field_type).to_owned(),
             });
         }
     };
@@ -215,85 +215,87 @@ fn convertir(campo: &Field, valor: &ConfigValue, seccion: &str) -> Result<Value,
     Ok(Value { kind: Some(kind) })
 }
 
-/// Resuelve el secreto de un campo sensible.
+/// Resolves the secret of a sensitive field.
 ///
-/// Lo que sale es el valor, no la referencia: el plugin recibe la contraseña y
-/// nunca el nombre de la variable ni la ruta del archivo. Saber de dónde
-/// salió no le sirve de nada y le daría un camino para ir a buscar más.
-fn convertir_secreto(
-    campo: &Field,
-    valor: &ConfigValue,
-    seccion: &str,
+/// What comes out is the value, not the reference: the plugin receives the
+/// password and never the name of the variable nor the path of the file. Knowing
+/// where it came from is of no use to it and would give it a path to go looking
+/// for more.
+fn convert_secret(
+    field: &Field,
+    value: &ConfigValue,
+    section: &str,
 ) -> Result<Value, ValidationError> {
-    let ConfigValue::Secret(referencia) = valor else {
-        // El valor rechazado no entra en el error, ni siquiera recortado: es
-        // exactamente el dato que este módulo existe para proteger.
-        return Err(ValidationError::SecretoLiteral {
-            seccion: seccion.to_owned(),
-            campo: campo.name.clone(),
+    let ConfigValue::Secret(reference) = value else {
+        // The rejected value does not go into the error, not even truncated: it
+        // is exactly the data this module exists to protect.
+        return Err(ValidationError::LiteralSecret {
+            section: section.to_owned(),
+            field: field.name.clone(),
         });
     };
 
-    resolver_referencia(referencia, &campo.name)
+    resolve_reference(reference, &field.name)
 }
 
-/// Obtiene el valor de una referencia y lo mete en un [`Value`] del protocolo.
+/// Obtains a reference's value and puts it into a protocol [`Value`].
 ///
-/// El error nombra el campo —una configuración puede tener varios secretos— y
-/// encadena el [`SecretError`], que tampoco contiene el valor.
-fn resolver_referencia(referencia: &SecretRef, campo: &str) -> Result<Value, ValidationError> {
-    let secreto = resolver(referencia).map_err(|fuente| ValidationError::SecretoNoResuelto {
-        campo: campo.to_owned(),
-        fuente,
+/// The error names the field —a configuration can have several secrets— and
+/// chains the [`SecretError`], which does not contain the value either.
+fn resolve_reference(reference: &SecretRef, field: &str) -> Result<Value, ValidationError> {
+    let secret = resolve(reference).map_err(|source| ValidationError::SecretNotResolved {
+        field: field.to_owned(),
+        source,
     })?;
 
     Ok(Value {
-        kind: Some(Kind::StringValue(secreto.expose().clone())),
+        kind: Some(Kind::StringValue(secret.expose().clone())),
     })
 }
 
-/// Cómo se llama un tipo del esquema en un mensaje de error.
-fn descripcion(tipo: FieldType) -> &'static str {
-    match tipo {
-        FieldType::String => "una cadena",
-        FieldType::Int => "un entero",
-        FieldType::Bool => "un booleano (true o false)",
-        FieldType::Duration => "una duración escrita como cadena (por ejemplo «30s»)",
-        FieldType::Path => "una ruta escrita como cadena",
-        FieldType::List => "una lista de cadenas",
-        FieldType::Unspecified => "de un tipo que el plugin no declara; es un fallo del plugin",
+/// How a schema type is named in an error message.
+fn type_description(field_type: FieldType) -> &'static str {
+    match field_type {
+        FieldType::String => "a string",
+        FieldType::Int => "an integer",
+        FieldType::Bool => "a boolean (true or false)",
+        FieldType::Duration => "a duration written as a string (for example \"30s\")",
+        FieldType::Path => "a path written as a string",
+        FieldType::List => "a list of strings",
+        FieldType::Unspecified => "of a type the plugin does not declare; this is a plugin bug",
     }
 }
 
-/// Pista para un campo que el esquema no declara.
+/// Hint for a field the schema does not declare.
 ///
-/// Con un parecido razonable se nombra: casi siempre es la errata. Sin él,
-/// sugerir el «menos lejano» sería ruido —el usuario no escribió mal `host`,
-/// escribió otra cosa— y lo útil es enseñarle qué campos existen.
-fn sugerir(desconocido: &str, esquema: &[Field]) -> String {
-    if esquema.is_empty() {
-        return "este plugin no declara ningún campo de configuración".to_owned();
+/// With a reasonable resemblance it is named: it is almost always the typo.
+/// Without one, suggesting the "least distant" would be noise —the user did not
+/// misspell `host`, they wrote something else— and what helps is showing them
+/// which fields exist.
+fn suggest(unknown: &str, schema: &[Field]) -> String {
+    if schema.is_empty() {
+        return "this plugin declares no configuration field".to_owned();
     }
 
-    let parecido = esquema
+    let similar = schema
         .iter()
-        .map(|campo| (distancia(desconocido, &campo.name), &campo.name))
-        .filter(|(d, _)| *d <= DISTANCIA_MAXIMA)
+        .map(|field| (distance(unknown, &field.name), &field.name))
+        .filter(|(d, _)| *d <= MAX_DISTANCE)
         .min_by_key(|(d, _)| *d);
 
-    if let Some((_, nombre)) = parecido {
-        return format!("¿quisiste decir «{nombre}»?");
+    if let Some((_, name)) = similar {
+        return format!("did you mean \"{name}\"?");
     }
 
-    let disponibles: Vec<&str> = esquema.iter().map(|campo| campo.name.as_str()).collect();
-    format!("los campos disponibles son: {}", disponibles.join(", "))
+    let available: Vec<&str> = schema.iter().map(|field| field.name.as_str()).collect();
+    format!("the available fields are: {}", available.join(", "))
 }
 
-/// Distancia de Levenshtein entre dos cadenas, en caracteres.
+/// Levenshtein distance between two strings, in characters.
 ///
-/// Se cuenta por `char` y no por byte para que una errata en un nombre con
-/// acentos no se mida como si fueran dos cambios.
-fn distancia(a: &str, b: &str) -> usize {
+/// It is counted per `char` and not per byte so that a typo in a name with
+/// accents is not measured as if it were two changes.
+fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
 
@@ -304,23 +306,23 @@ fn distancia(a: &str, b: &str) -> usize {
         return a.len();
     }
 
-    // Solo hacen falta dos filas de la matriz: la anterior y la que se está
-    // calculando.
-    let mut anterior: Vec<usize> = (0..=b.len()).collect();
-    let mut actual: Vec<usize> = vec![0; b.len() + 1];
+    // Only two rows of the matrix are needed: the previous one and the one being
+    // computed.
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current: Vec<usize> = vec![0; b.len() + 1];
 
     for (i, ca) in a.iter().enumerate() {
-        actual[0] = i + 1;
+        current[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
-            let sustitucion = anterior[j] + usize::from(ca != cb);
-            let borrado = anterior[j + 1] + 1;
-            let insercion = actual[j] + 1;
-            actual[j + 1] = sustitucion.min(borrado).min(insercion);
+            let substitution = previous[j] + usize::from(ca != cb);
+            let deletion = previous[j + 1] + 1;
+            let insertion = current[j] + 1;
+            current[j + 1] = substitution.min(deletion).min(insertion);
         }
-        std::mem::swap(&mut anterior, &mut actual);
+        std::mem::swap(&mut previous, &mut current);
     }
 
-    anterior[b.len()]
+    previous[b.len()]
 }
 
 #[cfg(test)]
@@ -328,35 +330,35 @@ mod tests {
     use super::*;
     use sb_proto::{Field, FieldType};
 
-    fn campo(nombre: &str, tipo: FieldType, requerido: bool, secreto: bool) -> Field {
+    fn field(name: &str, field_type: FieldType, required: bool, secret: bool) -> Field {
         Field {
-            name: nombre.into(),
-            r#type: tipo as i32,
-            required: requerido,
-            secret: secreto,
+            name: name.into(),
+            r#type: field_type as i32,
+            required,
+            secret,
             description: String::new(),
             default_value: String::new(),
         }
     }
 
-    fn esquema() -> Vec<Field> {
+    fn schema() -> Vec<Field> {
         vec![
-            campo("host", FieldType::String, true, false),
-            campo("port", FieldType::Int, false, false),
-            campo("password", FieldType::String, true, true),
-            campo("ssl", FieldType::Bool, false, false),
-            campo("ruta", FieldType::Path, false, false),
-            campo("excluir", FieldType::List, false, false),
+            field("host", FieldType::String, true, false),
+            field("port", FieldType::Int, false, false),
+            field("password", FieldType::String, true, true),
+            field("ssl", FieldType::Bool, false, false),
+            field("path", FieldType::Path, false, false),
+            field("exclude", FieldType::List, false, false),
         ]
     }
 
-    fn tabla(pares: Vec<(&str, ConfigValue)>) -> ConfigTable {
-        pares.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    fn table(pairs: Vec<(&str, ConfigValue)>) -> ConfigTable {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 
-    /// Configuración mínima válida: los dos campos requeridos.
-    fn minima() -> ConfigTable {
-        tabla(vec![
+    /// The minimal valid configuration: the two required fields.
+    fn minimal() -> ConfigTable {
+        table(vec![
             ("host", ConfigValue::String("db".into())),
             (
                 "password",
@@ -366,167 +368,164 @@ mod tests {
     }
 
     #[test]
-    fn acepta_una_configuracion_correcta() {
-        let r = validar_y_convertir(&minima(), &esquema(), "engine").unwrap();
+    fn accepts_a_correct_configuration() {
+        let r = validate_and_convert(&minimal(), &schema(), "engine").unwrap();
         assert!(r.contains_key("host"));
         assert!(r.contains_key("password"));
     }
 
     #[test]
-    fn el_secreto_llega_resuelto_no_como_referencia() {
-        // El plugin recibe el valor, nunca la ruta ni el nombre de la variable.
-        let r = validar_y_convertir(&minima(), &esquema(), "engine").unwrap();
+    fn the_secret_arrives_resolved_not_as_a_reference() {
+        // The plugin receives the value, never the path nor the variable name.
+        let r = validate_and_convert(&minimal(), &schema(), "engine").unwrap();
         let v = r.get("password").unwrap();
         match &v.kind {
             Some(sb_proto::value::Kind::StringValue(s)) => {
                 assert!(!s.is_empty());
-                assert!(
-                    !s.contains("PATH"),
-                    "no debe viajar el nombre de la variable"
-                );
+                assert!(!s.contains("PATH"), "the variable name must not travel");
             }
-            otro => panic!("se esperaba una cadena, llegó {otro:?}"),
+            other => panic!("a string was expected, {other:?} arrived"),
         }
     }
 
     #[test]
-    fn falta_un_campo_requerido() {
-        let cfg = tabla(vec![("host", ConfigValue::String("db".into()))]);
-        let err = validar_y_convertir(&cfg, &esquema(), "engine")
+    fn a_required_field_is_missing() {
+        let cfg = table(vec![("host", ConfigValue::String("db".into()))]);
+        let err = validate_and_convert(&cfg, &schema(), "engine")
             .err()
             .unwrap();
         assert!(
-            matches!(err, ValidationError::CampoRequeridoAusente { ref campo, .. } if campo == "password")
+            matches!(err, ValidationError::MissingRequiredField { ref field, .. } if field == "password")
         );
     }
 
     #[test]
-    fn un_campo_desconocido_se_rechaza_y_sugiere_el_parecido() {
-        let mut cfg = minima();
+    fn an_unknown_field_is_rejected_and_the_similar_one_is_suggested() {
+        let mut cfg = minimal();
         cfg.insert("hosst".into(), ConfigValue::String("db".into()));
-        let err = validar_y_convertir(&cfg, &esquema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "engine")
             .err()
             .unwrap();
-        let texto = err.to_string();
-        assert!(texto.contains("hosst"));
+        let text = err.to_string();
+        assert!(text.contains("hosst"));
         assert!(
-            texto.contains("host"),
-            "debe sugerir el campo que sí existe"
+            text.contains("host"),
+            "it must suggest the field that does exist"
         );
     }
 
     #[test]
-    fn un_campo_desconocido_muy_distinto_lista_los_disponibles() {
-        // Sin un parecido razonable, sugerir cualquiera sería ruido; mejor
-        // enseñar qué campos existen.
-        let mut cfg = minima();
+    fn a_very_different_unknown_field_lists_the_available_ones() {
+        // Without a reasonable resemblance, suggesting any of them would be
+        // noise; better to show which fields exist.
+        let mut cfg = minimal();
         cfg.insert("zzzzzzzz".into(), ConfigValue::String("x".into()));
-        let texto = validar_y_convertir(&cfg, &esquema(), "engine")
+        let text = validate_and_convert(&cfg, &schema(), "engine")
             .err()
             .unwrap()
             .to_string();
         assert!(
-            texto.contains("host") && texto.contains("port"),
-            "debe listar los campos disponibles"
+            text.contains("host") && text.contains("port"),
+            "it must list the available fields"
         );
     }
 
     #[test]
-    fn un_tipo_incorrecto_se_rechaza() {
-        let mut cfg = minima();
-        cfg.insert("port".into(), ConfigValue::String("no-es-un-numero".into()));
+    fn a_wrong_type_is_rejected() {
+        let mut cfg = minimal();
+        cfg.insert("port".into(), ConfigValue::String("not-a-number".into()));
         assert!(matches!(
-            validar_y_convertir(&cfg, &esquema(), "engine")
+            validate_and_convert(&cfg, &schema(), "engine")
                 .err()
                 .unwrap(),
-            ValidationError::TipoIncorrecto { .. }
+            ValidationError::WrongType { .. }
         ));
     }
 
     #[test]
-    fn un_campo_secreto_no_admite_valor_literal() {
-        // La regla más importante del módulo.
-        let cfg = tabla(vec![
+    fn a_secret_field_does_not_accept_a_literal_value() {
+        // The most important rule of the module.
+        let cfg = table(vec![
             ("host", ConfigValue::String("db".into())),
             ("password", ConfigValue::String("hunter2".into())),
         ]);
-        let err = validar_y_convertir(&cfg, &esquema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "engine")
             .err()
             .unwrap();
-        assert!(matches!(err, ValidationError::SecretoLiteral { .. }));
+        assert!(matches!(err, ValidationError::LiteralSecret { .. }));
         assert!(
             !err.to_string().contains("hunter2"),
-            "el error no puede filtrar el secreto"
+            "the error must not leak the secret"
         );
     }
 
     #[test]
-    fn el_error_de_secreto_literal_dice_las_alternativas() {
-        let cfg = tabla(vec![
+    fn the_literal_secret_error_states_the_alternatives() {
+        let cfg = table(vec![
             ("host", ConfigValue::String("db".into())),
             ("password", ConfigValue::String("x".into())),
         ]);
-        let texto = validar_y_convertir(&cfg, &esquema(), "engine")
+        let text = validate_and_convert(&cfg, &schema(), "engine")
             .err()
             .unwrap()
             .to_string();
-        assert!(texto.contains("env"), "debe decir cómo hacerlo bien");
-        assert!(texto.contains("file"));
+        assert!(text.contains("env"), "it must say how to do it right");
+        assert!(text.contains("file"));
     }
 
     #[test]
-    fn un_campo_no_secreto_no_admite_referencia_a_secreto() {
-        let mut cfg = minima();
+    fn a_non_secret_field_does_not_accept_a_secret_reference() {
+        let mut cfg = minimal();
         cfg.insert(
             "host".into(),
             ConfigValue::Secret(SecretRef::Env("PATH".into())),
         );
         assert!(matches!(
-            validar_y_convertir(&cfg, &esquema(), "engine")
+            validate_and_convert(&cfg, &schema(), "engine")
                 .err()
                 .unwrap(),
-            ValidationError::ReferenciaEnCampoPublico { .. }
+            ValidationError::SecretRefInPublicField { .. }
         ));
     }
 
     #[test]
-    fn los_campos_opcionales_ausentes_no_estorban() {
-        let r = validar_y_convertir(&minima(), &esquema(), "engine").unwrap();
+    fn absent_optional_fields_do_not_get_in_the_way() {
+        let r = validate_and_convert(&minimal(), &schema(), "engine").unwrap();
         assert!(!r.contains_key("port"));
         assert!(!r.contains_key("ssl"));
     }
 
     #[test]
-    fn los_tipos_path_y_duration_viajan_como_texto() {
-        // Su semántica la interpreta el plugin, no el núcleo.
-        let mut cfg = minima();
-        cfg.insert("ruta".into(), ConfigValue::String("/var/lib/x".into()));
-        let r = validar_y_convertir(&cfg, &esquema(), "engine").unwrap();
+    fn the_path_and_duration_types_travel_as_text() {
+        // Their semantics are interpreted by the plugin, not by the core.
+        let mut cfg = minimal();
+        cfg.insert("path".into(), ConfigValue::String("/var/lib/x".into()));
+        let r = validate_and_convert(&cfg, &schema(), "engine").unwrap();
         assert!(matches!(
-            r.get("ruta").unwrap().kind,
+            r.get("path").unwrap().kind,
             Some(sb_proto::value::Kind::StringValue(_))
         ));
     }
 
     #[test]
-    fn una_lista_viaja_como_lista() {
-        let mut cfg = minima();
+    fn a_list_travels_as_a_list() {
+        let mut cfg = minimal();
         cfg.insert(
-            "excluir".into(),
+            "exclude".into(),
             ConfigValue::List(vec!["a".into(), "b".into()]),
         );
-        let r = validar_y_convertir(&cfg, &esquema(), "engine").unwrap();
-        match &r.get("excluir").unwrap().kind {
+        let r = validate_and_convert(&cfg, &schema(), "engine").unwrap();
+        match &r.get("exclude").unwrap().kind {
             Some(sb_proto::value::Kind::ListValue(l)) => assert_eq!(l.values.len(), 2),
-            otro => panic!("se esperaba una lista, llegó {otro:?}"),
+            other => panic!("a list was expected, {other:?} arrived"),
         }
     }
 
     #[test]
-    fn un_booleano_viaja_como_booleano() {
-        let mut cfg = minima();
+    fn a_boolean_travels_as_a_boolean() {
+        let mut cfg = minimal();
         cfg.insert("ssl".into(), ConfigValue::Bool(true));
-        let r = validar_y_convertir(&cfg, &esquema(), "engine").unwrap();
+        let r = validate_and_convert(&cfg, &schema(), "engine").unwrap();
         assert!(matches!(
             r.get("ssl").unwrap().kind,
             Some(sb_proto::value::Kind::BoolValue(true))
@@ -534,43 +533,44 @@ mod tests {
     }
 
     #[test]
-    fn el_error_nombra_la_seccion() {
-        // En un backup hay dos plugins configurados. «falta el campo host» sin
-        // decir si es del motor o del destino obliga a adivinar.
+    fn the_error_names_the_section() {
+        // In a backup there are two configured plugins. "the field host is
+        // missing" without saying whether it is the engine's or the storage's
+        // forces you to guess.
         let cfg = ConfigTable::new();
-        let texto = validar_y_convertir(&cfg, &esquema(), "storage")
+        let text = validate_and_convert(&cfg, &schema(), "storage")
             .err()
             .unwrap()
             .to_string();
-        assert!(texto.contains("storage"));
+        assert!(text.contains("storage"));
     }
 
     #[test]
-    fn un_secreto_que_no_se_puede_resolver_da_un_error_util() {
-        let cfg = tabla(vec![
+    fn a_secret_that_cannot_be_resolved_gives_a_useful_error() {
+        let cfg = table(vec![
             ("host", ConfigValue::String("db".into())),
             (
                 "password",
-                ConfigValue::Secret(SecretRef::Env("SB_NO_EXISTE_ABC_999".into())),
+                ConfigValue::Secret(SecretRef::Env("SB_DOES_NOT_EXIST_ABC_999".into())),
             ),
         ]);
-        let err = validar_y_convertir(&cfg, &esquema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "engine")
             .err()
             .unwrap();
-        let texto = err.to_string();
-        assert!(texto.contains("password"), "debe decir qué campo falló");
+        let text = err.to_string();
+        assert!(text.contains("password"), "it must say which field failed");
     }
 
     #[test]
-    fn un_esquema_vacio_rechaza_cualquier_campo() {
-        let cfg = tabla(vec![("lo_que_sea", ConfigValue::String("x".into()))]);
-        assert!(validar_y_convertir(&cfg, &[], "engine").is_err());
+    fn an_empty_schema_rejects_any_field() {
+        let cfg = table(vec![("whatever", ConfigValue::String("x".into()))]);
+        assert!(validate_and_convert(&cfg, &[], "engine").is_err());
     }
 
     #[test]
-    fn un_esquema_vacio_acepta_una_configuracion_vacia() {
+    fn an_empty_schema_accepts_an_empty_configuration() {
         assert!(
-            validar_y_convertir(&ConfigTable::new(), &[], "engine")
+            validate_and_convert(&ConfigTable::new(), &[], "engine")
                 .unwrap()
                 .is_empty()
         );

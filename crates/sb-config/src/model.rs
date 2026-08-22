@@ -1,96 +1,93 @@
-//! Modelo de la configuración TOML de `shieldbk`.
+//! Model of `shieldbk`'s TOML configuration.
 //!
-//! Dos decisiones gobiernan este módulo:
+//! Two decisions govern this module:
 //!
-//! 1. **`engine_config` y `storage_config` son opacos para el núcleo.** El
-//!    núcleo no sabe qué es un puerto de base de datos ni un bucket: guarda esas
-//!    tablas como pares clave/valor genéricos ([`ConfigTable`]) y las valida
-//!    más tarde contra el esquema que cada plugin declara por gRPC. Codificar
-//!    aquí los campos de un motor concreto obligaría a recompilar el núcleo
-//!    para soportar un plugin nuevo, que es justo lo que la arquitectura de
-//!    plugins evita.
-//! 2. **Un secreto nunca es un literal.** Un campo secreto se escribe como una
-//!    referencia a su origen ([`SecretRef`]), así que el fichero de
-//!    configuración —que se versiona, se copia y se comparte— no contiene
-//!    contraseñas.
+//! 1. **`engine_config` and `storage_config` are opaque to the core.** The core
+//!    does not know what a database port or a bucket is: it keeps those tables as
+//!    generic key/value pairs ([`ConfigTable`]) and validates them later against
+//!    the schema each plugin declares over gRPC. Encoding the fields of a
+//!    specific engine here would mean recompiling the core to support a new
+//!    plugin, which is exactly what the plugin architecture avoids.
+//! 2. **A secret is never a literal.** A secret field is written as a reference
+//!    to its origin ([`SecretRef`]), so the configuration file —which is kept
+//!    under version control, copied and shared— contains no passwords.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-/// Nivel de compresión mínimo aceptado (el de zstd).
-const NIVEL_MINIMO: i32 = 1;
-/// Nivel de compresión máximo aceptado (el de zstd).
-const NIVEL_MAXIMO: i32 = 22;
+/// Minimum accepted compression level (zstd's).
+const MIN_LEVEL: i32 = 1;
+/// Maximum accepted compression level (zstd's).
+const MAX_LEVEL: i32 = 22;
 
-/// Nivel de compresión por defecto.
+/// Default compression level.
 ///
-/// Deliberadamente lejos del máximo: comprimir a 19 o 22 multiplica el tiempo
-/// de CPU en la máquina que está haciendo el volcado —normalmente el mismo
-/// servidor que atiende la base de datos— a cambio de unos pocos puntos
-/// porcentuales de tamaño. Quien prefiera el intercambio contrario lo pide
-/// explícitamente.
-const NIVEL_POR_DEFECTO: i32 = 6;
+/// Deliberately far from the maximum: compressing at 19 or 22 multiplies the CPU
+/// time on the machine taking the dump —normally the same server that serves the
+/// database— in exchange for a few percentage points of size. Whoever prefers the
+/// opposite trade-off asks for it explicitly.
+const DEFAULT_LEVEL: i32 = 6;
 
-/// Origen de un secreto. Nunca el secreto en sí.
+/// Origin of a secret. Never the secret itself.
 ///
-/// El fichero de configuración es un artefacto que se versiona en git, se
-/// copia entre máquinas y aparece en informes de error. Un literal ahí dentro
-/// es una filtración esperando a ocurrir, así que el modelo directamente no
-/// admite ninguno: solo se puede decir *dónde* está el secreto.
+/// The configuration file is an artifact that is kept in git, copied between
+/// machines and shows up in error reports. A literal in there is a leak waiting
+/// to happen, so the model simply does not accept one: it is only possible to say
+/// *where* the secret is.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretRef {
-    /// Variable de entorno del proceso `shieldbk`.
+    /// Environment variable of the `shieldbk` process.
     Env(String),
-    /// Archivo cuyo contenido es el secreto. Se exigen permisos restrictivos.
+    /// File whose contents are the secret. Restrictive permissions are required.
     File(String),
-    /// Entrada del llavero del sistema, en formato `servicio/clave`.
+    /// Entry of the system keyring, in `service/key` format.
     Keyring(String),
-    /// Comando y argumentos por separado: no hay shell, así que no hay
-    /// inyección.
+    /// Command and arguments separately: there is no shell, so there is no
+    /// injection.
     Command(Vec<String>),
-    /// Acepta permisos abiertos y avisa. Existe solo para secretos montados
-    /// por un orquestador: Docker usa 0444 en `/run/secrets` y Kubernetes 0644
-    /// por defecto. Rechazarlos sin alternativa impediría el caso de uso más
-    /// común en contenedor; relajar la comprobación por defecto sería peor. El
-    /// nombre es incómodo a propósito.
+    /// Accepts open permissions and warns. It exists only for secrets mounted by
+    /// an orchestrator: Docker uses 0444 in `/run/secrets` and Kubernetes 0644 by
+    /// default. Rejecting them without an alternative would rule out the most
+    /// common use case in a container; relaxing the check by default would be
+    /// worse. The name is deliberately awkward.
     FileInsecure(String),
 }
 
-/// Un valor cualquiera dentro de una tabla opaca de plugin.
+/// Any value inside an opaque plugin table.
 ///
-/// El orden de las variantes es significativo: con `untagged`, serde prueba
-/// una tras otra y se queda con la primera que encaja. [`SecretRef`] va
-/// primero para que una tabla como `{ env = "PGPASSWORD" }` se reconozca como
-/// referencia a secreto y no como un valor estructurado cualquiera.
+/// The order of the variants is significant: with `untagged`, serde tries them
+/// one after another and keeps the first that fits. [`SecretRef`] goes first so
+/// that a table such as `{ env = "PGPASSWORD" }` is recognized as a secret
+/// reference and not as just another structured value.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum ConfigValue {
-    /// Referencia al origen de un secreto.
+    /// Reference to the origin of a secret.
     Secret(SecretRef),
-    /// Booleano literal.
+    /// Literal boolean.
     Bool(bool),
-    /// Entero literal.
+    /// Literal integer.
     Int(i64),
-    /// Cadena literal.
+    /// Literal string.
     String(String),
-    /// Lista de cadenas. Un array suelto llega aquí; uno dentro de
-    /// `{ command = [...] }` se reconoce antes como [`SecretRef::Command`].
+    /// List of strings. A bare array lands here; one inside
+    /// `{ command = [...] }` is recognized earlier as [`SecretRef::Command`].
     List(Vec<String>),
 }
 
-/// Tabla de configuración opaca para el núcleo, validada más tarde contra el
-/// esquema que declara el plugin correspondiente.
+/// A configuration table that is opaque to the core, validated later against the
+/// schema declared by the corresponding plugin.
 pub type ConfigTable = BTreeMap<String, ConfigValue>;
 
-/// Dónde viven los plugins y su lockfile.
+/// Where the plugins and their lockfile live.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginsConfig {
-    /// Directorio donde se buscan los binarios de plugin.
+    /// Directory where plugin binaries are looked for.
     pub dir: String,
-    /// Fichero con los hashes de los binarios autorizados.
+    /// File with the hashes of the authorized binaries.
     pub lockfile: String,
 }
 
@@ -103,245 +100,245 @@ impl Default for PluginsConfig {
     }
 }
 
-/// Valores que se aplican a todos los targets que no los sobrescriban.
+/// Values applied to every target that does not override them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Defaults {
-    /// Nivel de compresión global, en `1..=22`.
+    /// Global compression level, in `1..=22`.
     pub compression_level: i32,
-    /// Plantilla de la clave del artefacto en el destino.
+    /// Template of the artifact's key in the destination.
     pub artifact_template: String,
 }
 
 impl Default for Defaults {
     fn default() -> Self {
         Self {
-            compression_level: NIVEL_POR_DEFECTO,
+            compression_level: DEFAULT_LEVEL,
             artifact_template:
                 "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age".to_owned(),
         }
     }
 }
 
-/// Una base de datos que respaldar, con su motor y su destino.
+/// A database to back up, with its engine and its storage.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
-    /// Nombre del target. Se usa como parte de la clave del artefacto.
+    /// Name of the target. It is used as part of the artifact's key.
     pub name: String,
-    /// Nombre del plugin de motor (`postgres`, `mysql`, …). El núcleo no
-    /// interpreta este valor: solo lo usa para localizar el plugin.
+    /// Name of the engine plugin (`postgres`, `mysql`, …). The core does not
+    /// interpret this value: it only uses it to locate the plugin.
     pub engine: String,
-    /// Nombre del plugin de almacenamiento. Igual de opaco que `engine`.
+    /// Name of the storage plugin. Just as opaque as `engine`.
     pub storage: String,
-    /// Clave pública age a la que se cifra el backup.
+    /// age public key the backup is encrypted to.
     pub recipient: String,
-    /// Configuración del plugin de motor. Opaca aquí.
+    /// Configuration of the engine plugin. Opaque here.
     #[serde(default)]
     pub engine_config: ConfigTable,
-    /// Configuración del plugin de almacenamiento. Opaca aquí.
+    /// Configuration of the storage plugin. Opaque here.
     #[serde(default)]
     pub storage_config: ConfigTable,
-    /// Nivel de compresión propio; si falta, manda el de [`Defaults`].
+    /// Its own compression level; if absent, [`Defaults`]' one wins.
     #[serde(default)]
     pub compression_level: Option<i32>,
-    /// Plantilla propia; si falta, manda la de [`Defaults`].
+    /// Its own template; if absent, [`Defaults`]' one wins.
     #[serde(default)]
     pub artifact_template: Option<String>,
 }
 
 impl Target {
-    /// Nivel de compresión que se aplicará: el del target si lo define, si no
-    /// el global.
+    /// Compression level that will be applied: the target's if it defines one,
+    /// otherwise the global one.
     #[must_use]
-    pub fn nivel_efectivo(&self, defaults: &Defaults) -> i32 {
+    pub fn effective_level(&self, defaults: &Defaults) -> i32 {
         self.compression_level.unwrap_or(defaults.compression_level)
     }
 
-    /// Plantilla de artefacto que se aplicará: la del target si la define, si
-    /// no la global.
+    /// Artifact template that will be applied: the target's if it defines one,
+    /// otherwise the global one.
     #[must_use]
-    pub fn plantilla_efectiva<'a>(&'a self, defaults: &'a Defaults) -> &'a str {
+    pub fn effective_template<'a>(&'a self, defaults: &'a Defaults) -> &'a str {
         self.artifact_template
             .as_deref()
             .unwrap_or(&defaults.artifact_template)
     }
 }
 
-/// La configuración completa de `shieldbk`.
+/// The complete configuration of `shieldbk`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Localización de los plugins.
+    /// Where the plugins are.
     #[serde(default)]
     pub plugins: PluginsConfig,
-    /// Valores globales.
+    /// Global values.
     #[serde(default)]
     pub defaults: Defaults,
-    /// Los targets declarados, en el orden del fichero.
+    /// The declared targets, in file order.
     #[serde(rename = "target", default)]
     pub targets: Vec<Target>,
 }
 
-/// Lo que puede ir mal al leer una configuración.
+/// What can go wrong while reading a configuration.
 ///
-/// Cada variante nombra el elemento problemático: quien recibe el error tiene
-/// que poder ir al fichero y arreglarlo sin adivinar.
+/// Every variant names the offending element: whoever receives the error has to
+/// be able to go to the file and fix it without guessing.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// El texto no es TOML válido o no encaja con el modelo.
-    #[error("la configuración no es TOML válido: {0}")]
-    TomlInvalido(Box<toml::de::Error>),
+    /// The text is not valid TOML or does not match the model.
+    #[error("the configuration is not valid TOML: {0}")]
+    InvalidToml(Box<toml::de::Error>),
 
-    /// Dos targets comparten nombre.
+    /// Two targets share a name.
     #[error(
-        "hay dos targets llamados «{nombre}». El nombre identifica al target en la línea de \
-         órdenes y forma parte de la clave del artefacto, así que tiene que ser único"
+        "there are two targets called \"{name}\". The name identifies the target on the command \
+         line and is part of the artifact's key, so it has to be unique"
     )]
-    NombreDuplicado {
-        /// El nombre repetido.
-        nombre: String,
+    DuplicateName {
+        /// The repeated name.
+        name: String,
     },
 
-    /// No hay ningún target que respaldar.
+    /// There is no target to back up.
     #[error(
-        "la configuración no declara ningún target: añade al menos un bloque `[[target]]` con \
-         `name`, `engine`, `storage` y `recipient`"
+        "the configuration declares no target: add at least one `[[target]]` block with `name`, \
+         `engine`, `storage` and `recipient`"
     )]
-    SinTargets,
+    NoTargets,
 
-    /// Un valor está fuera del rango admitido.
-    #[error("el valor de «{campo}» en {donde} no es válido ({valor}): {motivo}")]
-    ValorInvalido {
-        /// Nombre del campo.
-        campo: String,
-        /// Dónde aparece: `[defaults]` o el target concreto.
-        donde: String,
-        /// El valor rechazado.
-        valor: String,
-        /// Por qué se rechaza.
-        motivo: String,
+    /// A value is outside the accepted range.
+    #[error("the value of \"{field}\" in {location} is not valid ({value}): {reason}")]
+    InvalidValue {
+        /// Name of the field.
+        field: String,
+        /// Where it appears: `[defaults]` or the specific target.
+        location: String,
+        /// The rejected value.
+        value: String,
+        /// Why it is rejected.
+        reason: String,
     },
 
-    /// El nombre de un target no puede usarse en la clave de un artefacto.
-    #[error("el nombre de target «{nombre}» no es válido: {motivo}")]
-    NombreInvalido {
-        /// El nombre rechazado.
-        nombre: String,
-        /// Por qué se rechaza.
-        motivo: String,
+    /// A target's name cannot be used in an artifact's key.
+    #[error("the target name \"{name}\" is not valid: {reason}")]
+    InvalidName {
+        /// The rejected name.
+        name: String,
+        /// Why it is rejected.
+        reason: String,
     },
 }
 
 impl From<toml::de::Error> for ConfigError {
     fn from(e: toml::de::Error) -> Self {
-        Self::TomlInvalido(Box::new(e))
+        Self::InvalidToml(Box::new(e))
     }
 }
 
 impl Config {
-    /// Lee una configuración desde texto TOML y la valida.
+    /// Reads a configuration from TOML text and validates it.
     ///
-    /// La validación que se hace aquí es la que el núcleo puede hacer solo:
-    /// nombres de target utilizables, unicidad, rangos de compresión. Lo que
-    /// haya dentro de `engine_config` y `storage_config` no se toca: eso se
-    /// valida contra el esquema que declara cada plugin.
+    /// The validation done here is the one the core can do on its own: usable
+    /// target names, uniqueness, compression ranges. Whatever is inside
+    /// `engine_config` and `storage_config` is left untouched: that is validated
+    /// against the schema each plugin declares.
     ///
     /// # Errors
     ///
-    /// Devuelve [`ConfigError::TomlInvalido`] si el texto no es TOML válido,
-    /// le falta un campo obligatorio o trae un campo desconocido;
-    /// [`ConfigError::SinTargets`] si no hay ningún `[[target]]` —los comandos
-    /// que no respaldan nada usan [`Config::parse_sin_exigir_targets`]—;
-    /// [`ConfigError::NombreDuplicado`] o [`ConfigError::NombreInvalido`] si
-    /// los nombres de target no sirven, y [`ConfigError::ValorInvalido`] si un
-    /// nivel de compresión está fuera de `1..=22`.
-    pub fn parse(texto: &str) -> Result<Self, ConfigError> {
-        let config = Self::parse_sin_exigir_targets(texto)?;
+    /// Returns [`ConfigError::InvalidToml`] if the text is not valid TOML, is
+    /// missing a mandatory field or carries an unknown one;
+    /// [`ConfigError::NoTargets`] if there is no `[[target]]` —the commands that
+    /// back nothing up use [`Config::parse_without_requiring_targets`]—;
+    /// [`ConfigError::DuplicateName`] or [`ConfigError::InvalidName`] if the
+    /// target names are unusable, and [`ConfigError::InvalidValue`] if a
+    /// compression level is outside `1..=22`.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let config = Self::parse_without_requiring_targets(text)?;
         if config.targets.is_empty() {
-            return Err(ConfigError::SinTargets);
+            return Err(ConfigError::NoTargets);
         }
         Ok(config)
     }
 
-    /// Igual que [`Config::parse`] pero **sin** exigir que haya targets.
+    /// The same as [`Config::parse`] but **without** requiring any target.
     ///
-    /// Existe para los comandos que solo necesitan la sección `[plugins]`:
-    /// registrar, verificar o listar los binarios de plugin no tiene nada que
-    /// ver con qué bases de datos se respaldan, y de hecho es lo que se hace
-    /// *antes* de decidirlo —al instalar, o al construir una imagen—. Exigir
-    /// ahí un `[[target]]` obliga a inventarse uno con un `recipient` falso.
+    /// It exists for the commands that only need the `[plugins]` section:
+    /// registering, verifying or listing plugin binaries has nothing to do with
+    /// which databases are backed up, and in fact it is what is done *before*
+    /// deciding that —when installing, or when building an image—. Requiring a
+    /// `[[target]]` there would force inventing one with a fake `recipient`.
     ///
-    /// Todo lo demás se valida igual. Quien sí vaya a respaldar algo llama a
-    /// [`Config::parse`], que es la que exige los targets.
+    /// Everything else is validated the same. Whoever is actually going to back
+    /// something up calls [`Config::parse`], which is the one that requires
+    /// targets.
     ///
     /// # Errors
     ///
-    /// Los mismos que [`Config::parse`] menos [`ConfigError::SinTargets`].
-    pub fn parse_sin_exigir_targets(texto: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(texto)?;
+    /// The same as [`Config::parse`] minus [`ConfigError::NoTargets`].
+    pub fn parse_without_requiring_targets(text: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(text)?;
 
-        valida_nivel(config.defaults.compression_level, "[defaults]")?;
+        validate_level(config.defaults.compression_level, "[defaults]")?;
 
-        let mut vistos = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for target in &config.targets {
-            valida_nombre(&target.name)?;
-            if !vistos.insert(target.name.as_str()) {
-                return Err(ConfigError::NombreDuplicado {
-                    nombre: target.name.clone(),
+            validate_name(&target.name)?;
+            if !seen.insert(target.name.as_str()) {
+                return Err(ConfigError::DuplicateName {
+                    name: target.name.clone(),
                 });
             }
-            if let Some(nivel) = target.compression_level {
-                valida_nivel(nivel, &format!("el target «{}»", target.name))?;
+            if let Some(level) = target.compression_level {
+                validate_level(level, &format!("the target \"{}\"", target.name))?;
             }
         }
 
-        tracing::debug!(targets = config.targets.len(), "configuración cargada");
+        tracing::debug!(targets = config.targets.len(), "configuration loaded");
         Ok(config)
     }
 
-    /// Busca un target por su nombre.
+    /// Looks up a target by its name.
     #[must_use]
-    pub fn target(&self, nombre: &str) -> Option<&Target> {
-        self.targets.iter().find(|t| t.name == nombre)
+    pub fn target(&self, name: &str) -> Option<&Target> {
+        self.targets.iter().find(|t| t.name == name)
     }
 }
 
-/// Comprueba que un nivel de compresión está en el rango de zstd.
-fn valida_nivel(nivel: i32, donde: &str) -> Result<(), ConfigError> {
-    if (NIVEL_MINIMO..=NIVEL_MAXIMO).contains(&nivel) {
+/// Checks that a compression level is within zstd's range.
+fn validate_level(level: i32, location: &str) -> Result<(), ConfigError> {
+    if (MIN_LEVEL..=MAX_LEVEL).contains(&level) {
         return Ok(());
     }
-    Err(ConfigError::ValorInvalido {
-        campo: "compression_level".to_owned(),
-        donde: donde.to_owned(),
-        valor: nivel.to_string(),
-        motivo: format!("zstd solo admite niveles de {NIVEL_MINIMO} a {NIVEL_MAXIMO}"),
+    Err(ConfigError::InvalidValue {
+        field: "compression_level".to_owned(),
+        location: location.to_owned(),
+        value: level.to_string(),
+        reason: format!("zstd only accepts levels from {MIN_LEVEL} to {MAX_LEVEL}"),
     })
 }
 
-/// Comprueba que un nombre de target puede formar parte de la clave de un
-/// artefacto sin sorpresas.
+/// Checks that a target name can be part of an artifact's key without surprises.
 ///
-/// El nombre acaba concatenado en una ruta del destino remoto. Una barra
-/// crearía jerarquía donde no se esperaba, `..` podría escapar del prefijo del
-/// target al escribir en un destino de sistema de archivos, y un byte nulo
-/// trunca cadenas en cualquier API en C que haya por debajo.
-fn valida_nombre(nombre: &str) -> Result<(), ConfigError> {
-    let motivo = if nombre.is_empty() {
-        "no puede estar vacío"
-    } else if nombre.contains('/') || nombre.contains('\\') {
-        "no puede contener barras: el nombre forma parte de la clave del artefacto"
-    } else if nombre.contains("..") {
-        "no puede contener «..»: podría escapar del prefijo del target en el destino"
-    } else if nombre.contains('\0') {
-        "no puede contener bytes nulos"
+/// The name ends up concatenated into a path on the remote destination. A slash
+/// would create hierarchy where none was expected, `..` could escape the target's
+/// prefix when writing to a file-system destination, and a null byte truncates
+/// strings in any underlying C API.
+fn validate_name(name: &str) -> Result<(), ConfigError> {
+    let reason = if name.is_empty() {
+        "it cannot be empty"
+    } else if name.contains('/') || name.contains('\\') {
+        "it cannot contain slashes: the name is part of the artifact's key"
+    } else if name.contains("..") {
+        "it cannot contain \"..\": it could escape the target's prefix in the destination"
+    } else if name.contains('\0') {
+        "it cannot contain null bytes"
     } else {
         return Ok(());
     };
-    Err(ConfigError::NombreInvalido {
-        nombre: nombre.to_owned(),
-        motivo: motivo.to_owned(),
+    Err(ConfigError::InvalidName {
+        name: name.to_owned(),
+        reason: reason.to_owned(),
     })
 }
 
@@ -349,7 +346,7 @@ fn valida_nombre(nombre: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
-    const EJEMPLO: &str = r#"
+    const EXAMPLE: &str = r#"
 [plugins]
 dir = "~/.shieldbk/plugins"
 lockfile = "~/.shieldbk/plugins.lock"
@@ -359,13 +356,13 @@ compression_level = 6
 artifact_template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age"
 
 [[target]]
-name = "produccion"
+name = "production"
 engine = "postgres"
 storage = "r2"
 recipient = "age1qqqqqqqqqq"
 
 [target.engine_config]
-host = "db.interno"
+host = "db.internal"
 port = 5432
 ssl = true
 password = { env = "PGPASSWORD" }
@@ -376,20 +373,20 @@ secret_access_key = { keyring = "shieldbk/r2" }
 "#;
 
     #[test]
-    fn parsea_una_configuracion_completa() {
-        let c = Config::parse(EJEMPLO).unwrap();
+    fn parses_a_complete_configuration() {
+        let c = Config::parse(EXAMPLE).unwrap();
         assert_eq!(c.targets.len(), 1);
-        assert_eq!(c.targets[0].name, "produccion");
+        assert_eq!(c.targets[0].name, "production");
         assert_eq!(c.targets[0].engine, "postgres");
         assert_eq!(c.targets[0].storage, "r2");
         assert_eq!(c.defaults.compression_level, 6);
     }
 
     #[test]
-    fn los_valores_literales_y_las_referencias_conviven() {
-        let c = Config::parse(EJEMPLO).unwrap();
+    fn literal_values_and_references_live_side_by_side() {
+        let c = Config::parse(EXAMPLE).unwrap();
         let ec = &c.targets[0].engine_config;
-        assert!(matches!(ec.get("host"), Some(ConfigValue::String(s)) if s == "db.interno"));
+        assert!(matches!(ec.get("host"), Some(ConfigValue::String(s)) if s == "db.internal"));
         assert!(matches!(ec.get("port"), Some(ConfigValue::Int(5432))));
         assert!(matches!(ec.get("ssl"), Some(ConfigValue::Bool(true))));
         assert!(
@@ -398,7 +395,7 @@ secret_access_key = { keyring = "shieldbk/r2" }
     }
 
     #[test]
-    fn reconoce_las_cinco_fuentes_de_secreto() {
+    fn recognizes_the_five_secret_sources() {
         let toml = r#"
 [[target]]
 name = "t"
@@ -407,8 +404,8 @@ storage = "s"
 recipient = "age1x"
 [target.engine_config]
 a = { env = "A" }
-b = { file = "/ruta/b" }
-c = { keyring = "servicio/c" }
+b = { file = "/path/b" }
+c = { keyring = "service/c" }
 d = { command = ["vault", "read", "x"] }
 e = { file_insecure = "/run/secrets/e" }
 "#;
@@ -437,9 +434,9 @@ e = { file_insecure = "/run/secrets/e" }
     }
 
     #[test]
-    fn una_lista_de_cadenas_no_se_confunde_con_un_comando() {
-        // `command` es un array de cadenas, igual que una lista normal. La
-        // diferencia la marca estar dentro de una tabla con esa clave.
+    fn a_list_of_strings_is_not_mistaken_for_a_command() {
+        // `command` is an array of strings, just like a normal list. The
+        // difference is being inside a table with that key.
         let toml = r#"
 [[target]]
 name = "t"
@@ -447,17 +444,17 @@ engine = "e"
 storage = "s"
 recipient = "age1x"
 [target.engine_config]
-exclusiones = ["tabla_a", "tabla_b"]
+exclusions = ["table_a", "table_b"]
 "#;
         let c = Config::parse(toml).unwrap();
         assert!(matches!(
-            c.targets[0].engine_config.get("exclusiones"),
+            c.targets[0].engine_config.get("exclusions"),
             Some(ConfigValue::List(v)) if v.len() == 2
         ));
     }
 
     #[test]
-    fn se_rechazan_dos_targets_con_el_mismo_nombre() {
+    fn two_targets_with_the_same_name_are_rejected() {
         let toml = r#"
 [[target]]
 name = "dup"
@@ -471,69 +468,72 @@ storage = "s"
 recipient = "age1x"
 "#;
         let err = Config::parse(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::NombreDuplicado { .. }));
-        assert!(err.to_string().contains("dup"), "debe nombrar el duplicado");
+        assert!(matches!(err, ConfigError::DuplicateName { .. }));
+        assert!(
+            err.to_string().contains("dup"),
+            "it must name the duplicate"
+        );
     }
 
     #[test]
-    fn se_rechaza_una_configuracion_sin_targets() {
+    fn a_configuration_without_targets_is_rejected() {
         assert!(matches!(
             Config::parse("[plugins]\ndir = \"/x\"").unwrap_err(),
-            ConfigError::SinTargets
+            ConfigError::NoTargets
         ));
     }
 
     #[test]
-    fn sin_exigir_targets_una_config_de_solo_plugins_es_valida() {
-        // Instalar plugins pasa antes que decidir qué se respalda: quien solo
-        // va a sellar el lockfile no tiene por qué inventarse un target.
-        let c = Config::parse_sin_exigir_targets("[plugins]\ndir = \"/opt/sb\"").unwrap();
+    fn without_requiring_targets_a_plugins_only_config_is_valid() {
+        // Installing plugins comes before deciding what is backed up: whoever is
+        // only going to seal the lockfile does not have to invent a target.
+        let c = Config::parse_without_requiring_targets("[plugins]\ndir = \"/opt/sb\"").unwrap();
         assert!(c.targets.is_empty());
         assert_eq!(c.plugins.dir, "/opt/sb");
     }
 
     #[test]
-    fn sin_exigir_targets_el_resto_de_la_validacion_sigue_en_pie() {
-        // Lo único que se relaja es la exigencia de targets. Un target mal
-        // escrito se sigue rechazando igual.
-        for malo in [
+    fn without_requiring_targets_the_rest_of_the_validation_still_holds() {
+        // The only thing relaxed is the requirement of targets. A badly written
+        // target is still rejected the same.
+        for bad in [
             "[defaults]\ncompression_level = 99\n",
-            "[[target]]\nname = \"con/barra\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n",
-            "esto no es toml [[[",
+            "[[target]]\nname = \"with/slash\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n",
+            "this is not toml [[[",
         ] {
             assert!(
-                Config::parse_sin_exigir_targets(malo).is_err(),
-                "«{malo}» debería rechazarse igual que en `parse`"
+                Config::parse_without_requiring_targets(bad).is_err(),
+                "\"{bad}\" should be rejected just as in `parse`"
             );
         }
     }
 
     #[test]
-    fn se_rechaza_un_target_sin_recipient() {
-        // Sin clave pública no se puede cifrar, y un backup sin cifrar no es
-        // lo que esta herramienta promete.
+    fn a_target_without_a_recipient_is_rejected() {
+        // Without a public key nothing can be encrypted, and an unencrypted
+        // backup is not what this tool promises.
         let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\n";
         assert!(Config::parse(toml).is_err());
     }
 
     #[test]
-    fn el_nivel_de_compresion_global_se_valida() {
-        let toml = format!("[defaults]\ncompression_level = 99\n{EJEMPLO_TARGET}");
+    fn the_global_compression_level_is_validated() {
+        let toml = format!("[defaults]\ncompression_level = 99\n{EXAMPLE_TARGET}");
         assert!(matches!(
             Config::parse(&toml).unwrap_err(),
-            ConfigError::ValorInvalido { .. }
+            ConfigError::InvalidValue { .. }
         ));
     }
 
     #[test]
-    fn el_nivel_de_compresion_por_target_se_valida() {
+    fn the_per_target_compression_level_is_validated() {
         let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompression_level = 0\n";
         let err = Config::parse(toml).unwrap_err();
-        assert!(matches!(err, ConfigError::ValorInvalido { .. }));
-        assert!(err.to_string().contains('t'), "debe decir en qué target");
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+        assert!(err.to_string().contains('t'), "it must say in which target");
     }
 
-    const EJEMPLO_TARGET: &str = r#"
+    const EXAMPLE_TARGET: &str = r#"
 [[target]]
 name = "t"
 engine = "e"
@@ -542,71 +542,74 @@ recipient = "age1x"
 "#;
 
     #[test]
-    fn un_target_se_busca_por_nombre() {
-        let c = Config::parse(EJEMPLO).unwrap();
-        assert!(c.target("produccion").is_some());
-        assert!(c.target("no-existe").is_none());
+    fn a_target_is_looked_up_by_name() {
+        let c = Config::parse(EXAMPLE).unwrap();
+        assert!(c.target("production").is_some());
+        assert!(c.target("does-not-exist").is_none());
     }
 
     #[test]
-    fn el_nivel_del_target_gana_al_global() {
+    fn the_target_level_beats_the_global_one() {
         let toml = "[defaults]\ncompression_level = 3\n[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompression_level = 19\n";
         let c = Config::parse(toml).unwrap();
-        assert_eq!(c.targets[0].nivel_efectivo(&c.defaults), 19);
+        assert_eq!(c.targets[0].effective_level(&c.defaults), 19);
     }
 
     #[test]
-    fn sin_nivel_en_el_target_se_usa_el_global() {
-        let c = Config::parse(EJEMPLO).unwrap();
-        assert_eq!(c.targets[0].nivel_efectivo(&c.defaults), 6);
+    fn without_a_level_in_the_target_the_global_one_is_used() {
+        let c = Config::parse(EXAMPLE).unwrap();
+        assert_eq!(c.targets[0].effective_level(&c.defaults), 6);
     }
 
     #[test]
-    fn la_plantilla_del_target_gana_a_la_global() {
-        let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\nartifact_template = \"propia\"\n";
+    fn the_target_template_beats_the_global_one() {
+        let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\nartifact_template = \"own\"\n";
         let c = Config::parse(toml).unwrap();
-        assert_eq!(c.targets[0].plantilla_efectiva(&c.defaults), "propia");
+        assert_eq!(c.targets[0].effective_template(&c.defaults), "own");
     }
 
     #[test]
-    fn los_valores_por_defecto_son_razonables() {
-        let c = Config::parse(EJEMPLO_TARGET).unwrap();
+    fn the_default_values_are_reasonable() {
+        let c = Config::parse(EXAMPLE_TARGET).unwrap();
         assert!(
             (1..=9).contains(&c.defaults.compression_level),
-            "el nivel por defecto debe ser rápido, no máximo"
+            "the default level must be fast, not maximal"
         );
         assert!(c.defaults.artifact_template.contains("{target}"));
         assert!(c.plugins.dir.contains("plugins"));
     }
 
     #[test]
-    fn un_toml_invalido_da_error_y_no_panico() {
+    fn an_invalid_toml_is_an_error_and_not_a_panic() {
         assert!(matches!(
-            Config::parse("esto no es toml [[[").unwrap_err(),
-            ConfigError::TomlInvalido(_)
+            Config::parse("this is not toml [[[").unwrap_err(),
+            ConfigError::InvalidToml(_)
         ));
     }
 
     #[test]
-    fn un_campo_desconocido_en_target_se_rechaza() {
-        // Un typo en un nombre de campo no puede ignorarse en silencio: el
-        // usuario creería haber configurado algo que no está activo.
+    fn an_unknown_field_in_a_target_is_rejected() {
+        // A typo in a field name cannot be ignored in silence: the user would
+        // believe they had configured something that is not in effect.
         let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompresion_level = 5\n";
         assert!(
             Config::parse(toml).is_err(),
-            "un campo desconocido debe rechazarse"
+            "an unknown field must be rejected"
         );
     }
 
     #[test]
-    fn los_nombres_de_target_no_pueden_estar_vacios_ni_llevar_barras() {
-        // El nombre del target va en la clave del artefacto: una barra o un
-        // nombre vacío producirían rutas absurdas o inseguras en el destino.
-        for malo in ["", "con/barra", "..", "con espacio/y barra"] {
+    fn target_names_cannot_be_empty_nor_carry_slashes() {
+        // The target's name goes into the artifact's key: a slash or an empty
+        // name would produce absurd or unsafe paths in the destination.
+        for bad in ["", "with/slash", "..", "with space/and slash"] {
             let toml = format!(
-                "[[target]]\nname = \"{malo}\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n"
+                "[[target]]\nname = \"{bad}\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n"
             );
-            assert!(Config::parse(&toml).is_err(), "«{malo}» debería rechazarse");
+            assert!(
+                Config::parse(&toml).is_err(),
+                "\"{bad}\" should be rejected"
+            );
         }
     }
 }

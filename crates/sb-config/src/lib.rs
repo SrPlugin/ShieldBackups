@@ -1,9 +1,9 @@
-//! Configuración de `shieldbk`: modelo del fichero TOML.
+//! `shieldbk` configuration: the model of the TOML file.
 //!
-//! El núcleo no conoce ningún motor ni ningún almacenamiento concretos. Lo que
-//! el usuario escriba dentro de `engine_config` y `storage_config` viaja hasta
-//! aquí como una tabla opaca y se valida después contra el esquema que el
-//! plugin correspondiente declara por gRPC.
+//! The core knows no specific engine and no specific storage. Whatever the user
+//! writes inside `engine_config` and `storage_config` travels up to here as an
+//! opaque table and is validated later against the schema the corresponding
+//! plugin declares over gRPC.
 
 pub mod model;
 pub mod secrets;
@@ -12,5 +12,5 @@ pub mod validate;
 pub use model::{
     Config, ConfigError, ConfigTable, ConfigValue, Defaults, PluginsConfig, SecretRef, Target,
 };
-pub use secrets::{SecretError, resolver};
-pub use validate::{ValidationError, validar_y_convertir};
+pub use secrets::{SecretError, resolve};
+pub use validate::{ValidationError, validate_and_convert};

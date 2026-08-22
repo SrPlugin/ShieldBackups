@@ -25,7 +25,7 @@ use crate::error::CliError;
 #[must_use]
 pub fn prefijo_de(target: &Target, defaults: &Defaults) -> String {
     prefijo_de_plantilla(
-        target.plantilla_efectiva(defaults),
+        target.effective_template(defaults),
         &target.name,
         &target.engine,
         &target.storage,
