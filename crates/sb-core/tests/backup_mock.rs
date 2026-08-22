@@ -1,202 +1,199 @@
-// Igual que en `sb-transport/tests/fallos.rs`: este fichero es todo código de
-// prueba, ayudantes incluidos, y ahí un `unwrap` es lo que se quiere —que el
-// test explote justo donde falló—.
+// Same as in `sb-transport/tests/fallos.rs`: this file is all test code, helpers
+// included, and there an `unwrap` is exactly what is wanted —for the test to
+// blow up right where it failed—.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Backup completo contra `sb-plugin-mock`, de punta a punta y sin red.
+//! A complete backup against `sb-plugin-mock`, end to end and without a network.
 //!
-//! Los tests de las piezas sueltas ya cubren el pipeline, el canal de datos y
-//! el arranque de plugins. Lo que solo se puede comprobar aquí es lo que pasa
-//! cuando los bytes cruzan **dos veces** el límite de proceso: motor → núcleo →
-//! destino. Un fallo en ese camino no lo ve ningún test unitario, y se
-//! manifestaría como un artefacto que no se puede restaurar.
+//! The tests of the individual pieces already cover the pipeline, the data
+//! channel and plugin startup. What can only be checked here is what happens when
+//! the bytes cross the process boundary **twice**: engine → core → storage. A
+//! failure along that path is invisible to any unit test, and would show up as an
+//! artifact that cannot be restored.
 
-mod comun;
+mod common;
 
-use comun::{peticion, preparar};
+use common::{prepare, request};
 
-use sb_core::ops::backup::{BackupRequest, ejecutar_backup};
+use sb_core::ops::backup::{BackupRequest, run_backup};
 use sb_crypto::Identity;
-// Arriba y no dentro de cada test: `clippy::pedantic` prohíbe declarar items
-// después de las sentencias, y `shutdown` sobre el `Sha256Writer` lo necesitan
-// varios de ellos.
+// Up here and not inside each test: `clippy::pedantic` forbids declaring items
+// after statements, and several of them need `shutdown` on the `Sha256Writer`.
 use tokio::io::AsyncWriteExt as _;
 
 #[tokio::test]
-async fn un_backup_completo_produce_artefacto_y_manifiesto() {
+async fn a_complete_backup_produces_an_artifact_and_a_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 7, 2 * 1024 * 1024).await;
+    let (engine, storage) = prepare(dir.path(), 7, 2 * 1024 * 1024).await;
 
-    let r = ejecutar_backup(peticion(&motor, &destino, "prueba/artefacto.age", &id))
+    let r = run_backup(request(&engine, &storage, "test/artifact.age", &id))
         .await
         .unwrap();
 
     assert_eq!(r.summary.plaintext_bytes, 2 * 1024 * 1024);
     assert!(r.summary.ciphertext_bytes > 0);
 
-    assert!(dir.path().join("prueba/artefacto.age").exists());
-    assert!(
-        dir.path()
-            .join("prueba/artefacto.age.manifest.json")
-            .exists()
-    );
+    assert!(dir.path().join("test/artifact.age").exists());
+    assert!(dir.path().join("test/artifact.age.manifest.json").exists());
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn el_manifiesto_describe_fielmente_el_artefacto() {
+async fn the_manifest_faithfully_describes_the_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 3, 512 * 1024).await;
+    let (engine, storage) = prepare(dir.path(), 3, 512 * 1024).await;
 
-    let r = ejecutar_backup(peticion(&motor, &destino, "m.age", &id))
+    let r = run_backup(request(&engine, &storage, "m.age", &id))
         .await
         .unwrap();
 
-    let texto = std::fs::read_to_string(dir.path().join("m.age.manifest.json")).unwrap();
-    let m = sb_core::model::Manifest::parse(&texto).unwrap();
+    let text = std::fs::read_to_string(dir.path().join("m.age.manifest.json")).unwrap();
+    let m = sb_core::model::Manifest::parse(&text).unwrap();
 
     assert_eq!(m.plaintext_bytes, 512 * 1024);
     assert_eq!(m.ciphertext_sha256, r.summary.ciphertext_sha256.to_hex());
     assert_eq!(m.plaintext_sha256, r.summary.plaintext_sha256.to_hex());
     assert_eq!(m.artifact_key, "m.age");
-    assert_eq!(m.target, "prueba");
+    assert_eq!(m.target, "test");
     assert_eq!(m.encryption.recipient, id.to_recipient().to_string());
 
-    // El tamaño declarado coincide con el fichero que hay de verdad en el destino.
+    // The declared size matches the file that is really in the storage.
     let real = std::fs::metadata(dir.path().join("m.age")).unwrap().len();
     assert_eq!(m.ciphertext_bytes, real);
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn el_artefacto_del_destino_es_exactamente_lo_que_produjo_el_pipeline() {
-    // Comprueba que nada se corrompe al cruzar dos veces el límite de proceso.
+async fn the_artifact_in_the_storage_is_exactly_what_the_pipeline_produced() {
+    // Checks that nothing gets corrupted while crossing the process boundary
+    // twice.
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 11, 3 * 1024 * 1024 + 7).await;
+    let (engine, storage) = prepare(dir.path(), 11, 3 * 1024 * 1024 + 7).await;
 
-    let r = ejecutar_backup(peticion(&motor, &destino, "exacto.age", &id))
+    let r = run_backup(request(&engine, &storage, "exact.age", &id))
         .await
         .unwrap();
 
-    let bytes = std::fs::read(dir.path().join("exacto.age")).unwrap();
+    let bytes = std::fs::read(dir.path().join("exact.age")).unwrap();
     assert_eq!(bytes.len() as u64, r.summary.ciphertext_bytes);
 
-    // Y su digest coincide con el que calculó el pipeline al vuelo.
+    // And its digest matches the one the pipeline computed on the fly.
     let mut w = sb_crypto::Sha256Writer::new(Vec::new());
     w.write_all(&bytes).await.unwrap();
     w.shutdown().await.unwrap();
     assert_eq!(w.into_parts().1, r.summary.ciphertext_sha256);
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn el_plaintext_hasheado_es_el_que_el_motor_dijo_producir() {
-    // El resumen no se cree lo que diga el motor: se regenera el flujo
-    // determinista aquí y se compara con el digest que el pipeline calculó al
-    // vuelo. Si un byte se perdiera entre el motor y el núcleo, esto lo ve.
+async fn the_hashed_plaintext_is_the_one_the_engine_said_it_produced() {
+    // The summary does not take the engine's word for it: the deterministic
+    // stream is regenerated here and compared with the digest the pipeline
+    // computed on the fly. If a byte were lost between the engine and the core,
+    // this would see it.
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 23, 1024 * 1024 + 3).await;
+    let (engine, storage) = prepare(dir.path(), 23, 1024 * 1024 + 3).await;
 
-    let r = ejecutar_backup(peticion(&motor, &destino, "fiel.age", &id))
+    let r = run_backup(request(&engine, &storage, "faithful.age", &id))
         .await
         .unwrap();
 
-    let esperado: Vec<u8> = sb_plugin_mock::datos_deterministas(23, 1024 * 1024 + 3).collect();
+    let expected: Vec<u8> = sb_plugin_mock::datos_deterministas(23, 1024 * 1024 + 3).collect();
     let mut w = sb_crypto::Sha256Writer::new(Vec::new());
-    w.write_all(&esperado).await.unwrap();
+    w.write_all(&expected).await.unwrap();
     w.shutdown().await.unwrap();
     assert_eq!(w.into_parts().1, r.summary.plaintext_sha256);
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn el_backup_de_una_fuente_vacia_tambien_funciona() {
+async fn the_backup_of_an_empty_source_also_works() {
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 1, 0).await;
+    let (engine, storage) = prepare(dir.path(), 1, 0).await;
 
-    let r = ejecutar_backup(peticion(&motor, &destino, "vacio.age", &id))
+    let r = run_backup(request(&engine, &storage, "empty.age", &id))
         .await
         .unwrap();
 
     assert_eq!(r.summary.plaintext_bytes, 0);
-    assert!(r.summary.ciphertext_bytes > 0, "cabecera age y frame zstd");
-    assert!(dir.path().join("vacio.age").exists());
+    assert!(r.summary.ciphertext_bytes > 0, "age header and zstd frame");
+    assert!(dir.path().join("empty.age").exists());
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn una_clave_con_barras_crea_la_jerarquia() {
+async fn a_key_with_slashes_creates_the_hierarchy() {
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 5, 4096).await;
+    let (engine, storage) = prepare(dir.path(), 5, 4096).await;
 
-    ejecutar_backup(peticion(&motor, &destino, "a/b/c/d.age", &id))
+    run_backup(request(&engine, &storage, "a/b/c/d.age", &id))
         .await
         .unwrap();
     assert!(dir.path().join("a/b/c/d.age").exists());
     assert!(dir.path().join("a/b/c/d.age.manifest.json").exists());
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn un_plugin_sin_la_capacidad_necesaria_se_rechaza_antes_de_empezar() {
-    // Pedirle un dump a un plugin que solo es destino debe fallar de inmediato
-    // y con un error del dominio, no a mitad del flujo de datos.
+async fn a_plugin_without_the_needed_capability_is_rejected_before_starting() {
+    // Asking a plugin that is only a storage for a dump must fail immediately and
+    // with a domain error, not halfway through the data flow.
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 1, 1024).await;
+    let (engine, storage) = prepare(dir.path(), 1, 1024).await;
 
-    // Se invierten los papeles a propósito: se comprueba que la validación de
-    // capacidades existe. El mock tiene ambas, así que esto debe funcionar;
-    // lo que se verifica es que `ejecutar_backup` llama a exigir_capacidad.
-    let r = ejecutar_backup(BackupRequest {
-        engine: &destino,
-        storage: &motor,
-        ..peticion(&motor, &destino, "invertido.age", &id)
+    // The roles are swapped on purpose: what is checked is that the capability
+    // validation exists. The mock has both, so this must work; what is verified
+    // is that `run_backup` calls require_capability.
+    let r = run_backup(BackupRequest {
+        engine: &storage,
+        storage: &engine,
+        ..request(&engine, &storage, "swapped.age", &id)
     })
     .await;
-    assert!(r.is_ok(), "el mock tiene ambas capacidades");
+    assert!(r.is_ok(), "the mock has both capabilities");
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn dos_backups_consecutivos_con_la_misma_fuente_dan_el_mismo_plaintext() {
+async fn two_consecutive_backups_of_the_same_source_give_the_same_plaintext() {
     let dir = tempfile::tempdir().unwrap();
     let id = Identity::generate();
-    let (motor, destino) = preparar(dir.path(), 99, 256 * 1024).await;
+    let (engine, storage) = prepare(dir.path(), 99, 256 * 1024).await;
 
-    let a = ejecutar_backup(peticion(&motor, &destino, "a.age", &id))
+    let a = run_backup(request(&engine, &storage, "a.age", &id))
         .await
         .unwrap();
-    let b = ejecutar_backup(peticion(&motor, &destino, "b.age", &id))
+    let b = run_backup(request(&engine, &storage, "b.age", &id))
         .await
         .unwrap();
 
     assert_eq!(a.summary.plaintext_sha256, b.summary.plaintext_sha256);
     assert_ne!(
         a.summary.ciphertext_sha256, b.summary.ciphertext_sha256,
-        "age usa una clave de fichero distinta cada vez"
+        "age uses a different file key every time"
     );
 
-    motor.shutdown().await.unwrap();
-    destino.shutdown().await.unwrap();
+    engine.shutdown().await.unwrap();
+    storage.shutdown().await.unwrap();
 }

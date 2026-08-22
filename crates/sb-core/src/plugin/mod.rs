@@ -1,8 +1,8 @@
-//! Los plugins vistos desde el núcleo.
+//! Plugins as seen from the core.
 //!
-//! Un plugin de shieldbk no es una biblioteca enlazada: es un **proceso
-//! aparte** con el que se habla por gRPC sobre un socket Unix con mTLS. Este
-//! módulo es el lado del núcleo de esa relación.
+//! A shieldbk plugin is not a linked library: it is a **separate process** that
+//! is talked to over gRPC on a Unix socket with mTLS. This module is the core's
+//! side of that relationship.
 
 pub mod client;
 pub mod process;
@@ -10,5 +10,5 @@ pub mod process;
 #[cfg(test)]
 mod test_support;
 
-pub use client::{Capacidad, PluginClient, PluginError};
+pub use client::{Capability, PluginClient, PluginError};
 pub use process::{PluginProcess, PluginProcessError};

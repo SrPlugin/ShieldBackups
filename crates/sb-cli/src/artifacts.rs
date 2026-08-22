@@ -14,7 +14,7 @@
 //! silenciar artefactos que sí eran del target.
 
 use sb_config::{Defaults, Target};
-use sb_core::model::manifest_key_de;
+use sb_core::model::manifest_key_for;
 use sb_core::plugin::PluginClient;
 use sb_proto::storage_client::StorageClient;
 use sb_proto::{AbortIncompleteRequest, ArtifactMeta, ListRequest};
@@ -79,7 +79,7 @@ fn prefijo_de_plantilla(plantilla: &str, target: &str, engine: &str, storage: &s
 /// # Errors
 /// Devuelve [`CliError::Operacion`] si el destino no puede listar.
 pub async fn listar(storage: &PluginClient, prefijo: &str) -> Result<Vec<ArtifactMeta>, CliError> {
-    let mut grpc = StorageClient::new(storage.canal());
+    let mut grpc = StorageClient::new(storage.channel());
     let respuesta = grpc
         .list(ListRequest {
             prefix: prefijo.to_owned(),
@@ -88,12 +88,12 @@ pub async fn listar(storage: &PluginClient, prefijo: &str) -> Result<Vec<Artifac
         .map_err(|status| {
             CliError::operacion(format!(
                 "el destino «{}» no pudo listar «{prefijo}»: {}",
-                storage.nombre(),
+                storage.name(),
                 status.message()
             ))
         })?;
 
-    let sufijo = manifest_key_de("");
+    let sufijo = manifest_key_for("");
     Ok(respuesta
         .into_inner()
         .artifacts
@@ -109,7 +109,7 @@ pub async fn listar(storage: &PluginClient, prefijo: &str) -> Result<Vec<Artifac
 /// # Errors
 /// Devuelve [`CliError::Operacion`] si el destino rechaza la petición.
 pub async fn abortar_incompletas(storage: &PluginClient, prefijo: &str) -> Result<u32, CliError> {
-    let mut grpc = StorageClient::new(storage.canal());
+    let mut grpc = StorageClient::new(storage.channel());
     let respuesta = grpc
         .abort_incomplete(AbortIncompleteRequest {
             prefix: prefijo.to_owned(),
@@ -118,7 +118,7 @@ pub async fn abortar_incompletas(storage: &PluginClient, prefijo: &str) -> Resul
         .map_err(|status| {
             CliError::operacion(format!(
                 "el destino «{}» no pudo abortar las subidas incompletas de «{prefijo}»: {}",
-                storage.nombre(),
+                storage.name(),
                 status.message()
             ))
         })?;

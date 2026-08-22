@@ -1,21 +1,21 @@
-//! El plugin como interlocutor: proceso vivo + canal gRPC.
+//! The plugin as an interlocutor: live process + gRPC channel.
 //!
-//! [`PluginProcess`] arranca el binario y garantiza su limpieza;
-//! [`sb_transport::connect_control`] abre el canal cifrado. Ninguno de los dos
-//! sabe hablar el servicio `Plugin`. Este módulo los junta y expone los cinco
-//! RPC de control con tres cosas que las operaciones de backup necesitan y que
-//! `tonic::Status` no da:
+//! [`PluginProcess`] starts the binary and guarantees its cleanup;
+//! [`sb_transport::connect_control`] opens the encrypted channel. Neither of the
+//! two knows how to speak the `Plugin` service. This module joins them and
+//! exposes the five control RPCs with three things the backup operations need
+//! and that `tonic::Status` does not give:
 //!
-//! * **Plazo en cada llamada.** Un plugin que se queda colgado —esperando a un
-//!   servidor de base de datos que no contesta— dejaría el backup esperando
-//!   para siempre. Los RPC de control son todos rápidos, así que cualquier
-//!   espera larga es un fallo disfrazado de lentitud.
-//! * **Errores que dicen quién y en qué.** Un backup tiene dos plugins vivos a
-//!   la vez, el motor y el destino; «falló configure» obliga a adivinar cuál
-//!   de los dos fue.
-//! * **Versión y capacidades comprobadas antes de usarlas.** Pedirle un dump a
-//!   un plugin que solo sabe almacenar debe fallar al elegirlo, no a mitad del
-//!   backup.
+//! * **A deadline on every call.** A plugin that hangs —waiting for a database
+//!   server that does not answer— would leave the backup waiting forever. The
+//!   control RPCs are all fast, so any long wait is a failure dressed up as
+//!   slowness.
+//! * **Errors that say who and in what.** A backup has two live plugins at once,
+//!   the engine and the storage; "configure failed" forces you to guess which of
+//!   the two it was.
+//! * **Version and capabilities checked before being used.** Asking a plugin
+//!   that only knows how to store for a dump must fail when it is chosen, not
+//!   halfway through the backup.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -32,29 +32,28 @@ use tonic::transport::Channel;
 
 use super::process::{PluginProcess, PluginProcessError};
 
-/// Plazo máximo de cualquier RPC de control.
+/// Maximum deadline of any control RPC.
 ///
-/// Los cinco son rápidos por definición —informan, describen, guardan
-/// configuración o comprueban— así que un minuto no es un plazo ajustado sino
-/// el punto a partir del cual está claro que el plugin no va a contestar. Vale
-/// solo para el canal de control: un `Dump` puede tardar horas y no pasa por
-/// aquí.
-const PLAZO_RPC: Duration = Duration::from_secs(60);
+/// All five are fast by definition —they inform, describe, store configuration
+/// or check— so a minute is not a tight deadline but the point beyond which it
+/// is clear that the plugin is not going to answer. It applies only to the
+/// control channel: a `Dump` may take hours and does not go through here.
+const RPC_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Lo que un plugin sabe hacer, tal y como lo declara al arrancar.
+/// What a plugin knows how to do, as it declares at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Capacidad {
-    /// Sabe producir y restaurar un volcado: es un motor.
+pub enum Capability {
+    /// It can produce and restore a dump: it is an engine.
     Engine,
-    /// Sabe guardar y recuperar artefactos: es un destino.
+    /// It can store and retrieve artifacts: it is a storage.
     Storage,
 }
 
-impl Capacidad {
-    /// El nombre con el que viaja por el cable, que es el mismo que el plugin
-    /// declara en su anuncio de arranque.
+impl Capability {
+    /// The name it travels under on the wire, which is the same one the plugin
+    /// declares in its startup announcement.
     #[must_use]
-    pub fn como_cadena(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Engine => "engine",
             Self::Storage => "storage",
@@ -62,277 +61,281 @@ impl Capacidad {
     }
 }
 
-impl std::fmt::Display for Capacidad {
+impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.como_cadena())
+        f.write_str(self.as_str())
     }
 }
 
-/// Todo lo que puede salir mal al hablar con un plugin.
+/// Everything that can go wrong while talking to a plugin.
 ///
-/// Cada variante nombra al plugin porque el usuario tiene varios y el mensaje
-/// es lo único que le dice cuál de ellos le está dando problemas.
+/// Every variant names the plugin because the user has several and the message
+/// is the only thing that tells them which one is giving them trouble.
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
     #[error("{0}")]
-    Proceso(#[from] PluginProcessError),
+    Process(#[from] PluginProcessError),
     #[error("{0}")]
-    Transporte(#[from] ControlError),
-    /// El plugin contestó, pero con un error.
-    #[error("el plugin «{plugin}» falló en {operacion}: {mensaje}")]
+    Transport(#[from] ControlError),
+    /// The plugin answered, but with an error.
+    #[error("the plugin \"{plugin}\" failed on {operation}: {message}")]
     Rpc {
         plugin: String,
-        operacion: String,
-        mensaje: String,
+        operation: String,
+        message: String,
     },
-    /// El plugin no contestó dentro del plazo. Se distingue de `Rpc` porque el
-    /// remedio es otro: aquí no hay mensaje del plugin que leer, hay un
-    /// proceso al que mirar.
-    #[error("el plugin «{plugin}» no respondió a {operacion} en {} s", PLAZO_RPC.as_secs())]
-    Timeout { plugin: String, operacion: String },
-    #[error("el plugin «{plugin}» no sabe hacer de «{capacidad}»")]
-    SinCapacidad { plugin: String, capacidad: String },
+    /// The plugin did not answer within the deadline. It is told apart from
+    /// `Rpc` because the remedy is different: here there is no plugin message to
+    /// read, there is a process to look at.
+    #[error("the plugin \"{plugin}\" did not answer {operation} in {} s", RPC_DEADLINE.as_secs())]
+    Timeout { plugin: String, operation: String },
+    #[error("the plugin \"{plugin}\" does not know how to act as \"{capability}\"")]
+    MissingCapability { plugin: String, capability: String },
     #[error(
-        "el plugin «{plugin}» habla la versión {del_plugin} del protocolo y este núcleo la {del_nucleo}"
+        "the plugin \"{plugin}\" speaks version {plugin_version} of the protocol and this core speaks {core_version}"
     )]
-    VersionIncompatible {
+    IncompatibleVersion {
         plugin: String,
-        del_plugin: u32,
-        del_nucleo: u32,
+        plugin_version: u32,
+        core_version: u32,
     },
 }
 
-/// Un plugin arrancado, conectado y listo para recibir órdenes.
+/// A plugin started, connected and ready to take orders.
 ///
-/// Mientras este handle exista, el proceso existe y el canal está abierto.
-/// `shutdown` lo cierra ordenadamente; si nadie lo llama, el `Drop` del proceso
-/// se encarga igualmente.
+/// While this handle exists, the process exists and the channel is open.
+/// `shutdown` closes it in an orderly fashion; if nobody calls it, the process's
+/// `Drop` takes care of it anyway.
 #[derive(Debug)]
 pub struct PluginClient {
-    proceso: PluginProcess,
-    canal: Channel,
+    process: PluginProcess,
+    channel: Channel,
 }
 
 impl PluginClient {
-    /// Arranca el plugin, comprueba que hablan el mismo protocolo y abre el
-    /// canal de control.
+    /// Starts the plugin, checks that they speak the same protocol and opens the
+    /// control channel.
     ///
-    /// La versión se comprueba **antes** de conectar: si el plugin habla otro
-    /// protocolo, el canal no serviría de nada y lo único que se lograría
-    /// abriéndolo es que el fallo aparezca más tarde y peor explicado.
+    /// The version is checked **before** connecting: if the plugin speaks
+    /// another protocol, the channel would be useless and the only thing opening
+    /// it would achieve is making the failure show up later and worse explained.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::Proceso`] si el binario no arranca o no se
-    /// anuncia, [`PluginError::VersionIncompatible`] si las versiones no
-    /// coinciden y [`PluginError::Transporte`] si el canal no se puede abrir.
-    pub async fn start(nombre: &str, binario: &Path) -> Result<Self, PluginError> {
-        let proceso = PluginProcess::spawn(nombre, binario).await?;
+    /// Returns [`PluginError::Process`] if the binary does not start or does not
+    /// announce itself, [`PluginError::IncompatibleVersion`] if the versions do
+    /// not match, and [`PluginError::Transport`] if the channel cannot be
+    /// opened.
+    pub async fn start(name: &str, binary: &Path) -> Result<Self, PluginError> {
+        let process = PluginProcess::spawn(name, binary).await?;
 
-        if proceso.protocol_version() != sb_proto::PROTOCOL_VERSION {
-            let error = PluginError::VersionIncompatible {
-                plugin: nombre.to_string(),
-                del_plugin: proceso.protocol_version(),
-                del_nucleo: sb_proto::PROTOCOL_VERSION,
+        if process.protocol_version() != sb_proto::PROTOCOL_VERSION {
+            let error = PluginError::IncompatibleVersion {
+                plugin: name.to_string(),
+                plugin_version: process.protocol_version(),
+                core_version: sb_proto::PROTOCOL_VERSION,
             };
-            cerrar_tras_un_fallo(proceso, &error).await;
+            close_after_failure(process, &error).await;
             return Err(error);
         }
 
-        let tls = match proceso.pki().client_config() {
+        let tls = match process.pki().client_config() {
             Ok(tls) => tls,
-            Err(fuente) => {
-                let error = PluginError::Transporte(ControlError::from_pki(fuente));
-                cerrar_tras_un_fallo(proceso, &error).await;
+            Err(source) => {
+                let error = PluginError::Transport(ControlError::from_pki(source));
+                close_after_failure(process, &error).await;
                 return Err(error);
             }
         };
 
-        let canal = match connect_control(proceso.control_socket(), tls).await {
-            Ok(canal) => canal,
-            Err(fuente) => {
-                let error = PluginError::Transporte(fuente);
-                cerrar_tras_un_fallo(proceso, &error).await;
+        let channel = match connect_control(process.control_socket(), tls).await {
+            Ok(channel) => channel,
+            Err(source) => {
+                let error = PluginError::Transport(source);
+                close_after_failure(process, &error).await;
                 return Err(error);
             }
         };
 
-        Ok(Self { proceso, canal })
+        Ok(Self { process, channel })
     }
 
     #[must_use]
-    pub fn nombre(&self) -> &str {
-        self.proceso.nombre()
+    pub fn name(&self) -> &str {
+        self.process.name()
     }
 
-    /// El proceso que hay debajo: pid, directorio de ejecución y capacidades
-    /// declaradas.
+    /// The process underneath: pid, runtime directory and declared
+    /// capabilities.
     #[must_use]
-    pub fn proceso(&self) -> &PluginProcess {
-        &self.proceso
+    pub fn process(&self) -> &PluginProcess {
+        &self.process
     }
 
-    /// El canal de control, listo para construir un `EngineClient` o un
-    /// `StorageClient` encima.
+    /// The control channel, ready to build an `EngineClient` or a
+    /// `StorageClient` on top of it.
     ///
-    /// Clonarlo no abre otra conexión: un `Channel` de tonic es un handle a la
-    /// conexión ya establecida, y todas las llamadas se multiplexan sobre ella.
+    /// Cloning it does not open another connection: a tonic `Channel` is a
+    /// handle to the already established connection, and every call is
+    /// multiplexed over it.
     #[must_use]
-    pub fn canal(&self) -> Channel {
-        self.canal.clone()
+    pub fn channel(&self) -> Channel {
+        self.channel.clone()
     }
 
-    /// Si el plugin declaró saber hacer eso al arrancar.
+    /// Whether the plugin declared it knows how to do that at startup.
     #[must_use]
-    pub fn tiene_capacidad(&self, capacidad: Capacidad) -> bool {
-        self.proceso
+    pub fn has_capability(&self, capability: Capability) -> bool {
+        self.process
             .capabilities()
             .iter()
-            .any(|c| c == capacidad.como_cadena())
+            .any(|c| c == capability.as_str())
     }
 
-    /// Como [`Self::tiene_capacidad`], pero convierte el «no» en un error que
-    /// se puede propagar.
+    /// Like [`Self::has_capability`], but turns the "no" into an error that can
+    /// be propagated.
     ///
-    /// Existe para que elegir un plugin para un papel que no sabe desempeñar
-    /// falle al elegirlo y no a mitad del backup.
+    /// It exists so that choosing a plugin for a role it cannot play fails when
+    /// it is chosen and not halfway through the backup.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::SinCapacidad`], que nombra al plugin y a la
-    /// capacidad que le falta.
-    pub fn exigir_capacidad(&self, capacidad: Capacidad) -> Result<(), PluginError> {
-        if self.tiene_capacidad(capacidad) {
+    /// Returns [`PluginError::MissingCapability`], which names the plugin and
+    /// the capability it lacks.
+    pub fn require_capability(&self, capability: Capability) -> Result<(), PluginError> {
+        if self.has_capability(capability) {
             return Ok(());
         }
-        Err(PluginError::SinCapacidad {
-            plugin: self.nombre().to_string(),
-            capacidad: capacidad.como_cadena().to_string(),
+        Err(PluginError::MissingCapability {
+            plugin: self.name().to_string(),
+            capability: capability.as_str().to_string(),
         })
     }
 
-    /// Identidad, versión y capacidades, ya sobre el canal autenticado.
+    /// Identity, version and capabilities, now over the authenticated channel.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::Rpc`] o [`PluginError::Timeout`].
+    /// Returns [`PluginError::Rpc`] or [`PluginError::Timeout`].
     pub async fn info(&self) -> Result<InfoResponse, PluginError> {
         let mut grpc = self.grpc();
-        self.con_plazo("info", grpc.info(InfoRequest {})).await
+        self.with_deadline("info", grpc.info(InfoRequest {})).await
     }
 
-    /// Los campos de configuración que el plugin acepta.
+    /// The configuration fields the plugin accepts.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::Rpc`] o [`PluginError::Timeout`].
+    /// Returns [`PluginError::Rpc`] or [`PluginError::Timeout`].
     pub async fn schema(&self) -> Result<Vec<Field>, PluginError> {
         let mut grpc = self.grpc();
-        let respuesta = self
-            .con_plazo("schema", grpc.schema(SchemaRequest {}))
+        let response = self
+            .with_deadline("schema", grpc.schema(SchemaRequest {}))
             .await?;
-        Ok(respuesta.fields)
+        Ok(response.fields)
     }
 
-    /// Entrega la configuración ya validada y con los secretos resueltos.
+    /// Hands over the configuration already validated and with the secrets
+    /// resolved.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::Rpc`] si el plugin rechaza la configuración
-    /// —ahí va el motivo— o [`PluginError::Timeout`].
+    /// Returns [`PluginError::Rpc`] if the plugin rejects the configuration
+    /// —the reason travels there— or [`PluginError::Timeout`].
     pub async fn configure(&self, config: HashMap<String, Value>) -> Result<(), PluginError> {
         let mut grpc = self.grpc();
-        self.con_plazo("configure", grpc.configure(ConfigureRequest { config }))
+        self.with_deadline("configure", grpc.configure(ConfigureRequest { config }))
             .await?;
         Ok(())
     }
 
-    /// Comprobación de conectividad, permisos y dependencias.
+    /// Check of connectivity, permissions and dependencies.
     ///
-    /// Que el informe venga con `ok: false` **no** es un error de esta función:
-    /// es su respuesta, y es justo lo que `doctor` tiene que enseñarle al
-    /// usuario. Solo falla si el plugin no llega a contestar.
+    /// That the report comes back with `ok: false` is **not** an error of this
+    /// function: it is its answer, and it is exactly what `doctor` has to show
+    /// the user. It only fails if the plugin never answers.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::Rpc`] o [`PluginError::Timeout`].
+    /// Returns [`PluginError::Rpc`] or [`PluginError::Timeout`].
     pub async fn preflight(&self) -> Result<PreflightResponse, PluginError> {
         let mut grpc = self.grpc();
-        self.con_plazo("preflight", grpc.preflight(PreflightRequest {}))
+        self.with_deadline("preflight", grpc.preflight(PreflightRequest {}))
             .await
     }
 
-    /// Cierra el plugin: primero se lo pide, luego se asegura.
+    /// Closes the plugin: first it asks, then it makes sure.
     ///
-    /// Que el RPC de cierre falle no es motivo de error —el plugin puede haber
-    /// muerto ya, que es exactamente lo que se buscaba—, pero el proceso tiene
-    /// que terminar sí o sí: se registra el fallo y se pasa al cierre del
-    /// proceso, que mata al grupo entero y recoge al hijo.
+    /// That the shutdown RPC fails is not a reason for an error —the plugin may
+    /// already have died, which is exactly what was wanted—, but the process has
+    /// to end no matter what: the failure is logged and we move on to closing
+    /// the process, which kills the whole group and reaps the child.
     ///
     /// # Errors
-    /// Devuelve [`PluginError::Proceso`] si la limpieza del proceso falla.
+    /// Returns [`PluginError::Process`] if the process cleanup fails.
     pub async fn shutdown(self) -> Result<(), PluginError> {
         let mut grpc = self.grpc();
         if let Err(error) = self
-            .con_plazo("shutdown", grpc.shutdown(ShutdownRequest {}))
+            .with_deadline("shutdown", grpc.shutdown(ShutdownRequest {}))
             .await
         {
             tracing::debug!(
-                plugin = %self.nombre(),
+                plugin = %self.name(),
                 %error,
-                "el plugin no confirmó el cierre; se cierra por las bravas"
+                "the plugin did not confirm the shutdown; closing it the hard way"
             );
         }
-        // El canal se suelta antes de matar al proceso: si no, la conexión
-        // abierta sobrevive al socket que ya no existe.
-        drop(self.canal);
-        self.proceso.shutdown().await?;
+        // The channel is dropped before killing the process: otherwise the open
+        // connection outlives the socket that no longer exists.
+        drop(self.channel);
+        self.process.shutdown().await?;
         Ok(())
     }
 
-    /// Mata al plugin de golpe, como si se hubiera caído solo.
+    /// Kills the plugin outright, as if it had crashed on its own.
     ///
-    /// Existe para poder comprobar que hablar con un plugin muerto da un error
-    /// y no un bloqueo. Manda `SIGKILL` al grupo entero: sin despedida, sin
-    /// oportunidad de limpiar. No es una forma legítima de cerrar un plugin.
+    /// It exists so that we can check that talking to a dead plugin gives an
+    /// error and not a hang. It sends `SIGKILL` to the whole group: no farewell,
+    /// no chance to clean up. It is not a legitimate way to close a plugin.
     #[doc(hidden)]
-    pub fn matar_para_test(&self) {
-        super::process::matar_al_grupo(self.proceso.pid());
+    pub fn kill_for_test(&self) {
+        super::process::kill_group(self.process.pid());
     }
 
-    /// Un cliente gRPC nuevo sobre el canal ya abierto.
+    /// A fresh gRPC client over the already open channel.
     ///
-    /// Se construye uno por llamada a propósito: el cliente generado necesita
-    /// `&mut self` y el canal es barato de clonar, así que esto sale más
-    /// barato que guardar un cliente tras un mutex y serializar las llamadas.
+    /// One is built per call on purpose: the generated client needs `&mut self`
+    /// and the channel is cheap to clone, so this comes out cheaper than keeping
+    /// a client behind a mutex and serializing the calls.
     fn grpc(&self) -> PluginGrpc<Channel> {
-        PluginGrpc::new(self.canal())
+        PluginGrpc::new(self.channel())
     }
 
-    /// El plazo y la traducción de errores, en un solo sitio.
+    /// The deadline and the error translation, in a single place.
     ///
-    /// Repetir `tokio::time::timeout` en cada RPC es exactamente la clase de
-    /// repetición que acaba con un método sin plazo: basta con olvidarlo una
-    /// vez para que un plugin colgado deje el backup esperando para siempre.
-    async fn con_plazo<T, F>(&self, operacion: &str, llamada: F) -> Result<T, PluginError>
+    /// Repeating `tokio::time::timeout` in every RPC is exactly the kind of
+    /// repetition that ends with a method without a deadline: forgetting it once
+    /// is enough for a hung plugin to leave the backup waiting forever.
+    async fn with_deadline<T, F>(&self, operation: &str, call: F) -> Result<T, PluginError>
     where
         F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
-        match tokio::time::timeout(PLAZO_RPC, llamada).await {
-            Ok(Ok(respuesta)) => Ok(respuesta.into_inner()),
+        match tokio::time::timeout(RPC_DEADLINE, call).await {
+            Ok(Ok(response)) => Ok(response.into_inner()),
             Ok(Err(status)) => Err(PluginError::Rpc {
-                plugin: self.nombre().to_string(),
-                operacion: operacion.to_string(),
-                mensaje: mensaje_de(&status),
+                plugin: self.name().to_string(),
+                operation: operation.to_string(),
+                message: message_from(&status),
             }),
             Err(_) => Err(PluginError::Timeout {
-                plugin: self.nombre().to_string(),
-                operacion: operacion.to_string(),
+                plugin: self.name().to_string(),
+                operation: operation.to_string(),
             }),
         }
     }
 }
 
-/// Lo que le queda al usuario de un `Status`.
+/// What is left for the user out of a `Status`.
 ///
-/// El mensaje a secas es lo que el plugin quiso decir y es lo que hay que
-/// enseñar; cuando viene vacío —le pasa a los errores de transporte, donde no
-/// hay nadie al otro lado que redacte nada— el código es lo único que informa.
-pub(crate) fn mensaje_de(status: &tonic::Status) -> String {
+/// The bare message is what the plugin meant to say and it is what has to be
+/// shown; when it comes empty —which happens with transport errors, where there
+/// is nobody on the other side writing anything— the code is the only thing that
+/// informs.
+pub(crate) fn message_from(status: &tonic::Status) -> String {
     if status.message().is_empty() {
         format!("{:?}", status.code())
     } else {
@@ -340,20 +343,20 @@ pub(crate) fn mensaje_de(status: &tonic::Status) -> String {
     }
 }
 
-/// Cierra un proceso cuyo arranque no llegó a buen puerto.
+/// Closes a process whose startup did not reach a good end.
 ///
-/// Un plugin al que no se le puede hablar no puede quedarse vivo: conserva en
-/// memoria el material criptográfico de la sesión y no hay nadie que le vaya a
-/// pedir nada nunca.
-async fn cerrar_tras_un_fallo(proceso: PluginProcess, error: &PluginError) {
-    tracing::warn!(plugin = %proceso.nombre(), %error, "no se pudo abrir el canal con el plugin");
-    if let Err(fuente) = proceso.shutdown().await {
-        tracing::warn!(%fuente, "y tampoco se pudo cerrar limpiamente");
+/// A plugin that cannot be talked to cannot stay alive: it keeps the session's
+/// cryptographic material in memory and nobody is ever going to ask it for
+/// anything.
+async fn close_after_failure(process: PluginProcess, error: &PluginError) {
+    tracing::warn!(plugin = %process.name(), %error, "could not open the channel with the plugin");
+    if let Err(source) = process.shutdown().await {
+        tracing::warn!(%source, "and it could not be closed cleanly either");
     }
 }
 
 #[cfg(test)]
-use crate::plugin::test_support::ruta_mock;
+use crate::plugin::test_support::mock_path;
 
 #[cfg(test)]
 mod tests {
@@ -364,7 +367,7 @@ mod tests {
             kind: Some(sb_proto::value::Kind::StringValue(s.into())),
         }
     }
-    #[expect(dead_code, reason = "los campos enteros del mock son opcionales")]
+    #[expect(dead_code, reason = "the mock's integer fields are optional")]
     fn v_int(i: i64) -> sb_proto::Value {
         sb_proto::Value {
             kind: Some(sb_proto::value::Kind::IntValue(i)),
@@ -372,8 +375,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conecta_y_pide_info() {
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
+    async fn connects_and_asks_for_info() {
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
         let info = c.info().await.unwrap();
         assert_eq!(info.name, "mock");
         assert_eq!(info.protocol_version, sb_proto::PROTOCOL_VERSION);
@@ -381,103 +384,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pide_el_esquema_y_trae_campos() {
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
-        let campos = c.schema().await.unwrap();
-        assert!(campos.iter().any(|f| f.name == "dir"));
+    async fn asks_for_the_schema_and_gets_fields() {
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
+        let fields = c.schema().await.unwrap();
+        assert!(fields.iter().any(|f| f.name == "dir"));
         c.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn configura_y_hace_preflight() {
+    async fn configures_and_runs_preflight() {
         let dir = tempfile::tempdir().unwrap();
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
 
         let mut cfg = std::collections::HashMap::new();
         cfg.insert("dir".to_string(), v_str(&dir.path().to_string_lossy()));
         c.configure(cfg).await.unwrap();
 
         let pre = c.preflight().await.unwrap();
-        assert!(pre.ok, "el mock configurado debe pasar el preflight");
+        assert!(pre.ok, "the configured mock must pass the preflight");
         c.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn el_preflight_sin_configurar_informa_en_vez_de_reventar() {
-        // doctor necesita un informe, no una excepción: si el plugin no está
-        // configurado, eso es justo lo que doctor debe contarle al usuario.
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
+    async fn preflight_without_configuring_reports_instead_of_blowing_up() {
+        // doctor needs a report, not an exception: if the plugin is not
+        // configured, that is exactly what doctor must tell the user.
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
         let pre = c.preflight().await.unwrap();
         assert!(!pre.ok);
-        assert!(!pre.checks.is_empty(), "debe explicar qué falta");
+        assert!(!pre.checks.is_empty(), "it must explain what is missing");
         c.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn declara_correctamente_sus_capacidades() {
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
-        assert!(c.tiene_capacidad(Capacidad::Engine));
-        assert!(c.tiene_capacidad(Capacidad::Storage));
-        assert!(c.exigir_capacidad(Capacidad::Engine).is_ok());
+    async fn declares_its_capabilities_correctly() {
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
+        assert!(c.has_capability(Capability::Engine));
+        assert!(c.has_capability(Capability::Storage));
+        assert!(c.require_capability(Capability::Engine).is_ok());
         c.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn exigir_una_capacidad_ausente_da_un_error_que_la_nombra() {
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
-        // El mock tiene ambas, así que se comprueba el mensaje con el tipo de error directamente.
-        let err = PluginError::SinCapacidad {
+    async fn requiring_a_missing_capability_gives_an_error_that_names_it() {
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
+        // The mock has both, so the message is checked against the error type
+        // directly.
+        let err = PluginError::MissingCapability {
             plugin: "postgres".into(),
-            capacidad: "storage".into(),
+            capability: "storage".into(),
         };
-        let texto = err.to_string();
-        assert!(texto.contains("postgres"));
-        assert!(texto.contains("storage"));
+        let text = err.to_string();
+        assert!(text.contains("postgres"));
+        assert!(text.contains("storage"));
         c.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn hablar_con_un_plugin_muerto_da_error_no_cuelgue() {
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
-        c.matar_para_test();
+    async fn talking_to_a_dead_plugin_gives_an_error_not_a_hang() {
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
+        c.kill_for_test();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let r = tokio::time::timeout(std::time::Duration::from_secs(5), c.info()).await;
-        assert!(r.expect("no debe colgarse").is_err());
+        assert!(r.expect("it must not hang").is_err());
     }
 
     #[tokio::test]
-    async fn un_error_del_plugin_nombra_el_plugin_y_la_operacion() {
-        // Un error que solo dice "falló" obliga a adivinar cuál de los dos
-        // plugins de un backup fue el que falló y en qué llamada.
+    async fn a_plugin_error_names_the_plugin_and_the_operation() {
+        // An error that only says "failed" forces you to guess which of a
+        // backup's two plugins failed, and on which call.
         let err = PluginError::Rpc {
             plugin: "r2".into(),
-            operacion: "configure".into(),
-            mensaje: "bucket inexistente".into(),
+            operation: "configure".into(),
+            message: "nonexistent bucket".into(),
         };
-        let texto = err.to_string();
-        assert!(texto.contains("r2"));
-        assert!(texto.contains("configure"));
-        assert!(texto.contains("bucket inexistente"));
+        let text = err.to_string();
+        assert!(text.contains("r2"));
+        assert!(text.contains("configure"));
+        assert!(text.contains("nonexistent bucket"));
     }
 
     #[tokio::test]
-    async fn el_error_de_version_dice_ambas_versiones() {
-        let err = PluginError::VersionIncompatible {
-            plugin: "viejo".into(),
-            del_plugin: 7,
-            del_nucleo: 1,
+    async fn the_version_error_says_both_versions() {
+        let err = PluginError::IncompatibleVersion {
+            plugin: "old".into(),
+            plugin_version: 7,
+            core_version: 1,
         };
-        let texto = err.to_string();
-        assert!(texto.contains('7'), "la del plugin");
-        assert!(texto.contains("viejo"));
+        let text = err.to_string();
+        assert!(text.contains('7'), "the plugin's one");
+        assert!(text.contains("old"));
     }
 
     #[tokio::test]
-    async fn dos_clientes_simultaneos_funcionan() {
-        // Un backup arranca motor y destino a la vez.
-        let a = PluginClient::start("mock", &ruta_mock()).await.unwrap();
-        let b = PluginClient::start("mock", &ruta_mock()).await.unwrap();
+    async fn two_simultaneous_clients_work() {
+        // A backup starts an engine and a storage at once.
+        let a = PluginClient::start("mock", &mock_path()).await.unwrap();
+        let b = PluginClient::start("mock", &mock_path()).await.unwrap();
         assert_eq!(a.info().await.unwrap().name, "mock");
         assert_eq!(b.info().await.unwrap().name, "mock");
         a.shutdown().await.unwrap();
@@ -485,14 +489,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn el_shutdown_ordenado_termina_el_proceso() {
-        let c = PluginClient::start("mock", &ruta_mock()).await.unwrap();
-        let pid = c.proceso().pid();
+    async fn the_orderly_shutdown_ends_the_process() {
+        let c = PluginClient::start("mock", &mock_path()).await.unwrap();
+        let pid = c.process().pid();
         c.shutdown().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "shutdown debe terminar el proceso"
+            "shutdown must end the process"
         );
     }
 }

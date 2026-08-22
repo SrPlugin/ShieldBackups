@@ -169,7 +169,7 @@ fn si_el_binario_cambia_despues_del_lock_el_backup_se_niega_y_lo_explica() {
     assert_eq!(salida.status.code(), Some(3));
     let texto = String::from_utf8_lossy(&salida.stderr).to_string();
     assert!(
-        texto.contains("ha cambiado"),
+        texto.contains("has changed"),
         "el mensaje debe explicar que el binario cambió: {texto}"
     );
     assert!(

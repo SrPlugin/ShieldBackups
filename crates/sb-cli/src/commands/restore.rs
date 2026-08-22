@@ -13,8 +13,8 @@
 
 use std::path::Path;
 
-use sb_core::ops::restore::{RestoreRequest, ejecutar_restore};
-use sb_core::ops::verify::leer_manifiesto;
+use sb_core::ops::restore::{RestoreRequest, run_restore};
+use sb_core::ops::verify::read_manifest;
 use sb_crypto::{Digest, Identity};
 
 use crate::context::Contexto;
@@ -74,7 +74,7 @@ async fn restaurar(
     // medio migrar— y eso no puede impedir la restauración: si falta, se avisa
     // y se sigue sin la comprobación extra. Negarse sería dejar sin recuperar
     // datos que sí se pueden recuperar.
-    let esperado = match leer_manifiesto(destino, artifact).await {
+    let esperado = match read_manifest(destino, artifact).await {
         Ok(manifiesto) => Digest::from_hex(&manifiesto.ciphertext_sha256).ok(),
         Err(fuente) => {
             tracing::warn!(
@@ -87,7 +87,7 @@ async fn restaurar(
         }
     };
 
-    Ok(ejecutar_restore(RestoreRequest {
+    Ok(run_restore(RestoreRequest {
         engine: motor,
         storage: destino,
         artifact_key: artifact.to_owned(),

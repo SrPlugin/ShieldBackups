@@ -1,5 +1,5 @@
-//! Lockfile de plugins: verificación de integridad de los binarios que
-//! `shieldbk` va a ejecutar.
+//! Plugin lockfile: integrity verification of the binaries that `shieldbk` is
+//! about to execute.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -8,249 +8,247 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-/// Versión del formato del lockfile. Se incrementa solo ante cambios que un
-/// lector antiguo no pueda interpretar con seguridad.
+/// Version of the lockfile format. It is bumped only on changes that an older
+/// reader could not safely interpret.
 pub const LOCKFILE_VERSION: u32 = 1;
 
-/// Tamaño del trozo con el que se alimenta al hasher. Ni el binario ni el
-/// buffer completo se cargan en memoria.
-const TROZO: usize = 64 * 1024;
+/// Size of the chunk fed to the hasher. Neither the binary nor a full buffer is
+/// loaded into memory.
+const CHUNK: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockfileError {
-    #[error("no se pudo leer «{ruta}»: {source}")]
-    Lectura {
-        ruta: PathBuf,
+    #[error("could not read \"{path}\": {source}")]
+    Read {
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("no se pudo escribir «{ruta}»: {source}")]
-    Escritura {
-        ruta: PathBuf,
+    #[error("could not write \"{path}\": {source}")]
+    Write {
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
     #[error(
-        "el plugin «{nombre}» no está registrado en el lockfile. shieldbk no ejecuta binarios \
-         que no ha verificado. Comprueba que «{ruta}» es el binario que esperas y regístralo con \
-         `shieldbk plugin lock {nombre}`"
+        "the plugin \"{name}\" is not registered in the lockfile. shieldbk does not run binaries \
+         it has not verified. Check that \"{path}\" is the binary you expect and register it with \
+         `shieldbk plugin lock {name}`"
     )]
-    NoRegistrado { nombre: String, ruta: PathBuf },
+    NotRegistered { name: String, path: PathBuf },
     #[error(
-        "el binario del plugin «{nombre}» ({ruta}) ha cambiado desde que se registró: el \
-         lockfile esperaba sha256 {esperado} y el archivo tiene {encontrado}. Si el cambio es \
-         esperado (has actualizado el plugin), vuelve a registrarlo con `shieldbk plugin lock \
-         {nombre}`. Si no lo esperabas, NO lo ejecutes: el binario recibe las credenciales de tu \
-         base de datos y de tu almacenamiento"
+        "the binary of plugin \"{name}\" ({path}) has changed since it was registered: the \
+         lockfile expected sha256 {expected} and the file has {found}. If the change is expected \
+         (you updated the plugin), register it again with `shieldbk plugin lock {name}`. If you \
+         were not expecting it, do NOT run it: the binary receives the credentials of your \
+         database and of your storage"
     )]
-    HashNoCoincide {
-        nombre: String,
-        ruta: PathBuf,
-        esperado: String,
-        encontrado: String,
+    HashMismatch {
+        name: String,
+        path: PathBuf,
+        expected: String,
+        found: String,
     },
-    #[error("el lockfile no es válido: {0}")]
-    TomlInvalido(String),
+    #[error("the lockfile is not valid: {0}")]
+    InvalidToml(String),
 }
 
-/// SHA-256 en hexadecimal minúscula del contenido de un archivo.
+/// Lowercase hexadecimal SHA-256 of a file's contents.
 ///
-/// Lee en streaming, por trozos de 64 KiB: un binario de Rust compilado puede
-/// pesar decenas de megabytes y esto se ejecuta antes de **cada** arranque de
-/// plugin, así que el fichero nunca se carga entero en memoria.
+/// It reads in a streaming fashion, in 64 KiB chunks: a compiled Rust binary can
+/// weigh tens of megabytes and this runs before **every** plugin startup, so the
+/// file is never loaded whole into memory.
 ///
 /// # Errors
-/// Devuelve [`LockfileError::Lectura`] si el archivo no existe o no se puede
-/// leer.
-pub fn hash_de_archivo(ruta: &Path) -> Result<String, LockfileError> {
-    let mut archivo = std::fs::File::open(ruta).map_err(|source| LockfileError::Lectura {
-        ruta: ruta.to_path_buf(),
+/// Returns [`LockfileError::Read`] if the file does not exist or cannot be
+/// read.
+pub fn file_hash(path: &Path) -> Result<String, LockfileError> {
+    let mut file = std::fs::File::open(path).map_err(|source| LockfileError::Read {
+        path: path.to_path_buf(),
         source,
     })?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; TROZO];
+    let mut buffer = vec![0_u8; CHUNK];
     loop {
-        let leidos = archivo
+        let read = file
             .read(&mut buffer)
-            .map_err(|source| LockfileError::Lectura {
-                ruta: ruta.to_path_buf(),
+            .map_err(|source| LockfileError::Read {
+                path: path.to_path_buf(),
                 source,
             })?;
-        if leidos == 0 {
+        if read == 0 {
             break;
         }
-        hasher.update(&buffer[..leidos]);
+        hasher.update(&buffer[..read]);
     }
-    Ok(a_hex(&hasher.finalize()))
+    Ok(to_hex(&hasher.finalize()))
 }
 
-fn a_hex(bytes: &[u8]) -> String {
-    const DIGITOS: &[u8; 16] = b"0123456789abcdef";
-    let mut salida = String::with_capacity(bytes.len() * 2);
+fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        salida.push(char::from(DIGITOS[usize::from(byte >> 4)]));
-        salida.push(char::from(DIGITOS[usize::from(byte & 0x0f)]));
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
-    salida
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Entrada {
+struct Entry {
     sha256: String,
 }
 
-/// Documento tal y como se serializa a TOML. Separado de [`Lockfile`] para
-/// que la versión del formato no forme parte del estado en memoria.
+/// The document exactly as it is serialized to TOML. Kept apart from
+/// [`Lockfile`] so that the format version is not part of the in-memory state.
 #[derive(Debug, Serialize, Deserialize)]
-struct Documento {
+struct Document {
     version: u32,
     #[serde(default)]
-    plugins: BTreeMap<String, Entrada>,
+    plugins: BTreeMap<String, Entry>,
 }
 
-/// Registro de los binarios de plugin que este sistema ha aprobado, con el
-/// SHA-256 de cada uno.
+/// Record of the plugin binaries this system has approved, with the SHA-256 of
+/// each one.
 ///
-/// Un plugin recibe las credenciales de la base de datos y del object storage:
-/// ejecutar un binario cuyo contenido no se ha verificado es ejecutar código
-/// arbitrario con acceso a esos secretos. Antes de arrancar un plugin,
-/// `shieldbk` vuelve a calcular el hash del binario y lo compara con el que
-/// registró. La idea es la misma que la del lockfile de proveedores de
-/// Terraform.
+/// A plugin receives the credentials of the database and of the object storage:
+/// running a binary whose contents have not been verified means running
+/// arbitrary code with access to those secrets. Before starting a plugin,
+/// `shieldbk` recomputes the binary's hash and compares it with the registered
+/// one. The idea is the same as Terraform's provider lockfile.
 ///
-/// # Qué protege y qué no
+/// # What it protects and what it does not
 ///
-/// Protege contra que el binario **cambie** desde que se registró: una
-/// actualización silenciosa, una sustitución en el `PATH`, un compromiso del
-/// servidor que reescriba el archivo.
+/// It protects against the binary **changing** since it was registered: a silent
+/// update, a substitution on the `PATH`, a compromise of the server that
+/// rewrites the file.
 ///
-/// **No** protege contra un plugin malicioso desde el primer momento. Eso es
-/// imposible por construcción: un plugin necesita las credenciales para hacer
-/// su trabajo, así que registrar el binario equivocado significa haberle dado
-/// los secretos al binario equivocado. La confianza en el origen del plugin es
-/// una decisión de quien lo registra; el lockfile solo garantiza que sigue
-/// siendo el mismo.
+/// It does **not** protect against a plugin that is malicious from the very
+/// first moment. That is impossible by construction: a plugin needs the
+/// credentials to do its job, so registering the wrong binary means having given
+/// the secrets to the wrong binary. Trusting the plugin's origin is a decision
+/// of whoever registers it; the lockfile only guarantees that it is still the
+/// same one.
 ///
-/// Las entradas se guardan en un [`BTreeMap`]: el orden estable hace que el
-/// TOML generado sea determinista y sus diffs legibles, porque este archivo se
-/// revisa a mano y se versiona.
+/// The entries are kept in a [`BTreeMap`]: the stable ordering makes the
+/// generated TOML deterministic and its diffs readable, because this file is
+/// reviewed by hand and kept under version control.
 #[derive(Debug, Default, Clone)]
 pub struct Lockfile {
-    plugins: BTreeMap<String, Entrada>,
+    plugins: BTreeMap<String, Entry>,
 }
 
 impl Lockfile {
-    /// Registra (o vuelve a registrar) el binario de un plugin con el hash que
-    /// tiene ahora mismo.
+    /// Registers (or re-registers) a plugin's binary with the hash it has right
+    /// now.
     ///
-    /// Re-registrar es la operación normal tras actualizar un plugin: el hash
-    /// anterior se reemplaza.
+    /// Re-registering is the normal operation after updating a plugin: the
+    /// previous hash is replaced.
     ///
     /// # Errors
-    /// Devuelve [`LockfileError::Lectura`] si el binario no se puede leer.
-    pub fn registrar(&mut self, nombre: &str, ruta: &Path) -> Result<(), LockfileError> {
-        let sha256 = hash_de_archivo(ruta)?;
-        self.plugins.insert(nombre.to_owned(), Entrada { sha256 });
+    /// Returns [`LockfileError::Read`] if the binary cannot be read.
+    pub fn register(&mut self, name: &str, path: &Path) -> Result<(), LockfileError> {
+        let sha256 = file_hash(path)?;
+        self.plugins.insert(name.to_owned(), Entry { sha256 });
         Ok(())
     }
 
-    /// Comprueba que el binario de `ruta` sigue siendo el que se registró bajo
-    /// `nombre`.
+    /// Checks that the binary at `path` is still the one registered under
+    /// `name`.
     ///
     /// # Errors
-    /// - [`LockfileError::NoRegistrado`] si el plugin no está en el lockfile.
-    /// - [`LockfileError::HashNoCoincide`] si el binario ha cambiado.
-    /// - [`LockfileError::Lectura`] si el binario no se puede leer.
-    pub fn verificar(&self, nombre: &str, ruta: &Path) -> Result<(), LockfileError> {
-        let Some(entrada) = self.plugins.get(nombre) else {
-            return Err(LockfileError::NoRegistrado {
-                nombre: nombre.to_owned(),
-                ruta: ruta.to_path_buf(),
+    /// - [`LockfileError::NotRegistered`] if the plugin is not in the lockfile.
+    /// - [`LockfileError::HashMismatch`] if the binary has changed.
+    /// - [`LockfileError::Read`] if the binary cannot be read.
+    pub fn verify(&self, name: &str, path: &Path) -> Result<(), LockfileError> {
+        let Some(entry) = self.plugins.get(name) else {
+            return Err(LockfileError::NotRegistered {
+                name: name.to_owned(),
+                path: path.to_path_buf(),
             });
         };
-        let encontrado = hash_de_archivo(ruta)?;
-        if encontrado == entrada.sha256 {
+        let found = file_hash(path)?;
+        if found == entry.sha256 {
             Ok(())
         } else {
-            Err(LockfileError::HashNoCoincide {
-                nombre: nombre.to_owned(),
-                ruta: ruta.to_path_buf(),
-                esperado: entrada.sha256.clone(),
-                encontrado,
+            Err(LockfileError::HashMismatch {
+                name: name.to_owned(),
+                path: path.to_path_buf(),
+                expected: entry.sha256.clone(),
+                found,
             })
         }
     }
 
-    /// Nombres de los plugins registrados, en orden alfabético estable.
+    /// Names of the registered plugins, in stable alphabetical order.
     #[must_use]
-    pub fn nombres(&self) -> Vec<String> {
+    pub fn names(&self) -> Vec<String> {
         self.plugins.keys().cloned().collect()
     }
 
-    /// Serializa el lockfile a TOML. La salida solo depende del contenido, no
-    /// del orden en que se registraron los plugins.
+    /// Serializes the lockfile to TOML. The output depends only on the content,
+    /// not on the order in which the plugins were registered.
     ///
     /// # Errors
-    /// Devuelve [`LockfileError::TomlInvalido`] si la serialización falla.
+    /// Returns [`LockfileError::InvalidToml`] if serialization fails.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
-        let documento = Documento {
+        let document = Document {
             version: LOCKFILE_VERSION,
             plugins: self.plugins.clone(),
         };
-        toml::to_string(&documento).map_err(|e| LockfileError::TomlInvalido(e.to_string()))
+        toml::to_string(&document).map_err(|e| LockfileError::InvalidToml(e.to_string()))
     }
 
-    /// Interpreta el contenido TOML de un lockfile.
+    /// Parses the TOML contents of a lockfile.
     ///
     /// # Errors
-    /// Devuelve [`LockfileError::TomlInvalido`] si el texto no es TOML válido,
-    /// no tiene la forma esperada o viene de una versión más nueva del
-    /// formato.
-    pub fn from_toml(texto: &str) -> Result<Self, LockfileError> {
-        let documento: Documento =
-            toml::from_str(texto).map_err(|e| LockfileError::TomlInvalido(e.to_string()))?;
-        if documento.version > LOCKFILE_VERSION {
-            return Err(LockfileError::TomlInvalido(format!(
-                "lockfile de versión {}, esta versión de shieldbk soporta hasta la {LOCKFILE_VERSION}",
-                documento.version
+    /// Returns [`LockfileError::InvalidToml`] if the text is not valid TOML,
+    /// does not have the expected shape, or comes from a newer version of the
+    /// format.
+    pub fn from_toml(text: &str) -> Result<Self, LockfileError> {
+        let document: Document =
+            toml::from_str(text).map_err(|e| LockfileError::InvalidToml(e.to_string()))?;
+        if document.version > LOCKFILE_VERSION {
+            return Err(LockfileError::InvalidToml(format!(
+                "lockfile of version {}, this version of shieldbk supports up to {LOCKFILE_VERSION}",
+                document.version
             )));
         }
         Ok(Self {
-            plugins: documento.plugins,
+            plugins: document.plugins,
         })
     }
 
-    /// Carga el lockfile de disco.
+    /// Loads the lockfile from disk.
     ///
-    /// Si el archivo no existe devuelve un lockfile vacío: la primera vez que
-    /// alguien usa `shieldbk` todavía no hay nada registrado, y eso no es un
-    /// error de configuración. La diferencia la nota al primer
-    /// [`verificar`](Self::verificar), con un mensaje que dice qué hacer.
+    /// If the file does not exist it returns an empty lockfile: the first time
+    /// somebody uses `shieldbk` nothing is registered yet, and that is not a
+    /// configuration error. The difference shows up on the first
+    /// [`verify`](Self::verify), with a message that says what to do.
     ///
     /// # Errors
-    /// Devuelve [`LockfileError::Lectura`] si el archivo existe pero no se
-    /// puede leer, o [`LockfileError::TomlInvalido`] si su contenido no es
-    /// válido.
-    pub fn load(ruta: &Path) -> Result<Self, LockfileError> {
-        match std::fs::read_to_string(ruta) {
-            Ok(texto) => Self::from_toml(&texto),
+    /// Returns [`LockfileError::Read`] if the file exists but cannot be read, or
+    /// [`LockfileError::InvalidToml`] if its contents are not valid.
+    pub fn load(path: &Path) -> Result<Self, LockfileError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_toml(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(LockfileError::Lectura {
-                ruta: ruta.to_path_buf(),
+            Err(source) => Err(LockfileError::Read {
+                path: path.to_path_buf(),
                 source,
             }),
         }
     }
 
-    /// Escribe el lockfile en disco.
+    /// Writes the lockfile to disk.
     ///
     /// # Errors
-    /// Devuelve [`LockfileError::Escritura`] si el archivo no se puede escribir
-    /// o [`LockfileError::TomlInvalido`] si la serialización falla.
-    pub fn save(&self, ruta: &Path) -> Result<(), LockfileError> {
-        let texto = self.to_toml()?;
-        std::fs::write(ruta, texto).map_err(|source| LockfileError::Escritura {
-            ruta: ruta.to_path_buf(),
+    /// Returns [`LockfileError::Write`] if the file cannot be written or
+    /// [`LockfileError::InvalidToml`] if serialization fails.
+    pub fn save(&self, path: &Path) -> Result<(), LockfileError> {
+        let text = self.to_toml()?;
+        std::fs::write(path, text).map_err(|source| LockfileError::Write {
+            path: path.to_path_buf(),
             source,
         })
     }
@@ -261,221 +259,221 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    fn binario_falso(dir: &std::path::Path, nombre: &str, contenido: &[u8]) -> std::path::PathBuf {
-        let ruta = dir.join(nombre);
-        let mut f = std::fs::File::create(&ruta).unwrap();
-        f.write_all(contenido).unwrap();
-        ruta
+    fn fake_binary(dir: &std::path::Path, name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
+        path
     }
 
     #[test]
-    fn calcula_el_hash_de_un_binario() {
+    fn computes_the_hash_of_a_binary() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-x", b"contenido");
-        let hash = hash_de_archivo(&ruta).unwrap();
+        let path = fake_binary(dir.path(), "sb-plugin-x", b"contents");
+        let hash = file_hash(&path).unwrap();
         assert_eq!(hash.len(), 64);
-        assert_eq!(hash, hash_de_archivo(&ruta).unwrap());
+        assert_eq!(hash, file_hash(&path).unwrap());
     }
 
     #[test]
-    fn el_hash_coincide_con_el_sha256_conocido() {
-        // Verifica contra un valor externo, no solo consigo mismo: un hash
-        // consistente pero incorrecto pasaría el test anterior sin problema.
+    fn the_hash_matches_the_known_sha256() {
+        // Checks against an external value, not just against itself: a
+        // consistent but incorrect hash would pass the previous test just fine.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-x", b"abc");
+        let path = fake_binary(dir.path(), "sb-plugin-x", b"abc");
         assert_eq!(
-            hash_de_archivo(&ruta).unwrap(),
+            file_hash(&path).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
     #[test]
-    fn el_hash_de_un_archivo_vacio_es_el_conocido() {
+    fn the_hash_of_an_empty_file_is_the_known_one() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "vacio", b"");
+        let path = fake_binary(dir.path(), "empty", b"");
         assert_eq!(
-            hash_de_archivo(&ruta).unwrap(),
+            file_hash(&path).unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 
     #[test]
-    fn hashear_un_archivo_inexistente_da_error() {
-        assert!(hash_de_archivo(std::path::Path::new("/no/existe/nada")).is_err());
+    fn hashing_a_nonexistent_file_is_an_error() {
+        assert!(file_hash(std::path::Path::new("/does/not/exist")).is_err());
     }
 
     #[test]
-    fn acepta_un_binario_cuyo_hash_coincide() {
+    fn accepts_a_binary_whose_hash_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-x", b"contenido");
+        let path = fake_binary(dir.path(), "sb-plugin-x", b"contents");
         let mut lock = Lockfile::default();
-        lock.registrar("x", &ruta).unwrap();
-        assert!(lock.verificar("x", &ruta).is_ok());
+        lock.register("x", &path).unwrap();
+        assert!(lock.verify("x", &path).is_ok());
     }
 
     #[test]
-    fn rechaza_un_binario_modificado() {
-        // El caso que justifica todo el módulo.
+    fn rejects_a_modified_binary() {
+        // The case that justifies the whole module.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-x", b"original");
+        let path = fake_binary(dir.path(), "sb-plugin-x", b"original");
         let mut lock = Lockfile::default();
-        lock.registrar("x", &ruta).unwrap();
+        lock.register("x", &path).unwrap();
 
-        binario_falso(dir.path(), "sb-plugin-x", b"MODIFICADO");
+        fake_binary(dir.path(), "sb-plugin-x", b"MODIFIED");
 
-        let err = lock.verificar("x", &ruta).unwrap_err();
-        assert!(matches!(err, LockfileError::HashNoCoincide { .. }));
+        let err = lock.verify("x", &path).unwrap_err();
+        assert!(matches!(err, LockfileError::HashMismatch { .. }));
     }
 
     #[test]
-    fn detecta_un_cambio_de_un_solo_byte() {
+    fn detects_a_single_byte_change() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "p", &vec![7_u8; 100_000]);
+        let path = fake_binary(dir.path(), "p", &vec![7_u8; 100_000]);
         let mut lock = Lockfile::default();
-        lock.registrar("p", &ruta).unwrap();
+        lock.register("p", &path).unwrap();
 
-        let mut datos = vec![7_u8; 100_000];
-        datos[50_000] = 8;
-        binario_falso(dir.path(), "p", &datos);
+        let mut data = vec![7_u8; 100_000];
+        data[50_000] = 8;
+        fake_binary(dir.path(), "p", &data);
 
-        assert!(lock.verificar("p", &ruta).is_err());
+        assert!(lock.verify("p", &path).is_err());
     }
 
     #[test]
-    fn rechaza_un_plugin_que_no_esta_en_el_lockfile() {
+    fn rejects_a_plugin_that_is_not_in_the_lockfile() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-y", b"c");
+        let path = fake_binary(dir.path(), "sb-plugin-y", b"c");
         let lock = Lockfile::default();
         assert!(matches!(
-            lock.verificar("y", &ruta).unwrap_err(),
-            LockfileError::NoRegistrado { .. }
+            lock.verify("y", &path).unwrap_err(),
+            LockfileError::NotRegistered { .. }
         ));
     }
 
     #[test]
-    fn registrar_de_nuevo_actualiza_el_hash() {
-        // Actualizar un plugin es legítimo; hay que poder re-registrarlo.
+    fn registering_again_updates_the_hash() {
+        // Updating a plugin is legitimate; re-registering it must be possible.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "p", b"v1");
+        let path = fake_binary(dir.path(), "p", b"v1");
         let mut lock = Lockfile::default();
-        lock.registrar("p", &ruta).unwrap();
-        binario_falso(dir.path(), "p", b"v2");
-        assert!(lock.verificar("p", &ruta).is_err());
-        lock.registrar("p", &ruta).unwrap();
-        assert!(lock.verificar("p", &ruta).is_ok());
+        lock.register("p", &path).unwrap();
+        fake_binary(dir.path(), "p", b"v2");
+        assert!(lock.verify("p", &path).is_err());
+        lock.register("p", &path).unwrap();
+        assert!(lock.verify("p", &path).is_ok());
     }
 
     #[test]
-    fn ida_y_vuelta_por_toml() {
+    fn round_trip_through_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-x", b"c");
+        let path = fake_binary(dir.path(), "sb-plugin-x", b"c");
         let mut lock = Lockfile::default();
-        lock.registrar("x", &ruta).unwrap();
+        lock.register("x", &path).unwrap();
 
-        let texto = lock.to_toml().unwrap();
-        let vuelta = Lockfile::from_toml(&texto).unwrap();
-        assert!(vuelta.verificar("x", &ruta).is_ok());
+        let text = lock.to_toml().unwrap();
+        let back = Lockfile::from_toml(&text).unwrap();
+        assert!(back.verify("x", &path).is_ok());
     }
 
     #[test]
-    fn el_toml_generado_es_determinista() {
-        // El lockfile se revisa a mano y se versiona: sus diffs deben ser
-        // legibles, no reordenarse en cada escritura.
+    fn the_generated_toml_is_deterministic() {
+        // The lockfile is reviewed by hand and kept under version control: its
+        // diffs must be readable, not reshuffled on every write.
         let dir = tempfile::tempdir().unwrap();
-        let a = binario_falso(dir.path(), "a", b"1");
-        let b = binario_falso(dir.path(), "b", b"2");
-        let c = binario_falso(dir.path(), "c", b"3");
+        let a = fake_binary(dir.path(), "a", b"1");
+        let b = fake_binary(dir.path(), "b", b"2");
+        let c = fake_binary(dir.path(), "c", b"3");
 
-        let mut uno = Lockfile::default();
-        uno.registrar("zeta", &c).unwrap();
-        uno.registrar("alfa", &a).unwrap();
-        uno.registrar("mu", &b).unwrap();
+        let mut one = Lockfile::default();
+        one.register("zeta", &c).unwrap();
+        one.register("alpha", &a).unwrap();
+        one.register("mu", &b).unwrap();
 
-        let mut dos = Lockfile::default();
-        dos.registrar("alfa", &a).unwrap();
-        dos.registrar("mu", &b).unwrap();
-        dos.registrar("zeta", &c).unwrap();
+        let mut two = Lockfile::default();
+        two.register("alpha", &a).unwrap();
+        two.register("mu", &b).unwrap();
+        two.register("zeta", &c).unwrap();
 
-        assert_eq!(uno.to_toml().unwrap(), dos.to_toml().unwrap());
+        assert_eq!(one.to_toml().unwrap(), two.to_toml().unwrap());
     }
 
     #[test]
-    fn un_toml_corrupto_da_error_y_no_panico() {
+    fn a_corrupt_toml_is_an_error_and_not_a_panic() {
         assert!(matches!(
-            Lockfile::from_toml("esto no es toml [[[").unwrap_err(),
-            LockfileError::TomlInvalido(_)
+            Lockfile::from_toml("this is not toml [[[").unwrap_err(),
+            LockfileError::InvalidToml(_)
         ));
     }
 
     #[test]
-    fn un_lockfile_ausente_se_trata_como_vacio() {
-        // La primera vez que alguien usa shieldbk no existe el archivo. La
-        // diferencia la nota al primer `verificar`, con un mensaje que dice
-        // qué hacer, no con un error de fichero no encontrado.
+    fn a_missing_lockfile_is_treated_as_empty() {
+        // The first time somebody uses shieldbk the file does not exist. The
+        // difference shows up on the first `verify`, with a message that says
+        // what to do, not with a file-not-found error.
         let dir = tempfile::tempdir().unwrap();
-        let lock = Lockfile::load(&dir.path().join("no-existe.lock")).unwrap();
+        let lock = Lockfile::load(&dir.path().join("does-not-exist.lock")).unwrap();
         assert!(matches!(
-            lock.verificar("x", std::path::Path::new("/bin/true"))
+            lock.verify("x", std::path::Path::new("/bin/true"))
                 .unwrap_err(),
-            LockfileError::NoRegistrado { .. }
+            LockfileError::NotRegistered { .. }
         ));
     }
 
     #[test]
-    fn guardar_y_cargar_desde_disco() {
+    fn save_and_load_from_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta_bin = binario_falso(dir.path(), "p", b"x");
-        let ruta_lock = dir.path().join("plugins.lock");
+        let bin_path = fake_binary(dir.path(), "p", b"x");
+        let lock_path = dir.path().join("plugins.lock");
 
         let mut lock = Lockfile::default();
-        lock.registrar("p", &ruta_bin).unwrap();
-        lock.save(&ruta_lock).unwrap();
+        lock.register("p", &bin_path).unwrap();
+        lock.save(&lock_path).unwrap();
 
         assert!(
-            Lockfile::load(&ruta_lock)
+            Lockfile::load(&lock_path)
                 .unwrap()
-                .verificar("p", &ruta_bin)
+                .verify("p", &bin_path)
                 .is_ok()
         );
     }
 
     #[test]
-    fn el_mensaje_de_error_dice_que_hacer() {
-        // Un error que solo dice "no coincide" deja al usuario a oscuras a las
-        // tres de la mañana. Debe decir qué pasó y cómo seguir.
+    fn the_error_message_says_what_to_do() {
+        // An error that only says "does not match" leaves the user in the dark
+        // at three in the morning. It must say what happened and how to go on.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = binario_falso(dir.path(), "sb-plugin-x", b"a");
+        let path = fake_binary(dir.path(), "sb-plugin-x", b"a");
         let mut lock = Lockfile::default();
-        lock.registrar("x", &ruta).unwrap();
-        binario_falso(dir.path(), "sb-plugin-x", b"b");
+        lock.register("x", &path).unwrap();
+        fake_binary(dir.path(), "sb-plugin-x", b"b");
 
-        let texto = lock.verificar("x", &ruta).unwrap_err().to_string();
+        let text = lock.verify("x", &path).unwrap_err().to_string();
         assert!(
-            texto.contains("plugin lock"),
-            "debe decir cómo re-registrarlo"
+            text.contains("plugin lock"),
+            "it must say how to re-register it"
         );
-        assert!(texto.contains('x'), "debe nombrar el plugin");
+        assert!(text.contains('x'), "it must name the plugin");
     }
 
     #[test]
-    fn el_error_de_no_registrado_tambien_dice_que_hacer() {
+    fn the_not_registered_error_also_says_what_to_do() {
         let lock = Lockfile::default();
-        let texto = lock
-            .verificar("fantasma", std::path::Path::new("/bin/true"))
+        let text = lock
+            .verify("ghost", std::path::Path::new("/bin/true"))
             .unwrap_err()
             .to_string();
-        assert!(texto.contains("plugin lock"));
-        assert!(texto.contains("fantasma"));
+        assert!(text.contains("plugin lock"));
+        assert!(text.contains("ghost"));
     }
 
     #[test]
-    fn lista_los_plugins_registrados() {
+    fn lists_the_registered_plugins() {
         let dir = tempfile::tempdir().unwrap();
-        let a = binario_falso(dir.path(), "a", b"1");
+        let a = fake_binary(dir.path(), "a", b"1");
         let mut lock = Lockfile::default();
-        lock.registrar("uno", &a).unwrap();
-        lock.registrar("dos", &a).unwrap();
-        let nombres = lock.nombres();
-        assert_eq!(nombres, vec!["dos", "uno"], "en orden estable");
+        lock.register("two", &a).unwrap();
+        lock.register("one", &a).unwrap();
+        let names = lock.names();
+        assert_eq!(names, vec!["one", "two"], "in stable order");
     }
 }

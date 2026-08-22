@@ -9,12 +9,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# `rustix` da acceso a `kill(-pgid)` —matar al grupo entero, que es lo que se
-# lleva por delante a los nietos del plugin— con una API segura. La
-# alternativa, `libc::kill`, exigiría `unsafe`, y el workspace lo prohíbe.
+# `rustix` gives access to `kill(-pgid)` --killing the whole group, which is what
+# takes the plugin's grandchildren down with it-- through a safe API. The
+# alternative, `libc::kill`, would require `unsafe`, and the workspace forbids it.
 rustix = { version = "1.1.4", features = ["process"] }
-# El pipeline `zstd → age → SHA-256` vive en `sb-crypto`: el núcleo lo compone
-# entre los dos canales de datos, pero no reimplementa nada de él.
+# The `zstd -> age -> SHA-256` pipeline lives in `sb-crypto`: the core composes it
+# between the two data channels, but reimplements none of it.
 sb-crypto = { version = "0.1.0", path = "../sb-crypto" }
 sb-proto = { version = "0.1.0", path = "../sb-proto" }
 sb-transport = { version = "0.1.0", path = "../sb-transport" }
@@ -22,26 +22,26 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11.0"
 thiserror = { workspace = true }
-# Convertir segundos desde el epoch a fecha civil UTC tiene reglas (años
-# bisiestos, la excepción de los múltiplos de 400) que no merece la pena
-# reimplementar en un camino que decide dónde se escribe un artefacto. Solo se
-# usan los accesores (`year`, `month`, ...) y la marca se compone con
-# `format!`, así que no hacen falta las features `formatting`/`parsing`/`macros`
-# ni la dependencia de proc-macros que arrastran.
+# Converting seconds since the epoch into a civil UTC date has rules (leap years,
+# the exception for multiples of 400) that are not worth reimplementing on a path
+# that decides where an artifact is written. Only the accessors (`year`, `month`,
+# ...) are used and the timestamp is composed with `format!`, so the
+# `formatting`/`parsing`/`macros` features and the proc-macro dependency they drag
+# in are not needed.
 time = "0.3.55"
-# El tokio del workspace ya trae `process`, `io-util`, `time`, `net`, `macros`
-# y `rt-multi-thread`, que es todo lo que necesita el arranque de plugins: no
-# hace falta activar nada extra solo para este crate.
+# The workspace's tokio already brings `process`, `io-util`, `time`, `net`,
+# `macros` and `rt-multi-thread`, which is everything plugin startup needs: there
+# is no need to enable anything extra just for this crate.
 tokio.workspace = true
 toml = "1.1.4"
-# El canal de control es gRPC: el núcleo necesita el `Channel` de tonic para
-# construir los clientes generados en `sb-proto`.
+# The control channel is gRPC: the core needs tonic's `Channel` to build the
+# clients generated in `sb-proto`.
 tonic = "0.14.6"
 tracing.workspace = true
 
 [dev-dependencies]
-# El generador determinista del mock, para poder regenerar en el test lo que el
-# motor dijo haber producido y comparar digests en vez de creerle.
+# The mock's deterministic generator, so the test can regenerate what the engine
+# claimed to produce and compare digests instead of taking its word for it.
 sb-plugin-mock = { version = "0.1.0", path = "../../plugins/sb-plugin-mock" }
 tempfile = "3.27.0"
 proptest = { workspace = true }

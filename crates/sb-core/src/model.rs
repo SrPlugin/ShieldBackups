@@ -1,17 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-/// Versión del formato de manifiesto. Se incrementa solo ante cambios que un
-/// lector antiguo no pueda interpretar con seguridad.
+/// Version of the manifest format. It is bumped only on changes that an older
+/// reader could not safely interpret.
 pub const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("el manifiesto no es JSON válido: {0}")]
-    JsonInvalido(#[from] serde_json::Error),
-    #[error(
-        "manifiesto de versión {encontrada}, esta versión de shieldbk soporta hasta la {soportada}"
-    )]
-    VersionNoSoportada { encontrada: u32, soportada: u32 },
+    #[error("the manifest is not valid JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("manifest of version {found}, this version of shieldbk supports up to {supported}")]
+    UnsupportedVersion { found: u32, supported: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,15 +28,15 @@ pub struct CompressionInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptionInfo {
     pub algorithm: String,
-    /// Clave **pública** age. No es un secreto: saber a quién va dirigido un
-    /// artefacto no ayuda a descifrarlo.
+    /// The age **public** key. It is not a secret: knowing who an artifact is
+    /// addressed to does not help decrypt it.
     pub recipient: String,
 }
 
-/// Descripción completa de un artefacto, guardada junto a él.
+/// Full description of an artifact, stored next to it.
 ///
-/// `verify` y `restore` leen esto en vez de deducir nada del nombre del
-/// archivo: un nombre puede cambiar, un manifiesto es autoritativo.
+/// `verify` and `restore` read this instead of inferring anything from the file
+/// name: a name can change, a manifest is authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
@@ -54,40 +52,41 @@ pub struct Manifest {
     pub encryption: EncryptionInfo,
 }
 
-/// Clave del manifiesto que acompaña al artefacto guardado bajo `artifact_key`.
+/// Key of the manifest that accompanies the artifact stored under
+/// `artifact_key`.
 ///
-/// Es una función suelta y no solo un método porque `verify` necesita esta
-/// clave **antes** de tener el manifiesto: lo primero que hace es descargarlo.
-/// Si la regla estuviera solo dentro de [`Manifest`], la operación tendría que
-/// repetir el `format!` y el día que el sufijo cambiara habría dos verdades.
+/// It is a free function and not just a method because `verify` needs this key
+/// **before** it has the manifest: the first thing it does is download it. If
+/// the rule lived only inside [`Manifest`], the operation would have to repeat
+/// the `format!` and the day the suffix changed there would be two truths.
 #[must_use]
-pub fn manifest_key_de(artifact_key: &str) -> String {
+pub fn manifest_key_for(artifact_key: &str) -> String {
     format!("{artifact_key}.manifest.json")
 }
 
 impl Manifest {
-    /// Clave del manifiesto en el destino, derivada de la del artefacto.
+    /// Key of the manifest in the storage, derived from the artifact's own.
     #[must_use]
     pub fn manifest_key(&self) -> String {
-        manifest_key_de(&self.artifact_key)
+        manifest_key_for(&self.artifact_key)
     }
 
     /// # Errors
-    /// Devuelve error si el JSON es inválido o si el manifiesto viene de una
-    /// versión de shieldbk más nueva que esta.
+    /// Returns an error if the JSON is invalid or if the manifest comes from a
+    /// newer version of shieldbk than this one.
     pub fn parse(json: &str) -> Result<Self, ManifestError> {
         let m: Self = serde_json::from_str(json)?;
         if m.version > MANIFEST_VERSION {
-            return Err(ManifestError::VersionNoSoportada {
-                encontrada: m.version,
-                soportada: MANIFEST_VERSION,
+            return Err(ManifestError::UnsupportedVersion {
+                found: m.version,
+                supported: MANIFEST_VERSION,
             });
         }
         Ok(m)
     }
 
     /// # Errors
-    /// Devuelve error si la serialización falla.
+    /// Returns an error if serialization fails.
     pub fn to_json(&self) -> Result<String, ManifestError> {
         Ok(serde_json::to_string_pretty(self)?)
     }
@@ -97,17 +96,17 @@ impl Manifest {
 mod tests {
     use super::*;
 
-    fn manifiesto_de_ejemplo() -> Manifest {
+    fn sample_manifest() -> Manifest {
         Manifest {
             version: MANIFEST_VERSION,
-            target: "produccion".into(),
+            target: "production".into(),
             engine: EngineInfo {
                 plugin: "postgres".into(),
                 plugin_version: "0.1.0".into(),
                 server_version: "16.2".into(),
             },
             created_at: "2026-08-21T10:00:00Z".into(),
-            artifact_key: "produccion/2026/08/21/produccion-20260821T100000Z-postgres.dump.zst.age"
+            artifact_key: "production/2026/08/21/production-20260821T100000Z-postgres.dump.zst.age"
                 .into(),
             plaintext_bytes: 1_234,
             ciphertext_bytes: 567,
@@ -125,80 +124,80 @@ mod tests {
     }
 
     #[test]
-    fn ida_y_vuelta_por_json() {
-        let m = manifiesto_de_ejemplo();
+    fn round_trip_through_json() {
+        let m = sample_manifest();
         let json = m.to_json().unwrap();
-        let vuelta = Manifest::parse(&json).unwrap();
-        assert_eq!(m, vuelta);
+        let back = Manifest::parse(&json).unwrap();
+        assert_eq!(m, back);
     }
 
     #[test]
-    fn la_clave_del_manifiesto_deriva_de_la_del_artefacto() {
-        let m = manifiesto_de_ejemplo();
+    fn the_manifest_key_derives_from_the_artifact_key() {
+        let m = sample_manifest();
         assert_eq!(
             m.manifest_key(),
-            "produccion/2026/08/21/produccion-20260821T100000Z-postgres.dump.zst.age.manifest.json"
+            "production/2026/08/21/production-20260821T100000Z-postgres.dump.zst.age.manifest.json"
         );
     }
 
     #[test]
-    fn se_rechaza_un_manifiesto_de_version_futura() {
-        // Un shieldbk antiguo no puede interpretar con seguridad un manifiesto
-        // escrito por uno más nuevo: mejor negarse que restaurar mal.
-        let mut m = manifiesto_de_ejemplo();
+    fn a_manifest_from_a_future_version_is_rejected() {
+        // An old shieldbk cannot safely interpret a manifest written by a newer
+        // one: better to refuse than to restore badly.
+        let mut m = sample_manifest();
         m.version = MANIFEST_VERSION + 1;
         let json = serde_json::to_string(&m).unwrap();
         let err = Manifest::parse(&json).unwrap_err();
-        assert!(matches!(err, ManifestError::VersionNoSoportada { .. }));
+        assert!(matches!(err, ManifestError::UnsupportedVersion { .. }));
     }
 
     #[test]
-    fn el_error_de_version_dice_ambas_versiones() {
-        let mut m = manifiesto_de_ejemplo();
+    fn the_version_error_says_both_versions() {
+        let mut m = sample_manifest();
         m.version = 99;
-        let texto = Manifest::parse(&serde_json::to_string(&m).unwrap())
+        let text = Manifest::parse(&serde_json::to_string(&m).unwrap())
             .unwrap_err()
             .to_string();
-        assert!(texto.contains("99"), "debe decir qué versión encontró");
+        assert!(text.contains("99"), "it must say which version it found");
         assert!(
-            texto.contains(&MANIFEST_VERSION.to_string()),
-            "y cuál soporta"
+            text.contains(&MANIFEST_VERSION.to_string()),
+            "and which one it supports"
         );
     }
 
     #[test]
-    fn se_acepta_un_manifiesto_de_la_version_actual() {
-        let json = serde_json::to_string(&manifiesto_de_ejemplo()).unwrap();
+    fn a_manifest_of_the_current_version_is_accepted() {
+        let json = serde_json::to_string(&sample_manifest()).unwrap();
         assert!(Manifest::parse(&json).is_ok());
     }
 
     #[test]
-    fn un_json_corrupto_da_un_error_claro() {
+    fn a_corrupt_json_gives_a_clear_error() {
         assert!(matches!(
-            Manifest::parse("{ esto no es json").unwrap_err(),
-            ManifestError::JsonInvalido(_)
+            Manifest::parse("{ this is not json").unwrap_err(),
+            ManifestError::InvalidJson(_)
         ));
     }
 
     #[test]
-    fn falta_un_campo_obligatorio() {
-        // Un manifiesto al que le falta el digest no sirve para verificar nada.
+    fn a_mandatory_field_is_missing() {
+        // A manifest missing the digest is useless for verifying anything.
         let json = r#"{"version":1,"target":"t"}"#;
         assert!(matches!(
             Manifest::parse(json).unwrap_err(),
-            ManifestError::JsonInvalido(_)
+            ManifestError::InvalidJson(_)
         ));
     }
 
     #[test]
-    fn el_json_generado_es_legible_por_una_persona() {
-        // El manifiesto se lee a mano cuando algo va mal a las tres de la
-        // mañana. Debe estar indentado, no en una sola línea.
-        let json = manifiesto_de_ejemplo().to_json().unwrap();
-        assert!(json.contains('\n'), "debe ir indentado");
+    fn the_generated_json_is_readable_by_a_human() {
+        // The manifest is read by hand when something goes wrong at three in the
+        // morning. It must be indented, not on a single line.
+        let json = sample_manifest().to_json().unwrap();
+        assert!(json.contains('\n'), "it must be indented");
         assert!(
             json.contains("\"ciphertext_sha256\""),
-            "los nombres de campo son los del struct"
+            "the field names are the struct's own"
         );
     }
 }

@@ -1,148 +1,151 @@
-//! La operación de verify: comprobar un artefacto **sin poder leerlo**.
+//! The verify operation: checking an artifact **without being able to read it**.
 //!
 //! ```text
-//! plugin-destino ──[socket datos]──▶ núcleo ──▶ SHA-256 ──▶ /dev/null
+//! storage-plugin ──[data socket]──▶ core ──▶ SHA-256 ──▶ /dev/null
 //! ```
 //!
-//! Esta operación es la razón de que el pipeline hashee el texto cifrado y no
-//! el plano. El digest del plaintext obligaría a descifrar para comprobar
-//! cualquier cosa, y descifrar exige la clave privada; hasheando el ciphertext,
-//! **una máquina puede comprobar que sus backups siguen íntegros sin tener con
-//! qué leerlos**. Por eso [`ejecutar_verify`] no recibe ninguna `Identity`: no
-//! es que no la use, es que no puede.
+//! This operation is the reason the pipeline hashes the ciphertext and not the
+//! plaintext. A plaintext digest would force decryption in order to check
+//! anything, and decrypting requires the private key; by hashing the ciphertext,
+//! **a machine can check that its backups are still intact without having
+//! anything to read them with**. That is why [`run_verify`] does not receive any
+//! `Identity`: it is not that it does not use one, it is that it cannot.
 //!
-//! Lo segundo que define esta operación es lo que **no** hace: no carga el
-//! artefacto en memoria. Los bytes van de la tubería al hasher y de ahí a
-//! [`tokio::io::sink`], así que verificar un artefacto de trescientos gigabytes
-//! cuesta lo mismo en RAM que verificar uno de tres kilobytes.
+//! The second thing that defines this operation is what it does **not** do: it
+//! does not load the artifact into memory. The bytes go from the pipe to the
+//! hasher and from there to [`tokio::io::sink`], so verifying a three-hundred
+//! gigabyte artifact costs the same in RAM as verifying a three kilobyte one.
 
 use sb_crypto::Sha256Reader;
 
-use crate::model::{Manifest, manifest_key_de};
-use crate::ops::canal::{
-    BackupError, OP_GET, aceptar, crear_canal, descargar_blob, esperar_progreso, iniciar_get,
+use crate::model::{Manifest, manifest_key_for};
+use crate::ops::channel::{
+    BackupError, OP_GET, accept, create_channel, download_blob, start_get, wait_for_progress,
 };
-use crate::plugin::{Capacidad, PluginClient};
+use crate::plugin::{Capability, PluginClient};
 
-/// El veredicto sobre un artefacto.
+/// The verdict on an artifact.
 ///
-/// Los dos digests van dentro aunque coincidan: un informe que solo dijera
-/// `ok: false` no le sirve de nada a quien tiene que decidir si el problema es
-/// el artefacto, el manifiesto o el destino.
+/// Both digests go inside even when they match: a report that only said
+/// `ok: false` would be of no use to whoever has to decide whether the problem is
+/// the artifact, the manifest or the storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyOutcome {
-    /// Cierto solo si coinciden **el digest y el número de bytes**.
+    /// True only if **both the digest and the byte count** match.
     pub ok: bool,
-    /// El que dice el manifiesto.
-    pub digest_esperado: String,
-    /// El que se ha calculado leyendo el artefacto del destino.
-    pub digest_obtenido: String,
-    /// Los bytes que el destino sirvió de verdad.
+    /// The one the manifest states.
+    pub expected_digest: String,
+    /// The one computed by reading the artifact from the storage.
+    pub actual_digest: String,
+    /// The bytes the storage actually served.
     pub bytes: u64,
 }
 
-/// Trae del destino el manifiesto que describe a `artifact_key`.
+/// Fetches from the storage the manifest that describes `artifact_key`.
 ///
-/// Es lo primero que hace [`ejecutar_verify`], y está aparte porque no es solo
-/// suyo: `restore` necesita el mismo manifiesto —para saber qué digest debe
-/// tener el artefacto que le sirvan— y sin esto tendría que repetir la regla de
-/// cómo se deriva la clave y cómo se interpreta el contenido.
+/// It is the first thing [`run_verify`] does, and it lives apart because it is
+/// not only its own: `restore` needs the same manifest —to know which digest the
+/// artifact it is served must have— and without this it would have to repeat the
+/// rule for how the key is derived and how the contents are parsed.
 ///
 /// # Errors
-/// Devuelve [`BackupError::SinManifiesto`] si no se pudo traer —el mensaje
-/// nombra la clave exacta que se buscó— o [`BackupError::Manifiesto`] si no se
-/// entiende.
-pub async fn leer_manifiesto(
+/// Returns [`BackupError::NoManifest`] if it could not be fetched —the message
+/// names the exact key that was looked up— or [`BackupError::Manifest`] if it
+/// cannot be parsed.
+pub async fn read_manifest(
     storage: &PluginClient,
     artifact_key: &str,
 ) -> Result<Manifest, BackupError> {
-    let clave_manifiesto = manifest_key_de(artifact_key);
-    let crudo = descargar_blob(storage, &clave_manifiesto)
+    let manifest_key = manifest_key_for(artifact_key);
+    let raw = download_blob(storage, &manifest_key)
         .await
-        .map_err(|fuente| BackupError::SinManifiesto {
-            plugin: storage.nombre().to_string(),
-            clave: clave_manifiesto.clone(),
-            motivo: fuente.to_string(),
+        .map_err(|source| BackupError::NoManifest {
+            plugin: storage.name().to_string(),
+            key: manifest_key.clone(),
+            reason: source.to_string(),
         })?;
-    let texto = String::from_utf8(crudo).map_err(|_| BackupError::SinManifiesto {
-        plugin: storage.nombre().to_string(),
-        clave: clave_manifiesto.clone(),
-        motivo: "no es texto UTF-8".to_string(),
+    let text = String::from_utf8(raw).map_err(|_| BackupError::NoManifest {
+        plugin: storage.name().to_string(),
+        key: manifest_key.clone(),
+        reason: "it is not UTF-8 text".to_string(),
     })?;
-    Ok(Manifest::parse(&texto)?)
+    Ok(Manifest::parse(&text)?)
 }
 
-/// Descarga el artefacto y comprueba su digest contra el manifiesto.
+/// Downloads the artifact and checks its digest against the manifest.
 ///
-/// Que un artefacto no cuadre **no** es un error de esta función: es su
-/// respuesta, y es justo lo que hay que enseñarle a quien la llamó. Solo falla
-/// si no se puede llegar a emitir un veredicto: si el manifiesto no está, si no
-/// se entiende, o si la descarga se rompe.
+/// That an artifact does not match is **not** an error of this function: it is
+/// its answer, and it is exactly what has to be shown to the caller. It only
+/// fails if a verdict cannot be reached at all: if the manifest is missing, if it
+/// cannot be parsed, or if the download breaks.
 ///
-/// # Por qué se lee el manifiesto primero
+/// # Why the manifest is read first
 ///
-/// Sin él no hay contra qué comparar, y descargar cien gigabytes para
-/// descubrirlo al final es un coste que ya no se puede devolver. Además, la
-/// asimetría del fallo importa: «no encuentro el manifiesto» tiene un remedio
-/// —buscarlo, restaurarlo, mirar si la clave era otra— y el mensaje dice qué
-/// clave exacta se buscó para que ese remedio sea posible.
+/// Without it there is nothing to compare against, and downloading a hundred
+/// gigabytes only to find that out at the end is a cost that cannot be given
+/// back. Besides, the asymmetry of the failure matters: "I cannot find the
+/// manifest" has a remedy —look for it, restore it, check whether the key was a
+/// different one— and the message says which exact key was looked up so that
+/// remedy is possible.
 ///
 /// # Errors
-/// Devuelve [`BackupError::SinManifiesto`] si el manifiesto no se pudo traer
-/// —el mensaje nombra la clave—, [`BackupError::Manifiesto`] si no se entiende,
-/// y las variantes de transferencia si la descarga del artefacto se rompe.
-pub async fn ejecutar_verify(
+/// Returns [`BackupError::NoManifest`] if the manifest could not be fetched —the
+/// message names the key—, [`BackupError::Manifest`] if it cannot be parsed, and
+/// the transfer variants if the artifact download breaks.
+pub async fn run_verify(
     storage: &PluginClient,
     artifact_key: &str,
 ) -> Result<VerifyOutcome, BackupError> {
-    storage.exigir_capacidad(Capacidad::Storage)?;
+    storage.require_capability(Capability::Storage)?;
 
-    // 1. El manifiesto primero: es pequeño y es lo único que dice qué se
-    //    espera. Va a memoria porque cabe; el artefacto no.
-    let manifiesto = leer_manifiesto(storage, artifact_key).await?;
+    // 1. The manifest first: it is small and it is the only thing that says what
+    //    is expected. It goes into memory because it fits; the artifact does
+    //    not.
+    let manifest = read_manifest(storage, artifact_key).await?;
 
-    // 2. El artefacto se lee **en flujo**, contra un sumidero que lo tira. Lo
-    //    único que interesa es lo que el hasher va acumulando por el camino:
-    //    cargar el artefacto en memoria haría que verificar un backup grande
-    //    fuera imposible justo en la máquina pequeña que más lo necesita.
-    let canal = crear_canal(storage)?;
-    let descarga = iniciar_get(storage, artifact_key, &canal).await?;
-    let fuente = aceptar(&canal, storage.nombre(), OP_GET).await?;
+    // 2. The artifact is read **as a stream**, against a sink that throws it
+    //    away. The only thing that matters is what the hasher accumulates along
+    //    the way: loading the artifact into memory would make verifying a large
+    //    backup impossible on exactly the small machine that needs it most.
+    let channel = create_channel(storage)?;
+    let download = start_get(storage, artifact_key, &channel).await?;
+    let source = accept(&channel, storage.name(), OP_GET).await?;
 
-    let mut lector = Sha256Reader::new(fuente);
-    let bytes = tokio::io::copy(&mut lector, &mut tokio::io::sink())
+    let mut reader = Sha256Reader::new(source);
+    let bytes = tokio::io::copy(&mut reader, &mut tokio::io::sink())
         .await
-        .map_err(|fuente| BackupError::Io {
-            plugin: storage.nombre().to_string(),
-            fuente,
+        .map_err(|source| BackupError::Io {
+            plugin: storage.name().to_string(),
+            source,
         })?;
-    let obtenido = lector.digest().to_hex();
+    let actual = reader.digest().to_hex();
 
-    // 3. El plugin puede tener aún algo que decir: un `Get` que se rompió a
-    //    mitad llega por el flujo de progreso y no por la tubería, donde solo
-    //    se ve un fin de flujo prematuro que parecería un artefacto corto.
-    esperar_progreso(descarga, storage.nombre(), OP_GET).await?;
+    // 3. The plugin may still have something to say: a `Get` that broke halfway
+    //    arrives through the progress stream and not through the pipe, where all
+    //    that is seen is a premature end of stream that would look like a short
+    //    artifact.
+    wait_for_progress(download, storage.name(), OP_GET).await?;
 
-    // 4. Los dos criterios, no uno: el digest cubre el contenido y el tamaño
-    //    cubre el caso degenerado de un destino que sirviera menos de lo que
-    //    dice tener. Que el segundo sea redundante en la práctica no lo hace
-    //    inútil: es la comprobación barata que además explica el fallo.
-    let ok = obtenido == manifiesto.ciphertext_sha256 && bytes == manifiesto.ciphertext_bytes;
+    // 4. Both criteria, not one: the digest covers the contents and the size
+    //    covers the degenerate case of a storage serving less than it claims to
+    //    have. That the second one is redundant in practice does not make it
+    //    useless: it is the cheap check that also explains the failure.
+    let ok = actual == manifest.ciphertext_sha256 && bytes == manifest.ciphertext_bytes;
     if !ok {
         tracing::warn!(
-            clave = %artifact_key,
-            esperado = %manifiesto.ciphertext_sha256,
-            obtenido = %obtenido,
+            key = %artifact_key,
+            expected = %manifest.ciphertext_sha256,
+            actual = %actual,
             bytes,
-            esperados = manifiesto.ciphertext_bytes,
-            "el artefacto no coincide con su manifiesto"
+            expected_bytes = manifest.ciphertext_bytes,
+            "the artifact does not match its manifest"
         );
     }
 
     Ok(VerifyOutcome {
         ok,
-        digest_esperado: manifiesto.ciphertext_sha256,
-        digest_obtenido: obtenido,
+        expected_digest: manifest.ciphertext_sha256,
+        actual_digest: actual,
         bytes,
     })
 }

@@ -1,45 +1,46 @@
-//! La operación de `doctor`: enterarse de lo que está mal **antes** del backup.
+//! The `doctor` operation: finding out what is wrong **before** the backup.
 //!
-//! Las otras tres operaciones abortan al primer problema, y hacen bien: a
-//! mitad de un volcado no hay nada que seguir haciendo. Esta es lo contrario, y
-//! por eso vive aparte. `doctor` existe para que un backup de dos horas no se
-//! rompa a la hora y media por una credencial caducada, y para eso tiene que
-//! contarlo **todo** de una vez: un plugin que no contesta es una línea del
-//! informe, no el final del diagnóstico. Si abortara, el usuario arreglaría un
-//! problema para descubrir el siguiente, y así una vez por intento.
+//! The other three operations abort at the first problem, and rightly so:
+//! halfway through a dump there is nothing left to do. This one is the opposite,
+//! and that is why it lives apart. `doctor` exists so that a two-hour backup does
+//! not break at the ninety-minute mark over an expired credential, and for that
+//! it has to report **everything** in one go: a plugin that does not answer is a
+//! line of the report, not the end of the diagnosis. If it aborted, the user
+//! would fix one problem only to discover the next one, once per attempt.
 //!
-//! De ahí la firma: [`ejecutar_doctor`] no devuelve `Result`. No es que sus
-//! fallos se ignoren —cada uno acaba en el informe, con su origen y su
-//! remedio—, es que no hay ninguno que impida emitirlo.
+//! Hence the signature: [`run_doctor`] does not return a `Result`. It is not that
+//! its failures are ignored —each one ends up in the report, with its origin and
+//! its remedy—, it is that there is none that stops the report from being
+//! produced.
 
-use crate::plugin::{Capacidad, PluginClient};
+use crate::plugin::{Capability, PluginClient};
 
-/// Nombre de la comprobación que lleva la versión de la fuente.
+/// Name of the check that carries the source's version.
 ///
-/// El motor la reporta en su `Preflight` y el manifiesto de un backup la
-/// necesita, así que viaja como una comprobación más en vez de como un campo
-/// aparte: es información de diagnóstico —«contra qué versión de `PostgreSQL`
-/// estoy hablando»— y el usuario quiere verla en el informe, no solo el
-/// programa.
-const CHECK_VERSION_FUENTE: &str = "versión de la fuente";
+/// The engine reports it in its `Preflight` and a backup's manifest needs it, so
+/// it travels as one more check instead of as a separate field: it is diagnostic
+/// information —"which version of `PostgreSQL` am I talking to"— and the user
+/// wants to see it in the report, not just the program.
+const CHECK_SOURCE_VERSION: &str = "source version";
 
-/// Una comprobación ya hecha, con su veredicto y con **de quién es**.
+/// A check already performed, with its verdict and with **whose it is**.
 #[derive(Debug, Clone)]
 pub struct CheckResult {
-    /// "engine" o "storage": de qué plugin viene la comprobación.
+    /// "engine" or "storage": which plugin the check comes from.
     ///
-    /// Un backup tiene dos plugins vivos a la vez; «falta permiso» sin decir
-    /// cuál de los dos obliga a adivinar.
-    pub origen: String,
-    pub nombre: String,
+    /// A backup has two live plugins at once; "missing permission" without
+    /// saying which of the two forces you to guess.
+    pub origin: String,
+    pub name: String,
     pub ok: bool,
-    /// Qué se vio: la ruta que no existe, el error que devolvió el servidor.
-    pub detalle: String,
-    /// Qué hacer para arreglarlo. Vacío si no hay nada que arreglar.
-    pub remedio: String,
+    /// What was seen: the path that does not exist, the error the server
+    /// returned.
+    pub detail: String,
+    /// What to do to fix it. Empty if there is nothing to fix.
+    pub remedy: String,
 }
 
-/// Todo lo que se pudo averiguar sobre un target, junto.
+/// Everything that could be found out about a target, together.
 #[derive(Debug, Clone)]
 pub struct DoctorReport {
     pub target: String,
@@ -47,53 +48,52 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    /// Un informe **sin comprobaciones no está bien**: significa que algo no
-    /// llegó a ejecutarse.
+    /// A report **with no checks is not fine**: it means something never got to
+    /// run.
     ///
-    /// La alternativa —`all()` sobre una lista vacía, que es cierto— diría
-    /// «todo en orden» sin haber mirado nada, y ese es el único veredicto peor
-    /// que un fallo: el usuario se iría tranquilo a lanzar el backup.
+    /// The alternative —`all()` over an empty list, which is true— would say
+    /// "everything in order" without having looked at anything, and that is the
+    /// only verdict worse than a failure: the user would go off to launch the
+    /// backup with peace of mind.
     #[must_use]
     pub fn ok(&self) -> bool {
         !self.checks.is_empty() && self.checks.iter().all(|c| c.ok)
     }
 
-    /// Las comprobaciones que fallaron, **todas**.
+    /// The checks that failed, **all of them**.
     #[must_use]
-    pub fn fallos(&self) -> Vec<&CheckResult> {
+    pub fn failures(&self) -> Vec<&CheckResult> {
         self.checks.iter().filter(|c| !c.ok).collect()
     }
 
-    /// Versión de la fuente detectada por el motor, si la reportó.
+    /// Version of the source detected by the engine, if it reported one.
     #[must_use]
     pub fn server_version(&self) -> Option<&str> {
         self.checks
             .iter()
-            .find(|c| {
-                c.origen == Capacidad::Engine.como_cadena() && c.nombre == CHECK_VERSION_FUENTE
-            })
-            .map(|c| c.detalle.as_str())
+            .find(|c| c.origin == Capability::Engine.as_str() && c.name == CHECK_SOURCE_VERSION)
+            .map(|c| c.detail.as_str())
     }
 }
 
-/// Ejecuta el preflight de ambos plugins y junta los resultados.
+/// Runs the preflight of both plugins and joins the results.
 ///
-/// **Nunca aborta por un plugin que falle**: un plugin que no responde es un
-/// hallazgo del informe, no un error de la operación. El usuario quiere ver
-/// todo lo que está mal de una vez.
+/// **It never aborts because a plugin fails**: a plugin that does not respond is
+/// a finding of the report, not an error of the operation. The user wants to see
+/// everything that is wrong in one go.
 ///
-/// Los dos se preguntan en serie y no en paralelo a propósito: son dos RPC
-/// cortos, ganar unos milisegundos no compensa que los mensajes de un plugin
-/// se entremezclen con los del otro en el log, y el informe sale con el motor
-/// primero, que es como se lee.
-pub async fn ejecutar_doctor(
+/// The two are asked in series and not in parallel on purpose: they are two short
+/// RPCs, gaining a few milliseconds does not make up for one plugin's messages
+/// getting mixed with the other's in the log, and the report comes out with the
+/// engine first, which is how it reads.
+pub async fn run_doctor(
     target: &str,
     engine: &PluginClient,
     storage: &PluginClient,
 ) -> DoctorReport {
     let mut checks = Vec::new();
-    interrogar(&mut checks, Capacidad::Engine, engine).await;
-    interrogar(&mut checks, Capacidad::Storage, storage).await;
+    interrogate(&mut checks, Capability::Engine, engine).await;
+    interrogate(&mut checks, Capability::Storage, storage).await;
 
     DoctorReport {
         target: target.to_string(),
@@ -101,63 +101,65 @@ pub async fn ejecutar_doctor(
     }
 }
 
-/// Le pide el preflight a un plugin y vuelca lo que diga —o lo que falle— en
-/// el informe.
-async fn interrogar(checks: &mut Vec<CheckResult>, papel: Capacidad, plugin: &PluginClient) {
-    let origen = papel.como_cadena();
+/// Asks a plugin for its preflight and dumps whatever it says —or whatever
+/// fails— into the report.
+async fn interrogate(checks: &mut Vec<CheckResult>, role: Capability, plugin: &PluginClient) {
+    let origin = role.as_str();
 
-    let respuesta = match plugin.preflight().await {
-        Ok(respuesta) => respuesta,
+    let response = match plugin.preflight().await {
+        Ok(response) => response,
         Err(error) => {
-            // Aquí es donde `doctor` se separa de las demás operaciones: este
-            // `Err` no sale de la función, se convierte en una línea más.
+            // This is where `doctor` parts ways with the other operations: this
+            // `Err` does not leave the function, it becomes one more line.
             checks.push(CheckResult {
-                origen: origen.to_string(),
-                nombre: "preflight".to_string(),
+                origin: origin.to_string(),
+                name: "preflight".to_string(),
                 ok: false,
-                detalle: error.to_string(),
-                remedio: format!(
-                    "revisa que el plugin «{}» esté instalado, sea ejecutable y siga vivo",
-                    plugin.nombre()
+                detail: error.to_string(),
+                remedy: format!(
+                    "check that the plugin \"{}\" is installed, is executable and is still alive",
+                    plugin.name()
                 ),
             });
             return;
         }
     };
 
-    if papel == Capacidad::Engine && !respuesta.server_version.is_empty() {
+    if role == Capability::Engine && !response.server_version.is_empty() {
         checks.push(CheckResult {
-            origen: origen.to_string(),
-            nombre: CHECK_VERSION_FUENTE.to_string(),
+            origin: origin.to_string(),
+            name: CHECK_SOURCE_VERSION.to_string(),
             ok: true,
-            detalle: respuesta.server_version,
-            remedio: String::new(),
+            detail: response.server_version,
+            remedy: String::new(),
         });
     }
 
-    let alguno_falla = respuesta.checks.iter().any(|c| !c.ok);
-    checks.extend(respuesta.checks.into_iter().map(|c| CheckResult {
-        origen: origen.to_string(),
-        nombre: c.name,
+    let any_failed = response.checks.iter().any(|c| !c.ok);
+    checks.extend(response.checks.into_iter().map(|c| CheckResult {
+        origin: origin.to_string(),
+        name: c.name,
         ok: c.ok,
-        detalle: c.detail,
-        remedio: c.remediation,
+        detail: c.detail,
+        remedy: c.remediation,
     }));
 
-    // Un plugin que dice «no estoy bien» sin decir en qué no puede colarse
-    // como informe limpio: sin esto, un `ok: false` con la lista de checks
-    // vacía —o con todas en verde— haría que `doctor` diera el visto bueno.
-    if !respuesta.ok && !alguno_falla {
+    // A plugin that says "I am not well" without saying in what cannot slip
+    // through as a clean report: without this, an `ok: false` with an empty list
+    // of checks —or with all of them green— would make `doctor` give the go
+    // ahead.
+    if !response.ok && !any_failed {
         checks.push(CheckResult {
-            origen: origen.to_string(),
-            nombre: "veredicto".to_string(),
+            origin: origin.to_string(),
+            name: "verdict".to_string(),
             ok: false,
-            detalle: format!(
-                "el plugin «{}» se declara no preparado pero no dijo qué comprobación falla",
-                plugin.nombre()
+            detail: format!(
+                "the plugin \"{}\" declares itself not ready but did not say which check fails",
+                plugin.name()
             ),
-            remedio: "mira los registros del plugin: el fallo está ahí pero no llegó al informe"
-                .to_string(),
+            remedy:
+                "look at the plugin's logs: the failure is there but it did not reach the report"
+                    .to_string(),
         });
     }
 }
@@ -166,78 +168,78 @@ async fn interrogar(checks: &mut Vec<CheckResult>, papel: Capacidad, plugin: &Pl
 mod tests {
     use super::*;
 
-    fn check(origen: &str, nombre: &str, ok: bool, remedio: &str) -> CheckResult {
+    fn check(origin: &str, name: &str, ok: bool, remedy: &str) -> CheckResult {
         CheckResult {
-            origen: origen.into(),
-            nombre: nombre.into(),
+            origin: origin.into(),
+            name: name.into(),
             ok,
-            detalle: String::new(),
-            remedio: remedio.into(),
+            detail: String::new(),
+            remedy: remedy.into(),
         }
     }
 
     #[test]
-    fn un_informe_sin_fallos_esta_ok() {
-        let informe = DoctorReport {
+    fn a_report_without_failures_is_ok() {
+        let report = DoctorReport {
             target: "t".into(),
             checks: vec![
-                check("engine", "binario", true, ""),
+                check("engine", "binary", true, ""),
                 check("storage", "bucket", true, ""),
             ],
         };
-        assert!(informe.ok());
-        assert!(informe.fallos().is_empty());
+        assert!(report.ok());
+        assert!(report.failures().is_empty());
     }
 
     #[test]
-    fn un_solo_fallo_tumba_el_informe() {
-        let informe = DoctorReport {
+    fn a_single_failure_brings_the_report_down() {
+        let report = DoctorReport {
             target: "t".into(),
             checks: vec![
                 check("engine", "a", true, ""),
-                check("storage", "b", false, "concede s3:PutObject"),
+                check("storage", "b", false, "grant s3:PutObject"),
             ],
         };
-        assert!(!informe.ok());
-        assert_eq!(informe.fallos().len(), 1);
-        assert_eq!(informe.fallos()[0].remedio, "concede s3:PutObject");
+        assert!(!report.ok());
+        assert_eq!(report.failures().len(), 1);
+        assert_eq!(report.failures()[0].remedy, "grant s3:PutObject");
     }
 
     #[test]
-    fn un_informe_vacio_no_se_considera_correcto() {
-        // Cero comprobaciones significa que algo no llegó a ejecutarse, no que
-        // todo vaya bien. Un `doctor` que dice «ok» sin haber comprobado nada
-        // es peor que uno que falla.
-        let informe = DoctorReport {
+    fn an_empty_report_is_not_considered_correct() {
+        // Zero checks means something never got to run, not that everything is
+        // fine. A `doctor` that says "ok" without having checked anything is
+        // worse than one that fails.
+        let report = DoctorReport {
             target: "t".into(),
             checks: vec![],
         };
-        assert!(!informe.ok());
+        assert!(!report.ok());
     }
 
     #[test]
-    fn el_informe_conserva_todos_los_fallos_no_solo_el_primero() {
-        // El usuario quiere ver todo lo que está mal de una vez, no arreglar
-        // un problema para descubrir el siguiente.
-        let informe = DoctorReport {
+    fn the_report_keeps_every_failure_not_just_the_first() {
+        // The user wants to see everything that is wrong in one go, not fix one
+        // problem to discover the next.
+        let report = DoctorReport {
             target: "t".into(),
             checks: vec![
-                check("engine", "a", false, "arregla a"),
-                check("engine", "b", false, "arregla b"),
-                check("storage", "c", false, "arregla c"),
+                check("engine", "a", false, "fix a"),
+                check("engine", "b", false, "fix b"),
+                check("storage", "c", false, "fix c"),
             ],
         };
-        assert_eq!(informe.fallos().len(), 3);
+        assert_eq!(report.failures().len(), 3);
     }
 
     #[test]
-    fn los_fallos_conservan_de_que_plugin_vienen() {
-        // En un backup hay dos plugins; «falta permiso» sin decir cuál obliga
-        // a adivinar.
-        let informe = DoctorReport {
+    fn the_failures_keep_which_plugin_they_come_from() {
+        // In a backup there are two plugins; "missing permission" without saying
+        // which one forces you to guess.
+        let report = DoctorReport {
             target: "t".into(),
-            checks: vec![check("storage", "permisos", false, "x")],
+            checks: vec![check("storage", "permissions", false, "x")],
         };
-        assert_eq!(informe.fallos()[0].origen, "storage");
+        assert_eq!(report.failures()[0].origin, "storage");
     }
 }

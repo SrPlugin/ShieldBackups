@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use sb_config::{ConfigTable, Target, validar_y_convertir};
 use sb_core::lockfile::Lockfile;
-use sb_core::plugin::{Capacidad, PluginClient};
+use sb_core::plugin::{Capability, PluginClient};
 
 use crate::context::{Contexto, nombre_de_binario};
 use crate::error::CliError;
@@ -35,10 +35,10 @@ impl Papel {
         }
     }
 
-    const fn capacidad(self) -> Capacidad {
+    const fn capacidad(self) -> Capability {
         match self {
-            Self::Motor => Capacidad::Engine,
-            Self::Destino => Capacidad::Storage,
+            Self::Motor => Capability::Engine,
+            Self::Destino => Capability::Storage,
         }
     }
 
@@ -115,7 +115,7 @@ pub fn verificar(ctx: &Contexto, nombre: &str) -> Result<PathBuf, CliError> {
     }
 
     let lockfile = Lockfile::load(&ctx.ruta_lockfile)?;
-    lockfile.verificar(nombre, &ruta)?;
+    lockfile.verify(nombre, &ruta)?;
     tracing::debug!(plugin = nombre, ruta = %ruta.display(), "binario verificado");
     Ok(ruta)
 }
@@ -158,7 +158,7 @@ pub async fn arrancar_para(
     // La capacidad se comprueba aquí y no al usarla: pedirle un volcado a un
     // plugin que solo sabe almacenar tiene que fallar al elegirlo, no a mitad
     // del backup.
-    if let Err(fuente) = cliente.exigir_capacidad(papel.capacidad()) {
+    if let Err(fuente) = cliente.require_capability(papel.capacidad()) {
         let _ = cliente.shutdown().await;
         return Err(CliError::config(format!(
             "el target «{}» usa «{nombre}» como {}, pero {fuente}",
@@ -195,7 +195,7 @@ async fn configurar(cliente: &PluginClient, target: &Target, papel: Papel) -> Re
     // Lo que se registra es **cuántos** campos van, nunca cuáles ni sus
     // valores: entre ellos hay contraseñas.
     tracing::debug!(
-        plugin = cliente.nombre(),
+        plugin = cliente.name(),
         papel = seccion,
         campos = valores.len(),
         "configurando plugin"
@@ -218,7 +218,7 @@ async fn entregar(
 /// lo que el usuario vino a saber. Devolver el error del cierre haría que un
 /// backup correcto pareciera roto.
 pub async fn cerrar(cliente: PluginClient) {
-    let nombre = cliente.nombre().to_owned();
+    let nombre = cliente.name().to_owned();
     if let Err(fuente) = cliente.shutdown().await {
         tracing::warn!(plugin = %nombre, %fuente, "el plugin no se cerró limpiamente");
     }
@@ -232,8 +232,8 @@ mod tests {
     fn cada_papel_sabe_de_que_seccion_y_capacidad_habla() {
         assert_eq!(Papel::Motor.seccion(), "engine");
         assert_eq!(Papel::Destino.seccion(), "storage");
-        assert_eq!(Papel::Motor.capacidad(), Capacidad::Engine);
-        assert_eq!(Papel::Destino.capacidad(), Capacidad::Storage);
+        assert_eq!(Papel::Motor.capacidad(), Capability::Engine);
+        assert_eq!(Papel::Destino.capacidad(), Capability::Storage);
     }
 
     #[test]

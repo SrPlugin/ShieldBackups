@@ -1,45 +1,45 @@
-//! La operación de backup: motor → núcleo → destino, en un solo paso y sin
-//! tocar el disco local.
+//! The backup operation: engine → core → storage, in a single pass and without
+//! touching the local disk.
 //!
 //! ```text
-//! plugin-motor ──[socket datos]──▶ núcleo ──[socket datos]──▶ plugin-destino
-//!                               zstd → age → SHA-256
+//! engine-plugin ──[data socket]──▶ core ──[data socket]──▶ storage-plugin
+//!                             zstd → age → SHA-256
 //! ```
 //!
-//! Los bytes cruzan **dos veces** el límite de proceso y en ningún momento se
-//! materializan enteros: la memoria que usa un backup de un terabyte es la
-//! misma que la de uno de un megabyte.
+//! The bytes cross the process boundary **twice** and at no point are they
+//! materialized whole: the memory a one-terabyte backup uses is the same as that
+//! of a one-megabyte one.
 //!
-//! # El orden de las llamadas
+//! # The order of the calls
 //!
-//! Se llama primero a `Storage.Put` y **después** a `Engine.Dump`, que es justo
-//! al revés de como se lee el diagrama. La razón está en [`ejecutar_backup`] y
-//! no es una preferencia estilística: es la diferencia entre un backup que
-//! termina y uno que se cuelga.
+//! `Storage.Put` is called first and `Engine.Dump` **afterwards**, which is
+//! exactly the opposite of how the diagram reads. The reason is in [`run_backup`]
+//! and it is not a stylistic preference: it is the difference between a backup
+//! that finishes and one that hangs.
 
 use sb_crypto::{BackupOptions, BackupSummary, CompressionLevel, Recipient};
 
 use crate::model::{CompressionInfo, EncryptionInfo, EngineInfo, MANIFEST_VERSION, Manifest};
-use crate::ops::canal::{
-    OP_DUMP, OP_PUT, aceptar, crear_canal, esperar_progreso, iniciar_dump, iniciar_put, subir_blob,
+use crate::ops::channel::{
+    OP_DUMP, OP_PUT, accept, create_channel, start_dump, start_put, upload_blob, wait_for_progress,
 };
-use crate::plugin::{Capacidad, PluginClient};
+use crate::plugin::{Capability, PluginClient};
 
-// El error y la mecánica de las transferencias son de las tres operaciones, no
-// solo de esta: viven en `ops/canal.rs`. Se reexporta aquí porque
-// `ops::backup::BackupError` es el camino por el que ya se le conoce.
-pub use crate::ops::canal::BackupError;
+// The error and the mechanics of the transfers belong to the three operations,
+// not just to this one: they live in `ops/channel.rs`. It is re-exported here
+// because `ops::backup::BackupError` is the path it is already known by.
+pub use crate::ops::channel::BackupError;
 
-/// Algoritmo de compresión que registra el manifiesto. Lo fija el pipeline de
-/// `sb-crypto`, no la configuración.
-const ALGORITMO_COMPRESION: &str = "zstd";
-/// Algoritmo de cifrado, por el mismo motivo.
-const ALGORITMO_CIFRADO: &str = "age";
+/// Compression algorithm recorded in the manifest. It is fixed by the
+/// `sb-crypto` pipeline, not by the configuration.
+const COMPRESSION_ALGORITHM: &str = "zstd";
+/// Encryption algorithm, for the same reason.
+const ENCRYPTION_ALGORITHM: &str = "age";
 
-/// Todo lo que hace falta para un backup, ya resuelto.
+/// Everything a backup needs, already resolved.
 ///
-/// Los plugins llegan **arrancados y configurados**: esta operación no decide
-/// qué plugin usar ni cómo configurarlo, solo los pone a hablar.
+/// The plugins arrive **started and configured**: this operation does not decide
+/// which plugin to use nor how to configure it, it only makes them talk.
 pub struct BackupRequest<'a> {
     pub target: String,
     pub engine: &'a PluginClient,
@@ -49,84 +49,87 @@ pub struct BackupRequest<'a> {
     pub level: CompressionLevel,
     pub engine_version: String,
     pub server_version: String,
-    /// Marca ISO-8601 en UTC. La calcula quien llama, para que la operación
-    /// sea determinista y testeable.
+    /// ISO-8601 timestamp in UTC. The caller computes it, so that the operation
+    /// is deterministic and testable.
     pub created_at: String,
 }
 
-/// Lo que queda de un backup que salió bien.
+/// What is left of a backup that went well.
 #[derive(Debug, Clone)]
 pub struct BackupOutcome {
     pub summary: BackupSummary,
     pub artifact_key: String,
 }
 
-/// Ejecuta un backup completo y deja el artefacto y su manifiesto en el destino.
+/// Runs a complete backup and leaves the artifact and its manifest in the
+/// storage.
 ///
-/// # El orden de `Put` y `Dump`, que es contraintuitivo a propósito
+/// # The order of `Put` and `Dump`, deliberately counter-intuitive
 ///
-/// `Storage.Put` se llama **antes** que `Engine.Dump`. Leyendo el diagrama de
-/// arriba se diría que el productor va primero, y es exactamente el cambio que
-/// alguien intentará hacer algún día.
+/// `Storage.Put` is called **before** `Engine.Dump`. Reading the diagram above
+/// you would say the producer goes first, and that is exactly the change
+/// somebody will try to make some day.
 ///
-/// No lo hagas, y esta es la razón con lo que se sabe medido detrás.
+/// Do not do it, and here is the reason with the measurements behind it.
 ///
-/// El socket del volcado tiene un búfer del kernel de unos 208 KiB
-/// (`net.core.wmem_default`). Si el motor arranca antes de que el destino esté
-/// colocado, escribe en un socket que todavía nadie va a drenar y se bloquea en
-/// su `write` en cuanto ese búfer se llena. **Lo que ocurre después depende de
-/// algo que este código no controla: de cómo esté escrito el plugin.**
+/// The dump socket has a kernel buffer of about 208 KiB
+/// (`net.core.wmem_default`). If the engine starts before the storage is in
+/// place, it writes into a socket nobody is going to drain yet and blocks on its
+/// `write` as soon as that buffer fills up. **What happens next depends on
+/// something this code does not control: on how the plugin is written.**
 ///
-/// Se probó a invertir el orden y los tests de `tests/backup_mock.rs` siguen
-/// pasando, incluso metiendo tres segundos de retardo entre las dos llamadas:
-/// con plugins como el mock —cuyo `Dump` devuelve las cabeceras del RPC de
-/// inmediato y hace el trabajo en una tarea aparte— el motor no se cuelga, solo
-/// se queda parado en su `write` hasta que el núcleo llega al `accept` y el
-/// pipeline empieza a drenar. Que aquí no se vea no significa que dé igual:
+/// Reversing the order was tried and the tests in `tests/backup_mock.rs` still
+/// pass, even inserting three seconds of delay between the two calls: with
+/// plugins like the mock —whose `Dump` returns the RPC headers immediately and
+/// does the work in a separate task— the engine does not hang, it just stalls on
+/// its `write` until the core reaches the `accept` and the pipeline starts
+/// draining. That it does not show up here does not mean it does not matter:
 ///
-/// * Un plugin cuyo `Dump` escriba **antes** de devolver la respuesta del RPC
-///   —el protocolo no lo prohíbe— nunca contestaría, y `Dump` primero
-///   significaría que `Put` no llega a llamarse jamás. Eso sí es el bloqueo, y
-///   solo lo corta el plazo de apertura de `ops::canal`.
-/// * Con `Dump` primero, un `Put` que falle —clave inválida, destino caído—
-///   deja detrás un motor ya lanzado, escribiendo contra un socket que se va a
-///   cerrar debajo. Poner `Put` delante hace que ese fallo ocurra antes de
-///   haber movido un solo byte.
+/// * A plugin whose `Dump` writes **before** returning the RPC response —the
+///   protocol does not forbid it— would never answer, and `Dump` first would
+///   mean `Put` never gets called at all. That really is the hang, and only the
+///   open deadline in `ops::channel` cuts it short.
+/// * With `Dump` first, a `Put` that fails —invalid key, storage down— leaves
+///   behind an engine already launched, writing into a socket that is about to
+///   be closed under it. Putting `Put` first makes that failure happen before a
+///   single byte has been moved.
 ///
-/// La regla que hay debajo es la que vale la pena recordar: **el consumidor se
-/// coloca antes que el productor**, siempre. Es gratis y quita de en medio una
-/// clase entera de cuelgues que, por definición, no se manifiestan en las
-/// pruebas donde todo va bien.
+/// The underlying rule is the one worth remembering: **the consumer is placed
+/// before the producer**, always. It is free and it removes a whole class of
+/// hangs that, by definition, do not show up in tests where everything goes
+/// well.
 ///
 /// # Errors
-/// Devuelve [`BackupError`] si algún plugin no tiene la capacidad que se le
-/// pide, si no se conecta a su canal de datos dentro del plazo, si la
-/// transferencia se rompe o si falla el pipeline.
-pub async fn ejecutar_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, BackupError> {
-    // 1. Antes de nada: que cada plugin sepa hacer el papel que se le asigna.
-    //    Descubrirlo aquí cuesta una comparación de cadenas; descubrirlo a
-    //    mitad del volcado cuesta el volcado.
-    req.engine.exigir_capacidad(Capacidad::Engine)?;
-    req.storage.exigir_capacidad(Capacidad::Storage)?;
+/// Returns [`BackupError`] if some plugin lacks the capability it is asked for,
+/// if it does not connect to its data channel within the deadline, if the
+/// transfer breaks or if the pipeline fails.
+pub async fn run_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, BackupError> {
+    // 1. First of all: that each plugin can play the role it is assigned.
+    //    Finding out here costs a string comparison; finding out halfway through
+    //    the dump costs the dump.
+    req.engine.require_capability(Capability::Engine)?;
+    req.storage.require_capability(Capability::Storage)?;
 
-    // 2. Un canal por plugin, cada uno dentro del directorio de ejecución de su
-    //    dueño: es el único sitio al que ese proceso tiene acceso garantizado.
-    let canal_volcado = crear_canal(req.engine)?;
-    let canal_subida = crear_canal(req.storage)?;
+    // 2. One channel per plugin, each inside the runtime directory of its owner:
+    //    it is the only place that process is guaranteed to have access to.
+    let dump_channel = create_channel(req.engine)?;
+    let upload_channel = create_channel(req.storage)?;
 
-    // 3 y 4. EL CONSUMIDOR PRIMERO. Ver la nota de arriba antes de tocar esto.
-    let subida = iniciar_put(req.storage, &req.artifact_key, &canal_subida).await?;
-    let volcado = iniciar_dump(req.engine, &canal_volcado).await?;
+    // 3 and 4. THE CONSUMER FIRST. See the note above before touching this.
+    let upload = start_put(req.storage, &req.artifact_key, &upload_channel).await?;
+    let dump = start_dump(req.engine, &dump_channel).await?;
 
-    // 6. Ambos plugins tienen ya su orden; ahora deben aparecer por el socket.
-    let fuente = aceptar(&canal_volcado, req.engine.nombre(), OP_DUMP).await?;
-    let sumidero = aceptar(&canal_subida, req.storage.nombre(), OP_PUT).await?;
+    // 6. Both plugins now have their orders; now they must show up on the
+    //    socket.
+    let source = accept(&dump_channel, req.engine.name(), OP_DUMP).await?;
+    let sink = accept(&upload_channel, req.storage.name(), OP_PUT).await?;
 
-    // 7. El núcleo no es más que el tramo de tubería entre los dos sockets.
-    let recipiente = req.recipient.to_string();
+    // 7. The core is nothing more than the stretch of pipe between the two
+    //    sockets.
+    let recipient = req.recipient.to_string();
     let summary = sb_crypto::backup(
-        fuente,
-        sumidero,
+        source,
+        sink,
         &BackupOptions {
             recipient: req.recipient,
             level: req.level,
@@ -134,21 +137,22 @@ pub async fn ejecutar_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, Ba
     )
     .await?;
 
-    // 8. El pipeline ha terminado, pero los plugins no tienen por qué: el
-    //    destino aún puede estar cerrando su fichero. Sin esperar aquí, el
-    //    manifiesto podría describir un artefacto que todavía no está entero.
-    esperar_progreso(volcado, req.engine.nombre(), OP_DUMP).await?;
-    esperar_progreso(subida, req.storage.nombre(), OP_PUT).await?;
+    // 8. The pipeline has finished, but the plugins have not necessarily: the
+    //    storage may still be closing its file. Without waiting here, the
+    //    manifest could describe an artifact that is not complete yet.
+    wait_for_progress(dump, req.engine.name(), OP_DUMP).await?;
+    wait_for_progress(upload, req.storage.name(), OP_PUT).await?;
 
-    // 9. El manifiesto sube por el mismo camino que el artefacto —otro canal,
-    //    otro `Put`—. Un segundo camino (un RPC aparte que escribiera el JSON)
-    //    sería más corto, pero permitiría que artefacto y manifiesto acabaran
-    //    en sitios distintos o con permisos distintos sin que nadie lo notase.
-    let manifiesto = Manifest {
+    // 9. The manifest goes up the same way as the artifact —another channel,
+    //    another `Put`—. A second path (a separate RPC that wrote the JSON)
+    //    would be shorter, but it would allow the artifact and the manifest to
+    //    end up in different places or with different permissions without anyone
+    //    noticing.
+    let manifest = Manifest {
         version: MANIFEST_VERSION,
         target: req.target,
         engine: EngineInfo {
-            plugin: req.engine.nombre().to_string(),
+            plugin: req.engine.name().to_string(),
             plugin_version: req.engine_version,
             server_version: req.server_version,
         },
@@ -159,26 +163,26 @@ pub async fn ejecutar_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, Ba
         plaintext_sha256: summary.plaintext_sha256.to_hex(),
         ciphertext_sha256: summary.ciphertext_sha256.to_hex(),
         compression: CompressionInfo {
-            algorithm: ALGORITMO_COMPRESION.to_string(),
+            algorithm: COMPRESSION_ALGORITHM.to_string(),
             level: req.level.get(),
         },
         encryption: EncryptionInfo {
-            algorithm: ALGORITMO_CIFRADO.to_string(),
-            recipient: recipiente,
+            algorithm: ENCRYPTION_ALGORITHM.to_string(),
+            recipient,
         },
     };
-    subir_blob(
+    upload_blob(
         req.storage,
-        &manifiesto.manifest_key(),
-        manifiesto.to_json()?.as_bytes(),
+        &manifest.manifest_key(),
+        manifest.to_json()?.as_bytes(),
     )
     .await?;
 
     tracing::info!(
-        clave = %req.artifact_key,
+        key = %req.artifact_key,
         plaintext = summary.plaintext_bytes,
         ciphertext = summary.ciphertext_bytes,
-        "backup completado"
+        "backup completed"
     );
 
     Ok(BackupOutcome {

@@ -11,7 +11,7 @@
 //! artefacto que no cuadra no interrumpe al siguiente: el informe tiene que
 //! decir cuántos pasaron, no cuál fue el primero que falló.
 
-use sb_core::ops::verify::ejecutar_verify;
+use sb_core::ops::verify::run_verify;
 use sb_core::plugin::PluginClient;
 
 use crate::artifacts;
@@ -81,7 +81,7 @@ pub async fn ejecutar(
 async fn comprobar(destino: &PluginClient, claves: Vec<String>) -> Vec<Veredicto> {
     let mut veredictos = Vec::with_capacity(claves.len());
     for clave in claves {
-        veredictos.push(match ejecutar_verify(destino, &clave).await {
+        veredictos.push(match run_verify(destino, &clave).await {
             Ok(salida) if salida.ok => Veredicto {
                 clave,
                 ok: true,
@@ -92,7 +92,7 @@ async fn comprobar(destino: &PluginClient, claves: Vec<String>) -> Vec<Veredicto
                 ok: false,
                 detalle: format!(
                     "el manifiesto esperaba sha256 {} y el destino sirvió {} ({} bytes)",
-                    salida.digest_esperado, salida.digest_obtenido, salida.bytes
+                    salida.expected_digest, salida.actual_digest, salida.bytes
                 ),
             },
             // No poder emitir un veredicto es un veredicto negativo: un

@@ -13,7 +13,7 @@
 
 use sb_config::Target;
 use sb_core::naming::{NamingContext, render};
-use sb_core::ops::backup::{BackupRequest, ejecutar_backup};
+use sb_core::ops::backup::{BackupRequest, run_backup};
 use sb_crypto::{CompressionLevel, Recipient};
 use time::OffsetDateTime;
 
@@ -142,7 +142,7 @@ async fn ejecutar_con(
     let version_plugin = motor.info().await?.version;
     let version_servidor = motor.preflight().await?.server_version;
 
-    let salida = ejecutar_backup(BackupRequest {
+    let salida = run_backup(BackupRequest {
         target: target.name.clone(),
         engine: motor,
         storage: destino,

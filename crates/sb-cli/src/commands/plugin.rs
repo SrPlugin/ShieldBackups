@@ -150,7 +150,7 @@ pub fn lock(ctx: &Contexto) -> Result<Informe, CliError> {
     let mut lockfile = Lockfile::load(&ctx.ruta_lockfile)?;
     let mut registrados = Vec::with_capacity(binarios.len());
     for (nombre, ruta) in &binarios {
-        lockfile.registrar(nombre, ruta)?;
+        lockfile.register(nombre, ruta)?;
         registrados.push(nombre.clone());
     }
 
@@ -221,16 +221,16 @@ fn inventario(ctx: &Contexto) -> Result<(Vec<(String, Estado)>, Lockfile), CliEr
     let mut estados: Vec<(String, Estado)> = binarios
         .iter()
         .map(|(nombre, ruta)| {
-            let estado = match lockfile.verificar(nombre, ruta) {
+            let estado = match lockfile.verify(nombre, ruta) {
                 Ok(()) => Estado::Registrado,
-                Err(LockfileError::NoRegistrado { .. }) => Estado::SinRegistrar,
+                Err(LockfileError::NotRegistered { .. }) => Estado::SinRegistrar,
                 Err(_) => Estado::Alterado,
             };
             (nombre.clone(), estado)
         })
         .collect();
 
-    for registrado in lockfile.nombres() {
+    for registrado in lockfile.names() {
         if !binarios.iter().any(|(nombre, _)| nombre == &registrado) {
             estados.push((registrado, Estado::Ausente));
         }

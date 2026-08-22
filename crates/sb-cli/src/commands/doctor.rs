@@ -14,7 +14,7 @@
 //! está en el fichero y no en ningún plugin.
 
 use sb_config::Target;
-use sb_core::ops::doctor::{CheckResult, DoctorReport, ejecutar_doctor};
+use sb_core::ops::doctor::{CheckResult, DoctorReport, run_doctor};
 use sb_core::plugin::PluginClient;
 use sb_crypto::Recipient;
 
@@ -60,7 +60,7 @@ async fn diagnosticar(ctx: &Contexto, target: &Target) -> DoctorReport {
     let destino = arrancar(ctx, target, Papel::Destino, &mut checks).await;
 
     if let (Some(motor), Some(destino)) = (&motor, &destino) {
-        checks.extend(ejecutar_doctor(&target.name, motor, destino).await.checks);
+        checks.extend(run_doctor(&target.name, motor, destino).await.checks);
     }
 
     if let Some(motor) = motor {
@@ -87,11 +87,11 @@ async fn arrancar(
         Ok(cliente) => Some(cliente),
         Err(fuente) => {
             checks.push(CheckResult {
-                origen: papel.seccion().to_owned(),
-                nombre: "arranque".to_owned(),
+                origin: papel.seccion().to_owned(),
+                name: "arranque".to_owned(),
                 ok: false,
-                detalle: fuente.to_string(),
-                remedio: "el diagnóstico del plugin no se pudo hacer porque el plugin no llegó a \
+                detail: fuente.to_string(),
+                remedy: "el diagnóstico del plugin no se pudo hacer porque el plugin no llegó a \
                           arrancar: arregla esto primero"
                     .to_owned(),
             });
@@ -105,23 +105,23 @@ async fn arrancar(
 fn comprobar_recipient(target: &Target) -> CheckResult {
     match Recipient::parse(&target.recipient) {
         Ok(_) => CheckResult {
-            origen: ORIGEN_CONFIG.to_owned(),
-            nombre: "recipient".to_owned(),
+            origin: ORIGEN_CONFIG.to_owned(),
+            name: "recipient".to_owned(),
             ok: true,
             // Se muestra la clave **pública**: no es un secreto, y verla es la
             // única forma de notar que es la de otro sistema.
-            detalle: target.recipient.clone(),
-            remedio: String::new(),
+            detail: target.recipient.clone(),
+            remedy: String::new(),
         },
         Err(fuente) => CheckResult {
-            origen: ORIGEN_CONFIG.to_owned(),
-            nombre: "recipient".to_owned(),
+            origin: ORIGEN_CONFIG.to_owned(),
+            name: "recipient".to_owned(),
             ok: false,
-            detalle: format!(
+            detail: format!(
                 "«{}» no es una clave age válida: {fuente}",
                 target.recipient
             ),
-            remedio: format!(
+            remedy: format!(
                 "corrige `recipient` en el target «{}»: tiene que ser la clave pública `age1…` \
                  que imprimió `age-keygen`. Con una clave inválida el backup no se puede cifrar, \
                  y con la clave equivocada no se podrá descifrar nunca",
@@ -149,10 +149,10 @@ fn componer(informes: &[DoctorReport], con_fallos: usize) -> Informe {
             let marca = if check.ok { "  ok " } else { "  ✗  " };
             lineas.push(format!(
                 "{marca}[{}] {}: {}",
-                check.origen, check.nombre, check.detalle
+                check.origin, check.name, check.detail
             ));
-            if !check.ok && !check.remedio.is_empty() {
-                lineas.push(format!("       remedio: {}", check.remedio));
+            if !check.ok && !check.remedy.is_empty() {
+                lineas.push(format!("       remedio: {}", check.remedy));
             }
         }
 
@@ -161,11 +161,11 @@ fn componer(informes: &[DoctorReport], con_fallos: usize) -> Informe {
             "ok": informe.ok(),
             "server_version": informe.server_version(),
             "checks": informe.checks.iter().map(|c| serde_json::json!({
-                "origen": c.origen,
-                "nombre": c.nombre,
+                "origen": c.origin,
+                "nombre": c.name,
                 "ok": c.ok,
-                "detalle": c.detalle,
-                "remedio": c.remedio,
+                "detalle": c.detail,
+                "remedio": c.remedy,
             })).collect::<Vec<_>>(),
         }));
     }
@@ -186,9 +186,9 @@ fn detalle_de_fallos(informes: &[DoctorReport]) -> String {
         .iter()
         .filter(|i| !i.ok())
         .flat_map(|i| {
-            i.fallos()
+            i.failures()
                 .into_iter()
-                .map(move |c| format!("  {} [{}] {}: {}", i.target, c.origen, c.nombre, c.detalle))
+                .map(move |c| format!("  {} [{}] {}: {}", i.target, c.origin, c.name, c.detail))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -215,9 +215,9 @@ mod tests {
     fn una_clave_publica_valida_pasa_la_comprobacion() {
         let publica = sb_crypto::Identity::generate().to_recipient().to_string();
         let check = comprobar_recipient(&target_con(&publica));
-        assert!(check.ok, "{}", check.detalle);
-        assert_eq!(check.origen, ORIGEN_CONFIG);
-        assert_eq!(check.nombre, "recipient");
+        assert!(check.ok, "{}", check.detail);
+        assert_eq!(check.origin, ORIGEN_CONFIG);
+        assert_eq!(check.name, "recipient");
     }
 
     #[test]
@@ -227,13 +227,13 @@ mod tests {
         // hay nada que hacer.
         let check = comprobar_recipient(&target_con("age1esto-no-es-una-clave"));
         assert!(!check.ok);
-        assert_eq!(check.origen, ORIGEN_CONFIG);
+        assert_eq!(check.origin, ORIGEN_CONFIG);
         assert!(
-            check.remedio.contains("age-keygen"),
+            check.remedy.contains("age-keygen"),
             "un check que falla sin decir qué hacer no sirve: {}",
-            check.remedio
+            check.remedy
         );
-        assert!(check.detalle.contains("age1esto-no-es-una-clave"));
+        assert!(check.detail.contains("age1esto-no-es-una-clave"));
     }
 
     #[test]
@@ -250,11 +250,11 @@ mod tests {
             checks: vec![
                 comprobar_recipient(&target_con("no vale")),
                 CheckResult {
-                    origen: "storage".into(),
-                    nombre: "bucket".into(),
+                    origin: "storage".into(),
+                    name: "bucket".into(),
                     ok: true,
-                    detalle: "existe".into(),
-                    remedio: String::new(),
+                    detail: "existe".into(),
+                    remedy: String::new(),
                 },
             ],
         };

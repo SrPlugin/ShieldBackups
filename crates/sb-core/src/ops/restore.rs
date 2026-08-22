@@ -1,151 +1,149 @@
-//! La operación de restore: destino → núcleo → motor, el backup del revés.
+//! The restore operation: storage → core → engine, the backup in reverse.
 //!
 //! ```text
-//! plugin-destino ──[socket datos]──▶ núcleo ──[socket datos]──▶ plugin-motor
-//!                             SHA-256 → age⁻¹ → zstd⁻¹
+//! storage-plugin ──[data socket]──▶ core ──[data socket]──▶ engine-plugin
+//!                          SHA-256 → age⁻¹ → zstd⁻¹
 //! ```
 //!
-//! Igual que en el backup, los bytes cruzan **dos veces** el límite de proceso
-//! sin materializarse enteros en ningún sitio.
+//! Just as in the backup, the bytes cross the process boundary **twice** without
+//! being materialized whole anywhere.
 //!
-//! # El orden de las llamadas
+//! # The order of the calls
 //!
-//! Aquí el consumidor es el **motor** —es quien recibe el volcado—, así que se
-//! llama a `Engine.Restore` **antes** que a `Storage.Get`. Es la misma regla
-//! que en [`crate::ops::backup::ejecutar_backup`], cuyo doc-comment tiene el
-//! razonamiento medido: el consumidor se coloca antes que el productor.
+//! Here the consumer is the **engine** —it is the one receiving the dump—, so
+//! `Engine.Restore` is called **before** `Storage.Get`. It is the same rule as in
+//! [`crate::ops::backup::run_backup`], whose doc comment carries the measured
+//! reasoning: the consumer is placed before the producer.
 
 use sb_crypto::{Digest, Identity, RestoreOptions};
 use tokio::io::AsyncWriteExt as _;
 
-use crate::ops::canal::{
-    BackupError, OP_GET, OP_RESTORE, aceptar, crear_canal, esperar_progreso, iniciar_get,
-    iniciar_restore,
+use crate::ops::channel::{
+    BackupError, OP_GET, OP_RESTORE, accept, create_channel, start_get, start_restore,
+    wait_for_progress,
 };
-use crate::plugin::{Capacidad, PluginClient};
+use crate::plugin::{Capability, PluginClient};
 
-/// Todo lo que hace falta para una restauración, ya resuelto.
+/// Everything a restore needs, already resolved.
 ///
-/// Los plugins llegan **arrancados y configurados**, como en el backup: esta
-/// operación no elige plugin ni resuelve configuración, solo los pone a hablar.
+/// The plugins arrive **started and configured**, as in the backup: this
+/// operation does not choose a plugin nor resolve configuration, it only makes
+/// them talk.
 pub struct RestoreRequest<'a> {
     pub engine: &'a PluginClient,
     pub storage: &'a PluginClient,
     pub artifact_key: String,
-    /// La clave privada. Sin ella no hay restauración posible: es justo lo que
-    /// `verify` **no** necesita.
+    /// The private key. Without it no restore is possible: it is exactly what
+    /// `verify` does **not** need.
     pub identity: &'a Identity,
-    /// El digest que el manifiesto dice que debe tener el artefacto.
+    /// The digest the manifest says the artifact must have.
     ///
-    /// Es opcional porque el manifiesto puede no estar —o quien llama puede
-    /// haberlo comprobado ya con `verify`—, pero omitirlo renuncia a detectar
-    /// que el destino sirvió un artefacto **distinto** del que se pidió. El AEAD
-    /// de age no cubre ese caso: un artefacto ajeno bien formado y dirigido a la
-    /// misma identidad se descifraría sin protestar.
+    /// It is optional because the manifest may be missing —or the caller may
+    /// already have checked it with `verify`—, but omitting it gives up on
+    /// detecting that the storage served a **different** artifact from the one
+    /// requested. age's AEAD does not cover that case: a well-formed foreign
+    /// artifact addressed to the same identity would decrypt without complaint.
     pub expected_ciphertext_sha256: Option<Digest>,
 }
 
-/// Descarga el artefacto, lo verifica, lo descifra, lo descomprime y se lo
-/// entrega al motor.
+/// Downloads the artifact, verifies it, decrypts it, decompresses it and hands
+/// it to the engine.
 ///
-/// Devuelve los bytes de plaintext entregados.
+/// Returns the plaintext bytes delivered.
 ///
-/// # Advertencia: un error puede dejar plaintext parcial en el motor
+/// # Warning: an error may leave partial plaintext in the engine
 ///
-/// age entrega los bloques AEAD **ya verificados** de forma incremental, así
-/// que ante un artefacto truncado la lectura falla después de haber escrito
-/// todo lo que venía antes del corte: plaintext legítimo, pero parcial (se
-/// midieron 65 536 bytes). Lo mismo vale, y peor, para
-/// [`RestoreRequest::expected_ciphertext_sha256`]: el digest solo se puede
-/// comprobar cuando ya se ha leído el flujo entero, es decir, cuando el motor
-/// ya lo ha recibido todo.
+/// age delivers the AEAD blocks **already verified** incrementally, so with a
+/// truncated artifact the read fails after having written everything that came
+/// before the cut: legitimate plaintext, but partial (65,536 bytes were
+/// measured). The same applies, and worse, to
+/// [`RestoreRequest::expected_ciphertext_sha256`]: the digest can only be checked
+/// once the whole stream has been read, that is, once the engine has already
+/// received everything.
 ///
-/// El núcleo hace aquí lo único que puede hacer: **no** cerrar ordenadamente el
-/// canal del motor cuando algo falla —el motor ve el corte, no un fin de flujo
-/// normal—, abandonar las transferencias y devolver error sin esperar a que los
-/// plugins digan que terminaron bien.
+/// The core does here the only thing it can do: **not** close the engine's
+/// channel in an orderly fashion when something fails —the engine sees the cut,
+/// not a normal end of stream—, abandon the transfers and return an error
+/// without waiting for the plugins to say they finished well.
 ///
-/// Eso no basta, y conviene decirlo claro: **descartar lo escrito es
-/// responsabilidad del motor**, porque es el único que sabe qué significa
-/// deshacerlo. En la Fase 1 la defensa concreta es que `pg_restore` corre con
-/// `--single-transaction`, de modo que un volcado a medias no se confirma. Es
-/// una defensa **del plugin**, no del núcleo: un motor futuro que escriba
-/// ficheros directamente tendrá que traer la suya.
+/// That is not enough, and it is worth saying it plainly: **discarding what was
+/// written is the engine's responsibility**, because it is the only one that
+/// knows what undoing it means. In Phase 1 the concrete defence is that
+/// `pg_restore` runs with `--single-transaction`, so a half-finished dump is
+/// never committed. That is a defence **of the plugin**, not of the core: a
+/// future engine that writes files directly will have to bring its own.
 ///
 /// # Errors
-/// Devuelve [`BackupError`] si algún plugin no tiene la capacidad que se le
-/// pide, si no se conecta a su canal de datos dentro del plazo, si la
-/// transferencia se rompe, si el artefacto no está dirigido a `identity`, si
-/// está corrupto o truncado, o si su digest no es el esperado.
-pub async fn ejecutar_restore(req: RestoreRequest<'_>) -> Result<u64, BackupError> {
-    // 1. Antes de nada: que cada plugin sepa hacer el papel que se le asigna.
-    //    Descubrirlo aquí cuesta una comparación de cadenas; descubrirlo a
-    //    mitad de la restauración cuesta la base de datos a medio escribir.
-    req.engine.exigir_capacidad(Capacidad::Engine)?;
-    req.storage.exigir_capacidad(Capacidad::Storage)?;
+/// Returns [`BackupError`] if some plugin lacks the capability it is asked for,
+/// if it does not connect to its data channel within the deadline, if the
+/// transfer breaks, if the artifact is not addressed to `identity`, if it is
+/// corrupt or truncated, or if its digest is not the expected one.
+pub async fn run_restore(req: RestoreRequest<'_>) -> Result<u64, BackupError> {
+    // 1. First of all: that each plugin can play the role it is assigned.
+    //    Finding out here costs a string comparison; finding out halfway through
+    //    the restore costs a half-written database.
+    req.engine.require_capability(Capability::Engine)?;
+    req.storage.require_capability(Capability::Storage)?;
 
-    // 2. Un canal por plugin, cada uno dentro del directorio de ejecución de su
-    //    dueño: es el único sitio al que ese proceso tiene acceso garantizado.
-    let canal_motor = crear_canal(req.engine)?;
-    let canal_descarga = crear_canal(req.storage)?;
+    // 2. One channel per plugin, each inside the runtime directory of its owner:
+    //    it is the only place that process is guaranteed to have access to.
+    let engine_channel = create_channel(req.engine)?;
+    let download_channel = create_channel(req.storage)?;
 
-    // 3 y 4. EL CONSUMIDOR PRIMERO, que aquí es el motor. La razón, medida,
-    //    está en el doc-comment de `ejecutar_backup`.
-    let escritura = iniciar_restore(req.engine, &canal_motor).await?;
-    let descarga = iniciar_get(req.storage, &req.artifact_key, &canal_descarga).await?;
+    // 3 and 4. THE CONSUMER FIRST, which here is the engine. The measured reason
+    //    is in the doc comment of `run_backup`.
+    let write = start_restore(req.engine, &engine_channel).await?;
+    let download = start_get(req.storage, &req.artifact_key, &download_channel).await?;
 
-    // 5. Ambos plugins tienen ya su orden; ahora deben aparecer por el socket.
-    let fuente = aceptar(&canal_descarga, req.storage.nombre(), OP_GET).await?;
-    let mut sumidero = aceptar(&canal_motor, req.engine.nombre(), OP_RESTORE).await?;
+    // 5. Both plugins now have their orders; now they must show up on the
+    //    socket.
+    let source = accept(&download_channel, req.storage.name(), OP_GET).await?;
+    let mut sink = accept(&engine_channel, req.engine.name(), OP_RESTORE).await?;
 
-    // 6. El núcleo no es más que el tramo de tubería entre los dos sockets.
-    //    El sumidero se presta en vez de cederse: hace falta conservarlo para
-    //    decidir **cómo** se cierra, que es lo único que distingue un volcado
-    //    completo de uno cortado a mitad.
-    let opciones = RestoreOptions {
+    // 6. The core is nothing more than the stretch of pipe between the two
+    //    sockets. The sink is lent instead of being given away: it has to be
+    //    kept in order to decide **how** it is closed, which is the only thing
+    //    that tells a complete dump apart from one cut halfway.
+    let options = RestoreOptions {
         identity: req.identity,
         expected_ciphertext_sha256: req.expected_ciphertext_sha256,
     };
-    let escritos = match sb_crypto::restore(fuente, &mut sumidero, &opciones).await {
-        Ok(escritos) => escritos,
-        Err(fallo) => {
-            // El motor puede tener ya plaintext parcial. Se le corta el canal
-            // sin el `shutdown` ordenado y se abandonan ambas transferencias:
-            // lo que no puede pasar es que esto devuelva `Ok`.
-            escritura.abort();
-            descarga.abort();
-            drop(sumidero);
+    let written = match sb_crypto::restore(source, &mut sink, &options).await {
+        Ok(written) => written,
+        Err(failure) => {
+            // The engine may already hold partial plaintext. Its channel is cut
+            // without the orderly `shutdown` and both transfers are abandoned:
+            // what cannot happen is that this returns `Ok`.
+            write.abort();
+            download.abort();
+            drop(sink);
             tracing::error!(
-                clave = %req.artifact_key,
-                error = %fallo,
-                "restauración abortada: el motor puede haber recibido datos incompletos"
+                key = %req.artifact_key,
+                error = %failure,
+                "restore aborted: the engine may have received incomplete data"
             );
-            return Err(fallo.into());
+            return Err(failure.into());
         }
     };
 
-    // 7. El cierre del lado de escritura es lo que el motor ve como fin de
-    //    flujo, y por tanto como «esto está entero». Solo se hace cuando de
-    //    verdad lo está.
-    sumidero
-        .shutdown()
-        .await
-        .map_err(|fuente| BackupError::Io {
-            plugin: req.engine.nombre().to_string(),
-            fuente,
-        })?;
+    // 7. Closing the write side is what the engine sees as end of stream, and
+    //    therefore as "this is complete". It is only done when it really is.
+    sink.shutdown().await.map_err(|source| BackupError::Io {
+        plugin: req.engine.name().to_string(),
+        source,
+    })?;
 
-    // 8. El pipeline ha terminado, pero los plugins no tienen por qué: el motor
-    //    aún puede estar cerrando lo suyo. Sin esperar aquí, un restore podría
-    //    darse por bueno mientras el motor todavía está a medias.
-    esperar_progreso(escritura, req.engine.nombre(), OP_RESTORE).await?;
-    esperar_progreso(descarga, req.storage.nombre(), OP_GET).await?;
+    // 8. The pipeline has finished, but the plugins have not necessarily: the
+    //    engine may still be closing its own work. Without waiting here, a
+    //    restore could be taken as good while the engine is still halfway.
+    wait_for_progress(write, req.engine.name(), OP_RESTORE).await?;
+    wait_for_progress(download, req.storage.name(), OP_GET).await?;
 
     tracing::info!(
-        clave = %req.artifact_key,
-        plaintext = escritos,
-        "restauración completada"
+        key = %req.artifact_key,
+        plaintext = written,
+        "restore completed"
     );
 
-    Ok(escritos)
+    Ok(written)
 }

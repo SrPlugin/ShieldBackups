@@ -187,9 +187,9 @@ mod tests {
 
     #[test]
     fn un_lockfile_que_no_cuadra_es_un_error_de_plugin_y_conserva_su_remedio() {
-        let error = CliError::from(LockfileError::NoRegistrado {
-            nombre: "postgres".into(),
-            ruta: "/opt/sb-plugin-postgres".into(),
+        let error = CliError::from(LockfileError::NotRegistered {
+            name: "postgres".into(),
+            path: "/opt/sb-plugin-postgres".into(),
         });
         assert_eq!(error.codigo(), CODIGO_PLUGIN);
         assert!(

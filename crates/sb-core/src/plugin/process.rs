@@ -1,24 +1,24 @@
-//! Arranque y ciclo de vida de un plugin como proceso hijo.
+//! Startup and lifecycle of a plugin as a child process.
 //!
-//! El núcleo lanza cada plugin como un proceso aparte, le entrega por stdin el
-//! sobre con el material TLS de la sesión y espera su anuncio por stdout. A
-//! partir de ahí el plugin escucha en un socket Unix con mTLS y el núcleo le
-//! habla por gRPC.
+//! The core launches every plugin as a separate process, hands it on stdin the
+//! envelope with the session's TLS material and waits for its announcement on
+//! stdout. From then on the plugin listens on a Unix socket with mTLS and the
+//! core talks to it over gRPC.
 //!
-//! Este módulo es el lado del núcleo de ese arranque, y es donde se
-//! materializan tres garantías que no son higiene sino seguridad:
+//! This module is the core's side of that startup, and it is where three
+//! guarantees that are not hygiene but security take shape:
 //!
-//! * **El hijo no hereda el entorno del núcleo.** Si el núcleo tiene
-//!   `PGPASSWORD` o `AWS_SECRET_ACCESS_KEY` en su entorno, un plugin que las
-//!   heredara tendría credenciales que nadie le dio —y el entorno de un
-//!   proceso es legible en `/proc/<pid>/environ` por cualquiera que pueda
-//!   leerlo—.
-//! * **El plugin vive en su propio grupo de procesos.** El plugin de
-//!   `PostgreSQL` lanzará `pg_dump` como nieto del núcleo; matar solo al plugin
-//!   dejaría a `pg_dump` huérfano, consumiendo recursos del servidor de base
-//!   de datos y con una transacción abierta.
-//! * **La limpieza está garantizada.** Un proceso huérfano conserva en memoria
-//!   el material criptográfico de la sesión.
+//! * **The child does not inherit the core's environment.** If the core has
+//!   `PGPASSWORD` or `AWS_SECRET_ACCESS_KEY` in its environment, a plugin that
+//!   inherited them would hold credentials nobody gave it —and a process's
+//!   environment is readable in `/proc/<pid>/environ` by anyone who can read
+//!   it—.
+//! * **The plugin lives in its own process group.** The `PostgreSQL` plugin will
+//!   launch `pg_dump` as a grandchild of the core; killing only the plugin would
+//!   leave `pg_dump` orphaned, consuming resources of the database server and
+//!   with an open transaction.
+//! * **Cleanup is guaranteed.** An orphaned process keeps the session's
+//!   cryptographic material in memory.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,456 +33,457 @@ use sb_transport::{Bootstrap, EphemeralPki, HandshakeError, PkiError, READY_TIME
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
-/// Las únicas variables de entorno que un plugin recibe del núcleo.
+/// The only environment variables a plugin receives from the core.
 ///
-/// La lista es corta a propósito: es más fácil razonar sobre lo que se deja
-/// pasar que sobre lo que se filtra. `PATH` porque un plugin necesita
-/// encontrar las herramientas que envuelve (`pg_dump`, `mysqldump`), `HOME` y
-/// `TMPDIR` porque muchas bibliotecas las dan por hechas, y `LANG`/`TZ` porque
-/// sin ellas las fechas y los mensajes salen en otro idioma que el operador no
-/// espera.
-const VARIABLES_HEREDADAS: [&str; 5] = ["PATH", "HOME", "TMPDIR", "LANG", "TZ"];
+/// The list is deliberately short: it is easier to reason about what is let
+/// through than about what is filtered out. `PATH` because a plugin needs to
+/// find the tools it wraps (`pg_dump`, `mysqldump`), `HOME` and `TMPDIR` because
+/// many libraries take them for granted, and `LANG`/`TZ` because without them
+/// dates and messages come out in another language than the operator expects.
+const INHERITED_VARIABLES: [&str; 5] = ["PATH", "HOME", "TMPDIR", "LANG", "TZ"];
 
-/// `PATH` que se usa si el núcleo no tenía ninguno.
+/// `PATH` used if the core had none.
 ///
-/// Sin `PATH` un plugin no puede ni ejecutar `pg_dump`. Se prefiere un valor
-/// mínimo y explícito a heredar la ausencia.
-const PATH_POR_DEFECTO: &str = "/usr/local/bin:/usr/bin:/bin";
+/// Without `PATH` a plugin cannot even run `pg_dump`. A minimal, explicit value
+/// is preferred over inheriting the absence.
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
-/// Permisos del directorio donde vive el socket de control.
+/// Permissions of the directory where the control socket lives.
 ///
-/// `0700`: el socket es la puerta de entrada al plugin y quien pueda abrirlo
-/// habla con él. El mTLS lo protege de todas formas, pero dos cerraduras son
-/// mejor que una.
-const MODO_PRIVADO: u32 = 0o700;
+/// `0700`: the socket is the door into the plugin and whoever can open it talks
+/// to it. mTLS protects it anyway, but two locks are better than one.
+const PRIVATE_MODE: u32 = 0o700;
 
-/// Distingue directorios de plugins arrancados por el mismo núcleo.
+/// Distinguishes directories of plugins started by the same core.
 ///
-/// Un backup usa motor y destino a la vez: dos plugins vivos que no pueden
-/// compartir socket. El pid del núcleo separa ejecuciones distintas y este
-/// contador separa los plugins de una misma ejecución.
-static SIGUIENTE: AtomicU64 = AtomicU64::new(0);
+/// A backup uses an engine and a storage at once: two live plugins that cannot
+/// share a socket. The core's pid separates different runs and this counter
+/// separates the plugins of a single run.
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginProcessError {
-    #[error("no se pudo arrancar el plugin «{nombre}» desde {binario}: {fuente}")]
-    NoSePudoArrancar {
-        nombre: String,
-        binario: String,
+    #[error("could not start the plugin \"{name}\" from {binary}: {source}")]
+    SpawnFailed {
+        name: String,
+        binary: String,
         #[source]
-        fuente: std::io::Error,
+        source: std::io::Error,
     },
-    #[error("no se pudo preparar el directorio de ejecución {dir}: {fuente}")]
-    DirectorioDeEjecucion {
+    #[error("could not prepare the runtime directory {dir}: {source}")]
+    RuntimeDirectory {
         dir: String,
         #[source]
-        fuente: std::io::Error,
+        source: std::io::Error,
     },
-    #[error("no se pudo generar el material criptográfico de la sesión: {0}")]
+    #[error("could not generate the session's cryptographic material: {0}")]
     Pki(#[from] PkiError),
-    /// El plugin no llegó a anunciarse: o se quedó callado hasta agotar el
-    /// plazo, o murió sin escribir nada. Se tratan igual a propósito —desde el
-    /// núcleo son el mismo suceso, «este binario no es un plugin que funcione»—
-    /// y la diferencia queda registrada en el log junto al stderr del proceso,
-    /// que es donde sirve para depurar.
-    #[error("el plugin no se anunció dentro del plazo de arranque")]
-    TimeoutHandshake,
-    #[error("el anuncio del plugin no es válido: {0}")]
-    Anuncio(#[from] HandshakeError),
-    #[error("fallo de entrada/salida hablando con el plugin: {0}")]
+    /// The plugin never announced itself: either it stayed silent until the
+    /// deadline expired, or it died without writing anything. They are treated
+    /// the same on purpose —from the core's point of view they are the same
+    /// event, "this binary is not a working plugin"— and the difference is
+    /// recorded in the log next to the process's stderr, which is where it is
+    /// useful for debugging.
+    #[error("the plugin did not announce itself within the startup deadline")]
+    HandshakeTimeout,
+    #[error("the plugin's announcement is not valid: {0}")]
+    Announcement(#[from] HandshakeError),
+    #[error("input/output failure while talking to the plugin: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Un plugin arrancado y anunciado, con su proceso bajo control.
+/// A started and announced plugin, with its process under control.
 ///
-/// Mientras este handle exista, el proceso existe. Cuando se destruye —por
-/// `shutdown` o por `Drop`—, el plugin y todos sus descendientes mueren y su
-/// directorio de ejecución desaparece.
+/// While this handle exists, the process exists. When it is destroyed —by
+/// `shutdown` or by `Drop`—, the plugin and all its descendants die and its
+/// runtime directory disappears.
 pub struct PluginProcess {
-    nombre: String,
+    name: String,
     pid: u32,
     protocol_version: u32,
     capabilities: Vec<String>,
     runtime_dir: PathBuf,
     control_socket: PathBuf,
     pki: EphemeralPki,
-    entorno: BTreeMap<String, String>,
-    /// `None` solo después de `shutdown`, que se lleva el hijo para recogerlo.
-    hijo: Option<Child>,
+    env: BTreeMap<String, String>,
+    /// `None` only after `shutdown`, which takes the child away to reap it.
+    child: Option<Child>,
 }
 
-/// `Debug` escrito a mano y redactado: este struct guarda la PKI de la sesión,
-/// que incluye dos claves privadas. `EphemeralPki` no implementa `Debug` a
-/// propósito, así que aquí se imprime como `<redactado>`: el handle se puede
-/// volcar a un log de depuración del arranque sin que salga nada privado.
+/// `Debug` written by hand and redacted: this struct holds the session's PKI,
+/// which includes two private keys. `EphemeralPki` deliberately does not
+/// implement `Debug`, so here it is printed as `<redacted>`: the handle can be
+/// dumped to a startup debug log without anything private coming out.
 impl fmt::Debug for PluginProcess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PluginProcess")
-            .field("nombre", &self.nombre)
+            .field("name", &self.name)
             .field("pid", &self.pid)
             .field("protocol_version", &self.protocol_version)
             .field("capabilities", &self.capabilities)
             .field("runtime_dir", &self.runtime_dir)
             .field("control_socket", &self.control_socket)
-            .field("pki", &"<redactado>")
-            .field("entorno", &self.entorno)
-            .field("hijo", &self.hijo)
+            .field("pki", &"<redacted>")
+            .field("env", &self.env)
+            .field("child", &self.child)
             .finish()
     }
 }
 
 impl PluginProcess {
-    /// Arranca el binario de un plugin y espera a que se anuncie.
+    /// Starts a plugin's binary and waits for it to announce itself.
     ///
-    /// Genera una PKI efímera para esta sesión, crea un directorio privado
-    /// para el socket de control, lanza el proceso con un entorno mínimo y en
-    /// su propio grupo, le entrega el sobre por stdin y espera su `Ready`.
+    /// It generates an ephemeral PKI for this session, creates a private
+    /// directory for the control socket, launches the process with a minimal
+    /// environment and in its own group, hands it the envelope on stdin and
+    /// waits for its `Ready`.
     ///
-    /// Si algo falla en cualquier punto —incluido el plazo de arranque— el
-    /// proceso se mata **y se recoge**, y el directorio se borra, antes de
-    /// devolver el error: un arranque fallido no puede dejar residuos.
+    /// If anything fails at any point —including the startup deadline— the
+    /// process is killed **and reaped**, and the directory is removed, before
+    /// returning the error: a failed startup cannot leave residue behind.
     ///
     /// # Errors
-    /// Devuelve [`PluginProcessError::NoSePudoArrancar`] si el binario no se
-    /// puede ejecutar, [`PluginProcessError::TimeoutHandshake`] si no se
-    /// anuncia a tiempo, y los errores de PKI, entrada/salida o anuncio
-    /// inválido correspondientes.
-    pub async fn spawn(nombre: &str, binario: &Path) -> Result<Self, PluginProcessError> {
+    /// Returns [`PluginProcessError::SpawnFailed`] if the binary cannot be
+    /// executed, [`PluginProcessError::HandshakeTimeout`] if it does not
+    /// announce itself in time, and the corresponding PKI, input/output or
+    /// invalid-announcement errors.
+    pub async fn spawn(name: &str, binary: &Path) -> Result<Self, PluginProcessError> {
         let pki = EphemeralPki::generate()?;
-        let runtime_dir = crear_directorio_privado()?;
+        let runtime_dir = create_private_dir()?;
         let control_socket = runtime_dir.join("control.sock");
-        let entorno = entorno_minimo();
+        let env = minimal_env();
 
-        let mut hijo = match lanzar(binario, &entorno) {
-            Ok(hijo) => hijo,
-            Err(fuente) => {
-                // El directorio se creó antes de saber que el binario no
-                // existe: no puede quedarse ahí.
-                borrar_directorio(&runtime_dir);
-                return Err(PluginProcessError::NoSePudoArrancar {
-                    nombre: nombre.to_string(),
-                    binario: binario.display().to_string(),
-                    fuente,
+        let mut child = match launch(binary, &env) {
+            Ok(child) => child,
+            Err(source) => {
+                // The directory was created before knowing that the binary does
+                // not exist: it cannot stay there.
+                remove_dir(&runtime_dir);
+                return Err(PluginProcessError::SpawnFailed {
+                    name: name.to_string(),
+                    binary: binary.display().to_string(),
+                    source,
                 });
             }
         };
 
-        // El pid solo está disponible mientras no se haya recogido al hijo, y
-        // se necesita después para matar al grupo entero. Recién lanzado
-        // siempre lo hay; el 0 del caso imposible es inofensivo porque
-        // `matar_al_grupo` lo descarta antes de señalar nada.
-        let pid = hijo.id().unwrap_or_default();
-        let entrada = hijo.stdin.take();
-        let salida = hijo.stdout.take();
-        reemitir_stderr(nombre, hijo.stderr.take());
+        // The pid is only available while the child has not been reaped, and it
+        // is needed later to kill the whole group. Right after launching there
+        // always is one; the 0 of the impossible case is harmless because
+        // `kill_group` discards it before signalling anything.
+        let pid = child.id().unwrap_or_default();
+        let input = child.stdin.take();
+        let output = child.stdout.take();
+        relay_stderr(name, child.stderr.take());
 
-        let sobre = Bootstrap::new(
+        let envelope = Bootstrap::new(
             vec![sb_proto::PROTOCOL_VERSION],
             control_socket.display().to_string(),
             pki.server_bundle(),
         );
 
-        let mut proceso = Self {
-            nombre: nombre.to_string(),
+        let mut process = Self {
+            name: name.to_string(),
             pid,
             protocol_version: 0,
             capabilities: Vec::new(),
             runtime_dir,
             control_socket,
             pki,
-            entorno,
-            hijo: Some(hijo),
+            env,
+            child: Some(child),
         };
 
-        match esperar_anuncio(&sobre, entrada, salida).await {
+        match wait_for_announcement(&envelope, input, output).await {
             Ok(ready) => {
                 tracing::info!(
-                    plugin = %proceso.nombre,
+                    plugin = %process.name,
                     pid,
                     protocol_version = ready.protocol_version,
-                    "plugin arrancado"
+                    "plugin started"
                 );
-                proceso.protocol_version = ready.protocol_version;
-                proceso.capabilities = ready.capabilities;
-                Ok(proceso)
+                process.protocol_version = ready.protocol_version;
+                process.capabilities = ready.capabilities;
+                Ok(process)
             }
             Err(error) => {
-                tracing::warn!(plugin = %proceso.nombre, pid, %error, "el plugin no arrancó");
-                proceso.matar_y_recoger().await;
+                tracing::warn!(plugin = %process.name, pid, %error, "the plugin did not start");
+                process.kill_and_reap().await;
                 Err(error)
             }
         }
     }
 
     #[must_use]
-    pub fn nombre(&self) -> &str {
-        &self.nombre
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Pid del proceso del plugin, que es también el de su grupo.
+    /// Pid of the plugin's process, which is also its group's.
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    /// Versión del protocolo que el plugin declaró hablar.
+    /// Protocol version the plugin declared it speaks.
     #[must_use]
     pub fn protocol_version(&self) -> u32 {
         self.protocol_version
     }
 
-    /// Lo que el plugin dice saber hacer: `engine`, `storage` o ambas.
+    /// What the plugin says it knows how to do: `engine`, `storage` or both.
     #[must_use]
     pub fn capabilities(&self) -> &[String] {
         &self.capabilities
     }
 
-    /// Directorio privado donde vive el socket de control.
+    /// Private directory where the control socket lives.
     #[must_use]
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
     }
 
-    /// Socket por el que se habla gRPC con el plugin.
+    /// Socket over which gRPC is spoken with the plugin.
     #[must_use]
     pub fn control_socket(&self) -> &Path {
         &self.control_socket
     }
 
-    /// PKI de esta sesión: de aquí sale la configuración de cliente con la que
-    /// el núcleo se conecta al canal de control.
+    /// This session's PKI: from here comes the client configuration with which
+    /// the core connects to the control channel.
     #[must_use]
     pub fn pki(&self) -> &EphemeralPki {
         &self.pki
     }
 
-    /// El entorno exacto con el que se lanzó el hijo.
+    /// The exact environment the child was launched with.
     ///
-    /// Se guarda —en vez de deducirlo— para que sea comprobable: lo que este
-    /// mapa no contenga, el plugin no lo tiene.
+    /// It is stored —instead of being inferred— so that it is checkable: what
+    /// this map does not contain, the plugin does not have.
     #[must_use]
-    pub fn entorno_del_hijo(&self) -> &BTreeMap<String, String> {
-        &self.entorno
+    pub fn child_env(&self) -> &BTreeMap<String, String> {
+        &self.env
     }
 
-    /// Cierra el plugin: mata al grupo entero, **recoge** al hijo y borra el
-    /// directorio de ejecución.
+    /// Closes the plugin: kills the whole group, **reaps** the child and removes
+    /// the runtime directory.
     ///
-    /// Recoger al hijo no es opcional: un proceso al que nadie hace `wait`
-    /// queda zombie en la tabla de procesos, y con un backup por hora se
-    /// acumulan.
+    /// Reaping the child is not optional: a process nobody `wait`s on becomes a
+    /// zombie in the process table, and with one backup per hour they pile up.
     ///
     /// # Errors
-    /// Hoy no falla —los fallos de la limpieza se registran y se ignoran,
-    /// porque no hay nada mejor que hacer con ellos—, pero devuelve `Result`
-    /// para que un cierre ordenado por gRPC pueda informar de su fallo sin
-    /// cambiar a todos los que llaman.
+    /// Today it does not fail —cleanup failures are logged and ignored, because
+    /// there is nothing better to do with them—, but it returns a `Result` so
+    /// that an orderly gRPC shutdown can report its failure without changing
+    /// every caller.
     pub async fn shutdown(mut self) -> Result<(), PluginProcessError> {
-        self.matar_y_recoger().await;
+        self.kill_and_reap().await;
         Ok(())
     }
 
-    /// Mata al grupo, recoge al hijo y borra el directorio. Idempotente.
-    async fn matar_y_recoger(&mut self) {
-        matar_al_grupo(self.pid);
-        if let Some(mut hijo) = self.hijo.take() {
-            // Que `start_kill` falle porque ya había muerto no importa: lo que
-            // cuenta es el `wait`.
-            let _ = hijo.start_kill();
-            if let Err(fuente) = hijo.wait().await {
-                tracing::warn!(plugin = %self.nombre, pid = self.pid, %fuente, "no se pudo recoger al plugin");
+    /// Kills the group, reaps the child and removes the directory. Idempotent.
+    async fn kill_and_reap(&mut self) {
+        kill_group(self.pid);
+        if let Some(mut child) = self.child.take() {
+            // That `start_kill` fails because it had already died does not
+            // matter: what counts is the `wait`.
+            let _ = child.start_kill();
+            if let Err(source) = child.wait().await {
+                tracing::warn!(plugin = %self.name, pid = self.pid, %source, "could not reap the plugin");
             }
         }
-        borrar_directorio(&self.runtime_dir);
+        remove_dir(&self.runtime_dir);
     }
 }
 
-/// Red de seguridad ante pánicos y salidas por atajo.
+/// Safety net against panics and shortcut exits.
 ///
-/// En `Drop` no se puede esperar a nada, así que esto es lo mejor que se puede
-/// hacer sin bloquear: la señal al grupo se manda igual —es una llamada al
-/// sistema, no una espera— y la recogida del hijo queda en manos de
-/// `kill_on_drop`, que tokio resuelve en su cola de huérfanos.
+/// In `Drop` nothing can be awaited, so this is the best that can be done
+/// without blocking: the signal to the group is sent all the same —it is a
+/// system call, not a wait— and reaping the child is left to `kill_on_drop`,
+/// which tokio resolves in its orphan queue.
 impl Drop for PluginProcess {
     fn drop(&mut self) {
-        if let Some(mut hijo) = self.hijo.take() {
-            matar_al_grupo(self.pid);
-            let _ = hijo.start_kill();
+        if let Some(mut child) = self.child.take() {
+            kill_group(self.pid);
+            let _ = child.start_kill();
         }
-        borrar_directorio(&self.runtime_dir);
+        remove_dir(&self.runtime_dir);
     }
 }
 
-/// Lanza el proceso del plugin con las tres tuberías bajo control.
-fn lanzar(binario: &Path, entorno: &BTreeMap<String, String>) -> std::io::Result<Child> {
-    let mut orden = Command::new(binario);
-    // El entorno del núcleo no viaja: se parte de cero y se añade lo mínimo.
-    orden.env_clear();
-    orden.envs(entorno);
-    orden
+/// Launches the plugin's process with the three pipes under control.
+fn launch(binary: &Path, env: &BTreeMap<String, String>) -> std::io::Result<Child> {
+    let mut command = Command::new(binary);
+    // The core's environment does not travel: we start from zero and add the
+    // bare minimum.
+    command.env_clear();
+    command.envs(env);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Si el núcleo entra en pánico entre el spawn y el shutdown, el plugin no
-    // le sobrevive.
-    orden.kill_on_drop(true);
-    // Grupo de procesos propio (`setpgid(0, 0)`): el plugin de
-    // `PostgreSQL`
-    // lanzará `pg_dump` como nieto del núcleo, y al abortar hay que poder
-    // matarlos juntos. Matar solo al plugin dejaría un `pg_dump` huérfano con
-    // una transacción abierta contra la base de datos de producción.
+    // If the core panics between the spawn and the shutdown, the plugin does not
+    // outlive it.
+    command.kill_on_drop(true);
+    // Its own process group (`setpgid(0, 0)`): the `PostgreSQL` plugin will
+    // launch `pg_dump` as a grandchild of the core, and on abort they have to be
+    // killable together. Killing only the plugin would leave a `pg_dump` orphan
+    // with an open transaction against the production database.
     //
-    // `process_group` es seguro; `pre_exec`, que sería la otra forma de hacer
-    // esto, no lo es —y el workspace prohíbe `unsafe`—.
-    orden.process_group(0);
-    orden.spawn()
+    // `process_group` is safe; `pre_exec`, which would be the other way of doing
+    // this, is not —and the workspace forbids `unsafe`—.
+    command.process_group(0);
+    command.spawn()
 }
 
-/// Entrega el sobre, cierra el stdin y espera el anuncio con plazo.
-async fn esperar_anuncio(
-    sobre: &Bootstrap,
-    entrada: Option<ChildStdin>,
-    salida: Option<ChildStdout>,
+/// Delivers the envelope, closes stdin and waits for the announcement with a
+/// deadline.
+async fn wait_for_announcement(
+    envelope: &Bootstrap,
+    input: Option<ChildStdin>,
+    output: Option<ChildStdout>,
 ) -> Result<Ready, PluginProcessError> {
-    let entrada =
-        entrada.ok_or_else(|| std::io::Error::other("el plugin se lanzó sin stdin propio"))?;
-    enviar_sobre(sobre, entrada).await?;
+    let input = input
+        .ok_or_else(|| std::io::Error::other("the plugin was launched without its own stdin"))?;
+    send_envelope(envelope, input).await?;
 
-    let salida =
-        salida.ok_or_else(|| std::io::Error::other("el plugin se lanzó sin stdout propio"))?;
-    let mut lector = BufReader::new(salida);
-    let mut linea = String::new();
-    let leidos = tokio::time::timeout(
+    let output = output
+        .ok_or_else(|| std::io::Error::other("the plugin was launched without its own stdout"))?;
+    let mut reader = BufReader::new(output);
+    let mut line = String::new();
+    let read = tokio::time::timeout(
         Duration::from_millis(READY_TIMEOUT_MS),
-        lector.read_line(&mut linea),
+        reader.read_line(&mut line),
     )
     .await
-    .map_err(|_| PluginProcessError::TimeoutHandshake)??;
+    .map_err(|_| PluginProcessError::HandshakeTimeout)??;
 
-    if leidos == 0 {
-        // Fin de fichero: el proceso murió sin anunciarse. Para el núcleo es
-        // el mismo suceso que el silencio, y llega antes.
-        return Err(PluginProcessError::TimeoutHandshake);
+    if read == 0 {
+        // End of file: the process died without announcing itself. For the core
+        // it is the same event as silence, and it arrives sooner.
+        return Err(PluginProcessError::HandshakeTimeout);
     }
-    Ok(Ready::from_line(&linea)?)
+    Ok(Ready::from_line(&line)?)
 }
 
-/// Escribe el sobre de arranque y **cierra** el stdin del hijo.
+/// Writes the bootstrap envelope and **closes** the child's stdin.
 ///
-/// Cerrarlo es parte del contrato: el plugin ya tiene todo lo que necesita, y
-/// un stdin abierto es un canal por el que nadie va a hablar.
+/// Closing it is part of the contract: the plugin already has everything it
+/// needs, and an open stdin is a channel nobody is going to talk on.
 ///
-/// Un fallo al escribir no se propaga tal cual porque casi siempre significa
-/// que el proceso ya había muerto —una tubería rota—; el diagnóstico bueno lo
-/// da la espera del anuncio, que verá el fin de fichero, junto al stderr que
-/// se está reemitiendo.
-async fn enviar_sobre(
-    sobre: &Bootstrap,
-    mut entrada: ChildStdin,
+/// A write failure is not propagated as such because it almost always means the
+/// process had already died —a broken pipe—; the good diagnosis comes from
+/// waiting for the announcement, which will see the end of file, together with
+/// the stderr that is being relayed.
+async fn send_envelope(
+    envelope: &Bootstrap,
+    mut input: ChildStdin,
 ) -> Result<(), PluginProcessError> {
-    let linea = sobre.to_line()?;
-    let escritura = async {
-        entrada.write_all(linea.as_bytes()).await?;
-        entrada.write_all(b"\n").await?;
-        entrada.flush().await
+    let line = envelope.to_line()?;
+    let write = async {
+        input.write_all(line.as_bytes()).await?;
+        input.write_all(b"\n").await?;
+        input.flush().await
     }
     .await;
-    if let Err(fuente) = escritura {
-        tracing::debug!(%fuente, "no se pudo entregar el sobre de arranque");
+    if let Err(source) = write {
+        tracing::debug!(%source, "could not deliver the bootstrap envelope");
     }
-    drop(entrada);
+    drop(input);
     Ok(())
 }
 
-/// Lee el stderr del plugin y lo reemite al log del núcleo.
+/// Reads the plugin's stderr and relays it to the core's log.
 ///
-/// Sin esto, un plugin que falla lo hace en silencio: su stderr es una tubería
-/// que nadie lee y el operador solo ve «el plugin no arrancó».
-fn reemitir_stderr(nombre: &str, stderr: Option<ChildStderr>) {
+/// Without this, a plugin that fails does so in silence: its stderr is a pipe
+/// nobody reads and the operator only sees "the plugin did not start".
+fn relay_stderr(name: &str, stderr: Option<ChildStderr>) {
     let Some(stderr) = stderr else { return };
-    let nombre = nombre.to_string();
+    let name = name.to_string();
     tokio::spawn(async move {
-        let mut lineas = BufReader::new(stderr).lines();
-        while let Ok(Some(linea)) = lineas.next_line().await {
-            tracing::info!(plugin = %nombre, "{linea}");
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::info!(plugin = %name, "{line}");
         }
     });
 }
 
-/// El entorno con el que se lanza un plugin: lo mínimo, y nada más.
-fn entorno_minimo() -> BTreeMap<String, String> {
-    let mut entorno = BTreeMap::new();
-    for clave in VARIABLES_HEREDADAS {
-        if let Ok(valor) = std::env::var(clave) {
-            entorno.insert(clave.to_string(), valor);
+/// The environment a plugin is launched with: the bare minimum, and nothing
+/// else.
+fn minimal_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for key in INHERITED_VARIABLES {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_string(), value);
         }
     }
-    entorno
-        .entry("PATH".to_string())
-        .or_insert_with(|| PATH_POR_DEFECTO.to_string());
-    entorno
+    env.entry("PATH".to_string())
+        .or_insert_with(|| DEFAULT_PATH.to_string());
+    env
 }
 
-/// Crea el directorio privado donde vivirá el socket de control.
+/// Creates the private directory where the control socket will live.
 ///
-/// Bajo `XDG_RUNTIME_DIR` si existe —está en un tmpfs propio del usuario y las
-/// rutas son cortas, que importa porque un socket Unix no admite más de 108
-/// bytes de ruta—, y si no bajo el temporal del sistema. El modo se pide al
-/// crear, no después: entre crear y corregir hay una ventana en la que el
-/// directorio sería legible por otros.
-fn crear_directorio_privado() -> Result<PathBuf, PluginProcessError> {
+/// Under `XDG_RUNTIME_DIR` if it exists —it is on a tmpfs of the user's own and
+/// the paths are short, which matters because a Unix socket does not accept more
+/// than 108 bytes of path—, and otherwise under the system temporary directory.
+/// The mode is requested at creation time, not afterwards: between creating and
+/// fixing there is a window in which the directory would be readable by others.
+fn create_private_dir() -> Result<PathBuf, PluginProcessError> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|d| d.is_dir())
         .unwrap_or_else(std::env::temp_dir);
-    let n = SIGUIENTE.fetch_add(1, Ordering::Relaxed);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir = base.join(format!("shieldbk-{}-{n}", std::process::id()));
 
     DirBuilder::new()
-        .mode(MODO_PRIVADO)
+        .mode(PRIVATE_MODE)
         .create(&dir)
-        .map_err(|fuente| PluginProcessError::DirectorioDeEjecucion {
+        .map_err(|source| PluginProcessError::RuntimeDirectory {
             dir: dir.display().to_string(),
-            fuente,
+            source,
         })?;
-    // El `umask` del proceso solo puede quitar permisos, nunca añadirlos, así
-    // que esto no relaja nada; está para que el modo sea exactamente 0700
-    // aunque alguien haya heredado un umask raro.
-    std::fs::set_permissions(&dir, Permissions::from_mode(MODO_PRIVADO)).map_err(|fuente| {
-        PluginProcessError::DirectorioDeEjecucion {
+    // The process's `umask` can only take permissions away, never add them, so
+    // this does not relax anything; it is here so that the mode is exactly 0700
+    // even if somebody inherited an odd umask.
+    std::fs::set_permissions(&dir, Permissions::from_mode(PRIVATE_MODE)).map_err(|source| {
+        PluginProcessError::RuntimeDirectory {
             dir: dir.display().to_string(),
-            fuente,
+            source,
         }
     })?;
     Ok(dir)
 }
 
-/// Borra el directorio de ejecución. Best-effort: si no se puede, se registra.
-fn borrar_directorio(dir: &Path) {
-    if let Err(fuente) = std::fs::remove_dir_all(dir)
-        && fuente.kind() != std::io::ErrorKind::NotFound
+/// Removes the runtime directory. Best-effort: if it cannot be done, it is
+/// logged.
+fn remove_dir(dir: &Path) {
+    if let Err(source) = std::fs::remove_dir_all(dir)
+        && source.kind() != std::io::ErrorKind::NotFound
     {
-        tracing::warn!(dir = %dir.display(), %fuente, "no se pudo borrar el directorio del plugin");
+        tracing::warn!(dir = %dir.display(), %source, "could not remove the plugin's directory");
     }
 }
 
-/// Manda `SIGKILL` al grupo de procesos del plugin.
+/// Sends `SIGKILL` to the plugin's process group.
 ///
-/// Al grupo, no al proceso: es lo que se lleva por delante a los nietos. Como
-/// el plugin se lanzó con `process_group(0)`, el identificador del grupo es su
-/// propio pid, y el núcleo —que está en otro grupo— no se mata a sí mismo.
-pub(crate) fn matar_al_grupo(pid: u32) {
-    let Ok(crudo) = i32::try_from(pid) else {
+/// To the group, not to the process: that is what takes the grandchildren down
+/// with it. Since the plugin was launched with `process_group(0)`, the group's
+/// identifier is its own pid, and the core —which is in another group— does not
+/// kill itself.
+pub(crate) fn kill_group(pid: u32) {
+    let Ok(raw) = i32::try_from(pid) else {
         return;
     };
-    let Some(objetivo) = rustix::process::Pid::from_raw(crudo) else {
+    let Some(target) = rustix::process::Pid::from_raw(raw) else {
         return;
     };
-    if let Err(fuente) =
-        rustix::process::kill_process_group(objetivo, rustix::process::Signal::KILL)
+    if let Err(source) = rustix::process::kill_process_group(target, rustix::process::Signal::KILL)
     {
-        // `ESRCH` es lo normal cuando el plugin ya había terminado solo.
-        tracing::debug!(pid, %fuente, "no se pudo señalar al grupo del plugin");
+        // `ESRCH` is normal when the plugin had already finished on its own.
+        tracing::debug!(pid, %source, "could not signal the plugin's group");
     }
 }
 
@@ -490,15 +491,15 @@ pub(crate) fn matar_al_grupo(pid: u32) {
 #[allow(
     clippy::for_kv_map,
     clippy::items_after_statements,
-    reason = "estos tests describen el contrato tal y como se leería en una revisión; recorrer el mapa por pares deja a la vista que se inspeccionan las claves de un entorno, y el `use` junto a la comprobación de permisos mantiene el motivo al lado del assert"
+    reason = "these tests describe the contract as it would read in a review; walking the map by pairs makes it obvious that the keys of an environment are being inspected, and the `use` next to the permission check keeps the reason beside the assert"
 )]
 mod tests {
     use super::*;
-    use crate::plugin::test_support::ruta_mock;
+    use crate::plugin::test_support::mock_path;
 
     #[tokio::test]
-    async fn arranca_un_plugin_y_completa_el_handshake() {
-        let p = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
+    async fn starts_a_plugin_and_completes_the_handshake() {
+        let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
         assert_eq!(p.protocol_version(), sb_proto::PROTOCOL_VERSION);
         assert!(p.capabilities().contains(&"engine".to_string()));
         assert!(p.capabilities().contains(&"storage".to_string()));
@@ -506,108 +507,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn el_hijo_no_hereda_el_entorno_del_nucleo() {
-        // Si el núcleo tiene PGPASSWORD en su entorno, un plugin que lo
-        // heredara tendría credenciales que nadie le dio. Y el entorno de un
-        // proceso es legible en /proc/<pid>/environ.
-        let p = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
-        let entorno = p.entorno_del_hijo();
-        assert!(!entorno.contains_key("SHIELDBK_VARIABLE_QUE_NO_DEBE_HEREDARSE"));
+    async fn the_child_does_not_inherit_the_core_environment() {
+        // If the core has PGPASSWORD in its environment, a plugin that inherited
+        // it would hold credentials nobody gave it. And a process's environment
+        // is readable in /proc/<pid>/environ.
+        let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
+        let env = p.child_env();
+        assert!(!env.contains_key("SHIELDBK_VARIABLE_THAT_MUST_NOT_BE_INHERITED"));
         assert!(
-            entorno.contains_key("PATH"),
-            "pero sí lo mínimo para funcionar"
+            env.contains_key("PATH"),
+            "but the bare minimum to work is there"
         );
         assert!(
-            entorno.len() <= 6,
-            "el entorno debe ser mínimo, tiene {}",
-            entorno.len()
+            env.len() <= 6,
+            "the environment must be minimal, it has {}",
+            env.len()
         );
         p.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn el_entorno_del_hijo_no_contiene_nada_que_parezca_un_secreto() {
-        let p = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
-        for (clave, _) in p.entorno_del_hijo() {
-            let c = clave.to_uppercase();
+    async fn the_child_environment_contains_nothing_that_looks_like_a_secret() {
+        let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
+        for (key, _) in p.child_env() {
+            let k = key.to_uppercase();
             assert!(
-                !c.contains("PASSWORD")
-                    && !c.contains("SECRET")
-                    && !c.contains("TOKEN")
-                    && !c.contains("KEY")
-                    && !c.contains("CREDENTIAL"),
-                "variable sospechosa en el entorno del plugin: {clave}"
+                !k.contains("PASSWORD")
+                    && !k.contains("SECRET")
+                    && !k.contains("TOKEN")
+                    && !k.contains("KEY")
+                    && !k.contains("CREDENTIAL"),
+                "suspicious variable in the plugin's environment: {key}"
             );
         }
         p.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn un_binario_inexistente_da_un_error_claro() {
-        let err = PluginProcess::spawn("fantasma", std::path::Path::new("/no/existe/plugin"))
+    async fn a_nonexistent_binary_gives_a_clear_error() {
+        let err = PluginProcess::spawn("ghost", std::path::Path::new("/does/not/exist/plugin"))
             .await
             .unwrap_err();
-        assert!(matches!(err, PluginProcessError::NoSePudoArrancar { .. }));
-        let texto = err.to_string();
-        assert!(texto.contains("fantasma"), "debe nombrar el plugin");
+        assert!(matches!(err, PluginProcessError::SpawnFailed { .. }));
+        let text = err.to_string();
+        assert!(text.contains("ghost"), "it must name the plugin");
         assert!(
-            texto.contains("/no/existe/plugin"),
-            "y decir dónde lo buscó"
+            text.contains("/does/not/exist/plugin"),
+            "and say where it looked for it"
         );
     }
 
     #[tokio::test]
-    async fn un_binario_que_no_habla_el_protocolo_vence_por_tiempo() {
-        let inicio = std::time::Instant::now();
-        let err = PluginProcess::spawn("dormilon", std::path::Path::new("/bin/sleep"))
+    async fn a_binary_that_does_not_speak_the_protocol_times_out() {
+        let start = std::time::Instant::now();
+        let err = PluginProcess::spawn("sleepy", std::path::Path::new("/bin/sleep"))
             .await
             .unwrap_err();
-        assert!(matches!(err, PluginProcessError::TimeoutHandshake));
+        assert!(matches!(err, PluginProcessError::HandshakeTimeout));
         assert!(
-            inicio.elapsed() < std::time::Duration::from_secs(60),
-            "el timeout debe ser acotado"
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "the timeout must be bounded"
         );
     }
 
     #[tokio::test]
-    async fn al_destruir_el_proceso_el_hijo_muere() {
+    async fn destroying_the_process_kills_the_child() {
         let pid = {
-            let p = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
+            let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
             p.pid()
         };
         for _ in 0..100 {
-            if !proceso_vivo(pid) {
+            if !process_alive(pid) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
-            !proceso_vivo(pid),
-            "el plugin no debe sobrevivir a su handle"
+            !process_alive(pid),
+            "the plugin must not outlive its handle"
         );
     }
 
     #[tokio::test]
-    async fn el_directorio_de_sockets_es_privado_y_se_borra() {
+    async fn the_socket_directory_is_private_and_gets_removed() {
         let dir = {
-            let p = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
+            let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
             let d = p.runtime_dir().to_path_buf();
 
             use std::os::unix::fs::PermissionsExt;
-            let modo = std::fs::metadata(&d).unwrap().permissions().mode();
-            assert_eq!(modo & 0o777, 0o700);
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
 
             p.shutdown().await.unwrap();
             d
         };
-        assert!(!dir.exists(), "el directorio de sockets no debe sobrevivir");
+        assert!(!dir.exists(), "the socket directory must not survive");
     }
 
     #[tokio::test]
-    async fn dos_plugins_simultaneos_no_comparten_directorio() {
-        // Un backup usa motor y destino a la vez.
-        let a = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
-        let b = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
+    async fn two_simultaneous_plugins_do_not_share_a_directory() {
+        // A backup uses an engine and a storage at once.
+        let a = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
+        let b = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
         assert_ne!(a.runtime_dir(), b.runtime_dir());
         assert_ne!(a.pid(), b.pid());
         a.shutdown().await.unwrap();
@@ -615,29 +616,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn el_plugin_no_queda_zombie_tras_el_cierre() {
-        // Un proceso al que no se le hace wait queda como zombie en la tabla
-        // de procesos. Con un backup por hora, se acumulan.
-        let p = PluginProcess::spawn("mock", &ruta_mock()).await.unwrap();
+    async fn the_plugin_does_not_become_a_zombie_after_shutdown() {
+        // A process nobody waits on stays as a zombie in the process table. With
+        // one backup per hour, they pile up.
+        let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
         let pid = p.pid();
         p.shutdown().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!es_zombie(pid), "el proceso quedó zombie");
+        assert!(!is_zombie(pid), "the process was left as a zombie");
     }
 
-    /// Comprueba si un pid sigue vivo sin enviarle señal.
-    fn proceso_vivo(pid: u32) -> bool {
+    /// Checks whether a pid is still alive without sending it a signal.
+    fn process_alive(pid: u32) -> bool {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
     }
 
-    /// Comprueba si un pid está en estado zombie leyendo /proc.
-    fn es_zombie(pid: u32) -> bool {
+    /// Checks whether a pid is in the zombie state by reading /proc.
+    fn is_zombie(pid: u32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|s| {
                 s.rsplit(right_paren())
                     .next()
-                    .map(|resto| resto.trim_start().starts_with('Z'))
+                    .map(|rest| rest.trim_start().starts_with('Z'))
             })
             .unwrap_or(false)
     }
