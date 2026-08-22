@@ -1,73 +1,74 @@
-//! El despacho, y solo el despacho.
+//! The dispatch, and only the dispatch.
 //!
-//! Este archivo existe para poder responder a «¿dónde está el código de
-//! `verify`?» sin leer nada más. Cada subcomando vive en su propio archivo y
-//! ninguno necesita conocer a los demás; lo único común —cargar el contexto y
-//! limitar cuántos targets se procesan a la vez— está en [`concurrencia`],
-//! porque es una decisión de la herramienta y no de ningún comando concreto.
+//! This file exists so that "where is `verify`'s code?" can be answered without
+//! reading anything else. Each subcommand lives in its own file and none of
+//! them needs to know the others; the only shared part -- loading the context
+//! and limiting how many targets are processed at a time -- is in
+//! [`concurrency`], because it is a decision of the tool and not of any
+//! particular command.
 
 mod backup;
-mod concurrencia;
+mod concurrency;
 mod doctor;
 mod plugin;
 mod restore;
 mod storage;
 mod verify;
 
-use crate::cli::{AccionPlugin, AccionStorage, Cli, Comando};
-use crate::context::Contexto;
+use crate::cli::{Cli, Command, PluginAction, StorageAction};
+use crate::context::Context;
 use crate::error::CliError;
-use crate::output::Informe;
+use crate::output::Report;
 
-/// Ejecuta lo que se pidió y devuelve lo que hay que contar.
+/// Runs what was asked for and returns what has to be told.
 ///
 /// # Errors
-/// Devuelve [`CliError`] con la clase del fallo, que es lo que decide el código
-/// de salida del proceso.
-pub async fn ejecutar(cli: &Cli) -> Result<Informe, CliError> {
-    // La configuración se carga para todos los comandos, incluidos los de
-    // `plugin`: el directorio de plugins y el lockfile salen de ahí, así que
-    // sin ella no se sabría ni dónde mirar. Lo que cambia entre unos y otros es
-    // cuánto le exigen (ver [`contexto`]).
-    let ctx = contexto(cli)?;
+/// Returns [`CliError`] with the failure's class, which is what decides the
+/// process's exit code.
+pub async fn run(cli: &Cli) -> Result<Report, CliError> {
+    // The configuration is loaded for every command, the `plugin` ones
+    // included: the plugins directory and the lockfile come from it, so without
+    // it there would be no way to know where to look. What changes between them
+    // is how much they demand of it (see [`context`]).
+    let ctx = context(cli)?;
 
-    match &cli.comando {
-        Comando::Backup { target } => backup::ejecutar(&ctx, target.as_deref()).await,
-        Comando::Restore {
+    match &cli.command {
+        Command::Backup { target } => backup::run(&ctx, target.as_deref()).await,
+        Command::Restore {
             target,
             artifact,
             identity,
-        } => restore::ejecutar(&ctx, target, artifact, identity).await,
-        Comando::Verify { target, artifact } => {
-            verify::ejecutar(&ctx, target, artifact.as_deref()).await
+        } => restore::run(&ctx, target, artifact, identity).await,
+        Command::Verify { target, artifact } => {
+            verify::run(&ctx, target, artifact.as_deref()).await
         }
-        Comando::Doctor { target } => doctor::ejecutar(&ctx, target.as_deref()).await,
-        Comando::Plugin { accion } => match accion {
-            AccionPlugin::List => plugin::listar(&ctx),
-            AccionPlugin::Docs { plugin: nombre } => plugin::docs(&ctx, nombre).await,
-            AccionPlugin::Verify => plugin::verificar(&ctx),
-            AccionPlugin::Lock => plugin::lock(&ctx),
+        Command::Doctor { target } => doctor::run(&ctx, target.as_deref()).await,
+        Command::Plugin { action } => match action {
+            PluginAction::List => plugin::list(&ctx),
+            PluginAction::Docs { plugin: name } => plugin::docs(&ctx, name).await,
+            PluginAction::Verify => plugin::verify(&ctx),
+            PluginAction::Lock => plugin::lock(&ctx),
         },
-        Comando::Storage { accion } => match accion {
-            AccionStorage::Gc { target } => storage::gc(&ctx, target).await,
+        Command::Storage { action } => match action {
+            StorageAction::Gc { target } => storage::gc(&ctx, target).await,
         },
     }
 }
 
-/// El contexto que le toca a cada comando.
+/// The context each command gets.
 ///
-/// Los de `plugin` solo usan la sección `[plugins]`: registrar el hash de un
-/// binario, comprobarlo o listarlo no tiene nada que ver con qué bases de
-/// datos se respaldan, y es lo que se hace **antes** de decidirlo —al
-/// instalar, o al construir una imagen—. Los demás sí trabajan sobre targets y
-/// tienen que seguir exigiéndolos: un `backup` que arrancara con una
-/// configuración vacía no haría nada y terminaría diciendo que todo fue bien,
-/// que es peor que negarse.
+/// The `plugin` ones only use the `[plugins]` section: registering a binary's
+/// hash, checking it or listing it has nothing to do with which databases get
+/// backed up, and it is what is done **before** deciding that -- at install
+/// time, or while building an image. The rest do work on targets and have to
+/// keep requiring them: a `backup` that started with an empty configuration
+/// would do nothing and end up saying everything went well, which is worse than
+/// refusing.
 ///
-/// El caso general es exigirlos, así que un comando nuevo lo hará por defecto.
-fn contexto(cli: &Cli) -> Result<Contexto, CliError> {
-    match &cli.comando {
-        Comando::Plugin { .. } => Contexto::cargar_sin_exigir_targets(cli),
-        _ => Contexto::cargar(cli),
+/// The general case is requiring them, so a new command will do so by default.
+fn context(cli: &Cli) -> Result<Context, CliError> {
+    match &cli.command {
+        Command::Plugin { .. } => Context::load_without_requiring_targets(cli),
+        _ => Context::load(cli),
     }
 }

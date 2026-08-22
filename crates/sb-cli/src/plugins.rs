@@ -1,11 +1,11 @@
-//! Poner un plugin en marcha, con la comprobación que va delante de todas.
+//! Starting a plugin, with the check that comes before all the others.
 //!
-//! Un plugin es un proceso al que `shieldbk` le entrega la contraseña de la
-//! base de datos y las credenciales del almacenamiento. Eso convierte «¿qué
-//! binario es este?» en la pregunta más importante del arranque, y por eso
-//! **nada de este módulo ejecuta un binario sin haberlo verificado antes
-//! contra el lockfile**. La comprobación vive aquí y no en cada comando
-//! precisamente porque olvidarla una sola vez bastaría para anularla.
+//! A plugin is a process `shieldbk` hands the database password and the storage
+//! credentials to. That turns "which binary is this?" into the most important
+//! question of start-up, and that is why **nothing in this module runs a binary
+//! without having verified it against the lockfile first**. The check lives
+//! here and not in each command precisely because forgetting it once would be
+//! enough to void it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,213 +14,214 @@ use sb_config::{ConfigTable, Target, validate_and_convert};
 use sb_core::lockfile::Lockfile;
 use sb_core::plugin::{Capability, PluginClient};
 
-use crate::context::{Contexto, nombre_de_binario};
+use crate::context::{Context, plugin_name_of};
 use crate::error::CliError;
 
-/// Qué papel juega un plugin en un target: de dónde salen los bytes o adónde
-/// van.
+/// What part a plugin plays in a target: where the bytes come from or where
+/// they go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Papel {
-    Motor,
-    Destino,
+pub enum Role {
+    Engine,
+    Storage,
 }
 
-impl Papel {
-    /// La sección de la configuración de la que salen sus campos. Es también
-    /// lo que aparece en los mensajes de validación.
-    pub const fn seccion(self) -> &'static str {
+impl Role {
+    /// The configuration section its fields come from. It is also what shows up
+    /// in the validation messages.
+    pub const fn section(self) -> &'static str {
         match self {
-            Self::Motor => "engine",
-            Self::Destino => "storage",
+            Self::Engine => "engine",
+            Self::Storage => "storage",
         }
     }
 
-    const fn capacidad(self) -> Capability {
+    const fn capability(self) -> Capability {
         match self {
-            Self::Motor => Capability::Engine,
-            Self::Destino => Capability::Storage,
+            Self::Engine => Capability::Engine,
+            Self::Storage => Capability::Storage,
         }
     }
 
-    fn nombre_en(self, target: &Target) -> &str {
+    fn name_in(self, target: &Target) -> &str {
         match self {
-            Self::Motor => &target.engine,
-            Self::Destino => &target.storage,
+            Self::Engine => &target.engine,
+            Self::Storage => &target.storage,
         }
     }
 
-    fn configuracion_en(self, target: &Target) -> &ConfigTable {
+    fn config_in(self, target: &Target) -> &ConfigTable {
         match self {
-            Self::Motor => &target.engine_config,
-            Self::Destino => &target.storage_config,
+            Self::Engine => &target.engine_config,
+            Self::Storage => &target.storage_config,
         }
     }
 }
 
-/// Los binarios de plugin que hay en el directorio, en orden alfabético.
+/// The plugin binaries in the directory, in alphabetical order.
 ///
-/// Un directorio que todavía no existe es un directorio sin plugins y no un
-/// error: es el estado de una instalación recién hecha, y decírselo así a quien
-/// ejecuta `plugin list` explica más que un fallo de E/S.
+/// A directory that does not exist yet is a directory with no plugins and not
+/// an error: it is the state of a freshly made installation, and telling that
+/// to whoever runs `plugin list` explains more than an I/O failure.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el directorio existe pero no se puede leer.
-pub fn binarios(dir: &Path) -> Result<Vec<(String, PathBuf)>, CliError> {
-    let entradas = match std::fs::read_dir(dir) {
-        Ok(entradas) => entradas,
+/// Returns [`CliError::Plugin`] if the directory exists but cannot be read.
+pub fn binaries(dir: &Path) -> Result<Vec<(String, PathBuf)>, CliError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(fuente) => {
+        Err(source) => {
             return Err(CliError::plugin(format!(
-                "no se pudo leer el directorio de plugins «{}»: {fuente}",
+                "could not read the plugins directory `{}`: {source}",
                 dir.display()
             )));
         }
     };
 
-    let mut encontrados = Vec::new();
-    for entrada in entradas {
-        let entrada = entrada.map_err(|fuente| {
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| {
             CliError::plugin(format!(
-                "no se pudo recorrer el directorio de plugins «{}»: {fuente}",
+                "could not walk the plugins directory `{}`: {source}",
                 dir.display()
             ))
         })?;
-        let nombre_fichero = entrada.file_name().to_string_lossy().into_owned();
-        let Some(nombre) = nombre_de_binario(&nombre_fichero) else {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = plugin_name_of(&file_name) else {
             continue;
         };
-        if entrada.path().is_file() {
-            encontrados.push((nombre.to_owned(), entrada.path()));
+        if entry.path().is_file() {
+            found.push((name.to_owned(), entry.path()));
         }
     }
-    encontrados.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(encontrados)
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
 }
 
-/// Comprueba que el binario de `nombre` está donde debe y es el que se
-/// registró.
+/// Checks that `name`'s binary is where it should be and is the one that was
+/// registered.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el binario no está —el mensaje dice dónde
-/// se buscó— o si el lockfile no lo autoriza. El mensaje del lockfile llega
-/// intacto: ya trae el `shieldbk plugin lock <nombre>` que hay que teclear.
-pub fn verificar(ctx: &Contexto, nombre: &str) -> Result<PathBuf, CliError> {
-    let ruta = ctx.ruta_de_plugin(nombre);
-    if !ruta.is_file() {
+/// Returns [`CliError::Plugin`] if the binary is not there -- the message says
+/// where it was looked for -- or if the lockfile does not authorise it. The
+/// lockfile's message arrives intact: it already carries the
+/// `shieldbk plugin lock <name>` that has to be typed.
+pub fn verify(ctx: &Context, name: &str) -> Result<PathBuf, CliError> {
+    let path = ctx.plugin_path(name);
+    if !path.is_file() {
         return Err(CliError::plugin(format!(
-            "no se encontró el plugin «{nombre}»: se buscó en «{}». Instálalo ahí o cambia \
-             `plugins.dir` en la configuración",
-            ruta.display()
+            "the plugin `{name}` was not found: it was looked for at `{}`. Install it there or \
+             change `plugins.dir` in the configuration",
+            path.display()
         )));
     }
 
-    let lockfile = Lockfile::load(&ctx.ruta_lockfile)?;
-    lockfile.verify(nombre, &ruta)?;
-    tracing::debug!(plugin = nombre, ruta = %ruta.display(), "binario verificado");
-    Ok(ruta)
+    let lockfile = Lockfile::load(&ctx.lockfile_path)?;
+    lockfile.verify(name, &path)?;
+    tracing::debug!(plugin = name, path = %path.display(), "binary verified");
+    Ok(path)
 }
 
-/// Arranca un plugin verificado, **sin configurarlo**.
+/// Starts a verified plugin, **without configuring it**.
 ///
-/// Es lo que necesita `plugin docs`: un plugin vivo al que solo se le va a
-/// preguntar qué campos acepta.
+/// It is what `plugin docs` needs: a live plugin that will only be asked which
+/// fields it accepts.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el binario no pasa la verificación o si el
-/// proceso no llega a hablar.
-pub async fn arrancar(ctx: &Contexto, nombre: &str) -> Result<PluginClient, CliError> {
-    let ruta = verificar(ctx, nombre)?;
-    Ok(PluginClient::start(nombre, &ruta).await?)
+/// Returns [`CliError::Plugin`] if the binary does not pass verification or if
+/// the process never gets to talk.
+pub async fn start(ctx: &Context, name: &str) -> Result<PluginClient, CliError> {
+    let path = verify(ctx, name)?;
+    Ok(PluginClient::start(name, &path).await?)
 }
 
-/// Arranca el plugin que juega `papel` en `target`, ya configurado y con su
-/// capacidad comprobada.
+/// Starts the plugin that plays `role` in `target`, already configured and with
+/// its capability checked.
 ///
-/// El orden importa y es el mismo en las cuatro operaciones: verificar el
-/// binario, arrancarlo, **preguntarle su esquema**, validar contra él lo que
-/// dice la configuración —resolviendo los secretos por el camino— y solo
-/// entonces entregárselo. Validar contra el esquema del plugin y no contra una
-/// lista en el núcleo es lo que permite que añadir un motor nuevo no obligue a
-/// recompilar `shieldbk`.
+/// The order matters and is the same in all four operations: verify the binary,
+/// start it, **ask it for its schema**, validate what the configuration says
+/// against it -- resolving the secrets along the way -- and only then hand it
+/// over. Validating against the plugin's schema rather than against a list in
+/// the core is what lets adding a new engine not require recompiling
+/// `shieldbk`.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el plugin no arranca o no sabe hacer el
-/// papel que se le pide, y [`CliError::Config`] si su configuración no encaja
-/// con el esquema o un secreto no se pudo resolver.
-pub async fn arrancar_para(
-    ctx: &Contexto,
+/// Returns [`CliError::Plugin`] if the plugin does not start or cannot play the
+/// part it is asked for, and [`CliError::Config`] if its configuration does not
+/// match the schema or a secret could not be resolved.
+pub async fn start_for(
+    ctx: &Context,
     target: &Target,
-    papel: Papel,
+    role: Role,
 ) -> Result<PluginClient, CliError> {
-    let nombre = papel.nombre_en(target);
-    let cliente = arrancar(ctx, nombre).await?;
+    let name = role.name_in(target);
+    let client = start(ctx, name).await?;
 
-    // La capacidad se comprueba aquí y no al usarla: pedirle un volcado a un
-    // plugin que solo sabe almacenar tiene que fallar al elegirlo, no a mitad
-    // del backup.
-    if let Err(fuente) = cliente.require_capability(papel.capacidad()) {
-        let _ = cliente.shutdown().await;
+    // The capability is checked here and not at use time: asking a plugin that
+    // only knows how to store for a dump has to fail when it is chosen, not
+    // halfway through the backup.
+    if let Err(source) = client.require_capability(role.capability()) {
+        let _ = client.shutdown().await;
         return Err(CliError::config(format!(
-            "el target «{}» usa «{nombre}» como {}, pero {fuente}",
+            "the target `{}` uses `{name}` as {}, but {source}",
             target.name,
-            papel.seccion()
+            role.section()
         )));
     }
 
-    match configurar(&cliente, target, papel).await {
-        Ok(()) => Ok(cliente),
+    match configure(&client, target, role).await {
+        Ok(()) => Ok(client),
         Err(error) => {
-            // Un plugin al que no se ha podido configurar no puede quedarse
-            // vivo: es un proceso con material criptográfico de sesión al que
-            // ya nadie va a pedirle nada.
-            let _ = cliente.shutdown().await;
+            // A plugin that could not be configured cannot be left alive: it is
+            // a process holding session key material that nobody is going to
+            // ask anything of any more.
+            let _ = client.shutdown().await;
             Err(error)
         }
     }
 }
 
-/// Le pregunta el esquema, valida la configuración contra él y se la entrega.
-async fn configurar(cliente: &PluginClient, target: &Target, papel: Papel) -> Result<(), CliError> {
-    let esquema = cliente.schema().await?;
-    let seccion = papel.seccion();
-    let valores = validate_and_convert(papel.configuracion_en(target), &esquema, seccion).map_err(
-        |fuente| {
+/// Asks it for the schema, validates the configuration against it and hands it
+/// over.
+async fn configure(client: &PluginClient, target: &Target, role: Role) -> Result<(), CliError> {
+    let schema = client.schema().await?;
+    let section = role.section();
+    let values =
+        validate_and_convert(role.config_in(target), &schema, section).map_err(|source| {
             CliError::config(format!(
-                "la configuración de `{seccion}` del target «{}» no es válida: {fuente}",
+                "the `{section}` configuration of target `{}` is not valid: {source}",
                 target.name
             ))
-        },
-    )?;
+        })?;
 
-    // Lo que se registra es **cuántos** campos van, nunca cuáles ni sus
-    // valores: entre ellos hay contraseñas.
+    // What gets logged is **how many** fields go, never which ones nor their
+    // values: among them there are passwords.
     tracing::debug!(
-        plugin = cliente.name(),
-        papel = seccion,
-        campos = valores.len(),
-        "configurando plugin"
+        plugin = client.name(),
+        role = section,
+        fields = values.len(),
+        "configuring plugin"
     );
-    entregar(cliente, valores).await
+    deliver(client, values).await
 }
 
-/// La entrega en sí, aparte para que quede claro que el mapa —que lleva los
-/// secretos ya resueltos— no pasa por ningún otro sitio.
-async fn entregar(
-    cliente: &PluginClient,
-    valores: HashMap<String, sb_proto::Value>,
+/// The handover itself, kept apart so it is clear that the map -- which carries
+/// the already resolved secrets -- goes nowhere else.
+async fn deliver(
+    client: &PluginClient,
+    values: HashMap<String, sb_proto::Value>,
 ) -> Result<(), CliError> {
-    Ok(cliente.configure(valores).await?)
+    Ok(client.configure(values).await?)
 }
 
-/// Cierra un plugin sin dejar que su fallo tape el de la operación.
+/// Shuts a plugin down without letting its failure cover up the operation's.
 ///
-/// Un cierre que falla es una anotación en el log; el resultado del backup es
-/// lo que el usuario vino a saber. Devolver el error del cierre haría que un
-/// backup correcto pareciera roto.
-pub async fn cerrar(cliente: PluginClient) {
-    let nombre = cliente.name().to_owned();
-    if let Err(fuente) = cliente.shutdown().await {
-        tracing::warn!(plugin = %nombre, %fuente, "el plugin no se cerró limpiamente");
+/// A shutdown that fails is a note in the log; the backup's result is what the
+/// user came to find out. Returning the shutdown error would make a correct
+/// backup look broken.
+pub async fn close(client: PluginClient) {
+    let name = client.name().to_owned();
+    if let Err(source) = client.shutdown().await {
+        tracing::warn!(plugin = %name, %source, "the plugin did not shut down cleanly");
     }
 }
 
@@ -229,34 +230,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cada_papel_sabe_de_que_seccion_y_capacidad_habla() {
-        assert_eq!(Papel::Motor.seccion(), "engine");
-        assert_eq!(Papel::Destino.seccion(), "storage");
-        assert_eq!(Papel::Motor.capacidad(), Capability::Engine);
-        assert_eq!(Papel::Destino.capacidad(), Capability::Storage);
+    fn each_role_knows_which_section_and_capability_it_talks_about() {
+        assert_eq!(Role::Engine.section(), "engine");
+        assert_eq!(Role::Storage.section(), "storage");
+        assert_eq!(Role::Engine.capability(), Capability::Engine);
+        assert_eq!(Role::Storage.capability(), Capability::Storage);
     }
 
     #[test]
-    fn un_directorio_que_no_existe_es_un_directorio_sin_plugins() {
-        // Es el estado de una instalación recién hecha, no un fallo.
-        let vacio = binarios(Path::new("/no/existe/este/directorio"));
-        assert!(matches!(vacio, Ok(v) if v.is_empty()));
+    fn a_directory_that_does_not_exist_is_a_directory_with_no_plugins() {
+        // It is the state of a freshly made installation, not a failure.
+        let empty = binaries(Path::new("/does/not/exist/this/directory"));
+        assert!(matches!(empty, Ok(v) if v.is_empty()));
     }
 
     #[test]
-    fn solo_se_listan_los_ficheros_con_el_prefijo_del_proyecto() {
+    fn only_the_files_with_the_projects_prefix_are_listed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("sb-plugin-zeta"), b"z").unwrap();
-        std::fs::write(dir.path().join("sb-plugin-alfa"), b"a").unwrap();
+        std::fs::write(dir.path().join("sb-plugin-alpha"), b"a").unwrap();
         std::fs::write(dir.path().join("plugins.lock"), b"l").unwrap();
         std::fs::create_dir(dir.path().join("sb-plugin-dir")).unwrap();
 
-        let encontrados = binarios(dir.path()).unwrap();
-        let nombres: Vec<&str> = encontrados.iter().map(|(n, _)| n.as_str()).collect();
+        let found = binaries(dir.path()).unwrap();
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
-            nombres,
-            vec!["alfa", "zeta"],
-            "solo ficheros, y en orden estable"
+            names,
+            vec!["alpha", "zeta"],
+            "only files, and in a stable order"
         );
     }
 }

@@ -1,111 +1,111 @@
-// Igual que en el resto de los tests del workspace: aquí un `unwrap` es lo que
-// se quiere, que el test explote justo donde falló.
+// Just as in the rest of the workspace's tests: here an `unwrap` is what is
+// wanted, for the test to blow up exactly where it failed.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Los tests de la superficie de la CLI: los que no necesitan un plugin vivo.
+//! The tests of the CLI's surface: the ones that need no live plugin.
 //!
-//! Son los rápidos, y cubren lo que un script que llame a `shieldbk` necesita
-//! poder dar por hecho: que hay seis comandos, que los códigos de salida
-//! distinguen los tipos de error, y que en `--format json` la salida estándar
-//! es JSON **pase lo que pase**.
+//! They are the fast ones, and they cover what a script calling `shieldbk`
+//! needs to be able to take for granted: that there are six commands, that the
+//! exit codes tell the kinds of error apart, and that under `--format json`
+//! standard output is JSON **no matter what**.
 
-mod comun;
+mod common;
 
-use comun::{Banco, alterar, json_de};
+use common::{Bench, alter, json_of};
 
-/// Un error de configuración. Un script tiene que poder reaccionar distinto a
-/// «la config está mal» que a «el backup falló».
-const CODIGO_CONFIG: i32 = 2;
+/// A configuration error. A script has to be able to react differently to "the
+/// config is wrong" than to "the backup failed".
+const EXIT_CONFIG: i32 = 2;
 
 #[test]
-fn el_help_muestra_los_seis_comandos() {
-    let salida = Banco::nuevo().cmd().arg("--help").output().unwrap();
-    assert!(salida.status.success());
-    let texto = String::from_utf8_lossy(&salida.stdout).to_string();
-    for comando in ["backup", "restore", "verify", "doctor", "plugin", "storage"] {
+fn the_help_shows_the_six_commands() {
+    let out = Bench::new().cmd().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    for command in ["backup", "restore", "verify", "doctor", "plugin", "storage"] {
         assert!(
-            texto.contains(comando),
-            "el help no menciona «{comando}»:\n{texto}"
+            text.contains(command),
+            "the help does not mention `{command}`:\n{text}"
         );
     }
 }
 
 #[test]
-fn la_version_funciona() {
-    let salida = Banco::nuevo().cmd().arg("--version").output().unwrap();
-    assert!(salida.status.success());
-    let texto = String::from_utf8_lossy(&salida.stdout).to_string();
+fn the_version_works() {
+    let out = Bench::new().cmd().arg("--version").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
-        texto.contains(env!("CARGO_PKG_VERSION")),
-        "«--version» debe decir la versión: {texto}"
+        text.contains(env!("CARGO_PKG_VERSION")),
+        "`--version` must say the version: {text}"
     );
 }
 
 #[test]
-fn una_config_inexistente_da_codigo_2_y_nombra_la_ruta() {
-    let banco = Banco::nuevo();
-    let inexistente = banco.ruta("no/existe/config.toml");
-    let salida = banco
+fn a_nonexistent_config_gives_code_2_and_names_the_path() {
+    let bench = Bench::new();
+    let missing = bench.path("does/not/exist/config.toml");
+    let out = bench
         .cmd()
-        .args(["--config", &inexistente.to_string_lossy(), "doctor"])
+        .args(["--config", &missing.to_string_lossy(), "doctor"])
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_string();
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        texto.contains(&inexistente.to_string_lossy().to_string()),
-        "el error debe nombrar la ruta que buscó: {texto}"
+        text.contains(&missing.to_string_lossy().to_string()),
+        "the error must name the path it looked for: {text}"
     );
 }
 
 #[test]
-fn un_toml_invalido_da_codigo_2_y_dice_que_es_toml() {
-    let banco = Banco::nuevo();
-    let config = banco.config("esto no es toml [[[");
-    let salida = banco
-        .cmd()
-        .args(["--config", &config.to_string_lossy(), "doctor"])
-        .output()
-        .unwrap();
-
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_lowercase();
-    assert!(
-        texto.contains("toml"),
-        "el error debe decir que el problema es el TOML: {texto}"
-    );
-}
-
-#[test]
-fn una_config_sin_targets_da_codigo_2_y_lo_dice() {
-    let banco = Banco::nuevo();
-    let config = banco.config("[defaults]\ncompression_level = 6\n");
-    let salida = banco
+fn an_invalid_toml_gives_code_2_and_says_it_is_toml() {
+    let bench = Bench::new();
+    let config = bench.config("this is not toml [[[");
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "doctor"])
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_lowercase();
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let text = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(
-        texto.contains("target"),
-        "el error debe decir que faltan targets: {texto}"
+        text.contains("toml"),
+        "the error must say the problem is the TOML: {text}"
     );
 }
 
 #[test]
-fn en_json_stdout_es_json_parseable_aunque_el_comando_falle() {
-    // Es lo que hace la herramienta usable desde un script: `shieldbk --format
-    // json backup | jq` tiene que funcionar también el día que el backup falle.
-    let banco = Banco::nuevo();
-    let inexistente = banco.ruta("no/existe/config.toml");
-    let salida = banco
+fn a_config_without_targets_gives_code_2_and_says_so() {
+    let bench = Bench::new();
+    let config = bench.config("[defaults]\ncompression_level = 6\n");
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "doctor"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let text = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        text.contains("target"),
+        "the error must say targets are missing: {text}"
+    );
+}
+
+#[test]
+fn in_json_stdout_is_parseable_json_even_when_the_command_fails() {
+    // It is what makes the tool usable from a script: `shieldbk --format json
+    // backup | jq` has to work on the day the backup fails too.
+    let bench = Bench::new();
+    let missing = bench.path("does/not/exist/config.toml");
+    let out = bench
         .cmd()
         .args([
             "--config",
-            &inexistente.to_string_lossy(),
+            &missing.to_string_lossy(),
             "--format",
             "json",
             "doctor",
@@ -113,26 +113,26 @@ fn en_json_stdout_es_json_parseable_aunque_el_comando_falle() {
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let json = json_de(&salida.stdout);
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let json = json_of(&out.stdout);
     assert_eq!(json["ok"], serde_json::Value::Bool(false));
     assert!(
         json["error"]
             .as_str()
             .unwrap_or_default()
             .contains("config"),
-        "el JSON debe llevar el mensaje: {json}"
+        "the JSON must carry the message: {json}"
     );
 }
 
 #[test]
-fn en_json_ningun_log_se_cuela_en_stdout() {
-    // La salida estándar pertenece al resultado y nada más puede escribir ahí.
-    // `-vv` sube la traza a `debug`, que es cuando de verdad hay volumen de
-    // registros que colar.
-    let banco = Banco::nuevo();
-    let config = banco.config_mock("age1qqqqqqqqqq");
-    let salida = banco
+fn in_json_no_log_slips_into_stdout() {
+    // Standard output belongs to the result and nothing else may write there.
+    // `-vv` raises tracing to `debug`, which is when there really is a volume of
+    // log lines to slip through.
+    let bench = Bench::new();
+    let config = bench.config_mock("age1qqqqqqqqqq");
+    let out = bench
         .cmd()
         .args([
             "--config",
@@ -141,221 +141,221 @@ fn en_json_ningun_log_se_cuela_en_stdout() {
             "json",
             "-vv",
             "doctor",
-            "no-existe",
+            "does-not-exist",
         ])
         .output()
         .unwrap();
 
-    assert_ne!(salida.status.code(), Some(0));
-    let json = json_de(&salida.stdout);
+    assert_ne!(out.status.code(), Some(0));
+    let json = json_of(&out.stdout);
     assert_eq!(json["ok"], serde_json::Value::Bool(false));
     assert!(
-        !salida.stderr.is_empty(),
-        "con -vv tiene que haber registros, y tienen que estar en stderr"
+        !out.stderr.is_empty(),
+        "with -vv there have to be logs, and they have to be on stderr"
     );
 }
 
 #[test]
-fn plugin_lock_registra_los_binarios_del_directorio_y_escribe_el_lockfile() {
-    let banco = Banco::nuevo();
-    let config = banco.config_mock("age1qqqqqqqqqq");
-    std::fs::write(banco.dir_plugins().join("sb-plugin-uno"), b"binario uno").unwrap();
-    std::fs::write(banco.dir_plugins().join("sb-plugin-dos"), b"binario dos").unwrap();
-    // Un fichero que no es un plugin no debe acabar registrado.
-    std::fs::write(banco.dir_plugins().join("LEEME.txt"), b"no soy un plugin").unwrap();
+fn plugin_lock_registers_the_directorys_binaries_and_writes_the_lockfile() {
+    let bench = Bench::new();
+    let config = bench.config_mock("age1qqqqqqqqqq");
+    std::fs::write(bench.plugins_dir().join("sb-plugin-one"), b"binary one").unwrap();
+    std::fs::write(bench.plugins_dir().join("sb-plugin-two"), b"binary two").unwrap();
+    // A file that is not a plugin must not end up registered.
+    std::fs::write(bench.plugins_dir().join("README.txt"), b"not a plugin").unwrap();
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
 
     assert!(
-        salida.status.success(),
+        out.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&salida.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
-    let lock = std::fs::read_to_string(banco.lockfile()).unwrap();
+    let lock = std::fs::read_to_string(bench.lockfile()).unwrap();
     assert!(
-        lock.contains("uno"),
-        "el lockfile debe registrar uno: {lock}"
-    );
-    assert!(
-        lock.contains("dos"),
-        "el lockfile debe registrar dos: {lock}"
+        lock.contains("one"),
+        "the lockfile must register one: {lock}"
     );
     assert!(
-        !lock.contains("LEEME"),
-        "un fichero que no es un plugin no se registra: {lock}"
+        lock.contains("two"),
+        "the lockfile must register two: {lock}"
+    );
+    assert!(
+        !lock.contains("README"),
+        "a file that is not a plugin is not registered: {lock}"
     );
 }
 
 #[test]
-fn plugin_verify_pasa_tras_lock_y_falla_si_el_binario_cambia() {
-    let banco = Banco::nuevo();
-    let config = banco.config_mock("age1qqqqqqqqqq");
-    let binario = banco.dir_plugins().join("sb-plugin-uno");
-    std::fs::write(&binario, b"binario uno").unwrap();
+fn plugin_verify_passes_after_lock_and_fails_if_the_binary_changes() {
+    let bench = Bench::new();
+    let config = bench.config_mock("age1qqqqqqqqqq");
+    let binary = bench.plugins_dir().join("sb-plugin-one");
+    std::fs::write(&binary, b"binary one").unwrap();
 
-    let lock = banco
+    let lock = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
     assert!(lock.status.success());
 
-    let bien = banco
+    let good = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "verify"])
         .output()
         .unwrap();
     assert!(
-        bien.status.success(),
-        "recién registrado debe verificar: {}",
-        String::from_utf8_lossy(&bien.stderr)
+        good.status.success(),
+        "freshly registered it must verify: {}",
+        String::from_utf8_lossy(&good.stderr)
     );
 
-    alterar(&binario);
+    alter(&binary);
 
-    let mal = banco
+    let bad = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "verify"])
         .output()
         .unwrap();
     assert_eq!(
-        mal.status.code(),
+        bad.status.code(),
         Some(3),
-        "un binario alterado es un error de plugin"
+        "an altered binary is a plugin error"
     );
-    let texto = String::from_utf8_lossy(&mal.stderr).to_string();
+    let text = String::from_utf8_lossy(&bad.stderr).to_string();
     assert!(
-        texto.contains("uno"),
-        "el error debe nombrar el plugin alterado: {texto}"
+        text.contains("one"),
+        "the error must name the altered plugin: {text}"
     );
 }
 
 #[test]
-fn un_target_inexistente_da_un_error_que_lo_nombra() {
-    let banco = Banco::nuevo();
-    let config = banco.config_mock("age1qqqqqqqqqq");
-    let salida = banco
+fn a_nonexistent_target_gives_an_error_that_names_it() {
+    let bench = Bench::new();
+    let config = bench.config_mock("age1qqqqqqqqqq");
+    let out = bench
         .cmd()
         .args([
             "--config",
             &config.to_string_lossy(),
             "doctor",
-            "el-que-no-esta",
+            "the-one-not-there",
         ])
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_string();
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        texto.contains("el-que-no-esta"),
-        "el error debe nombrar el target que se pidió: {texto}"
+        text.contains("the-one-not-there"),
+        "the error must name the target that was asked for: {text}"
     );
     assert!(
-        texto.contains("produccion"),
-        "y ayudar diciendo cuáles hay: {texto}"
+        text.contains("production"),
+        "and help by saying which ones there are: {text}"
     );
 }
 
 #[test]
-fn la_tilde_de_las_rutas_de_la_configuracion_se_expande() {
-    // La configuración se escribe a mano y sus rutas se escriben como las
-    // escribiría una persona. Ninguna shell las expande al leerlas de un TOML,
-    // y sin esta expansión `shieldbk` crearía un directorio llamado
-    // literalmente «~» dentro del directorio de trabajo: no fallaría, haría lo
-    // correcto en el sitio equivocado.
-    let banco = Banco::nuevo();
-    let config = banco.config(
+fn the_tilde_in_the_configurations_paths_is_expanded() {
+    // The configuration is written by hand and its paths are written the way a
+    // person would write them. No shell expands them when they are read from a
+    // TOML, and without this expansion `shieldbk` would create a directory
+    // literally named `~` inside the working directory: it would not fail, it
+    // would do the right thing in the wrong place.
+    let bench = Bench::new();
+    let config = bench.config(
         r#"
 [plugins]
 dir = "~/plugins"
 lockfile = "~/plugins.lock"
 
 [[target]]
-name = "produccion"
+name = "production"
 engine = "mock"
 storage = "mock"
 recipient = "age1qqqqqqqqqq"
 "#,
     );
-    std::fs::write(banco.dir_plugins().join("sb-plugin-uno"), b"uno").unwrap();
+    std::fs::write(bench.plugins_dir().join("sb-plugin-one"), b"one").unwrap();
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
 
     assert!(
-        salida.status.success(),
+        out.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&salida.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        banco.lockfile().is_file(),
-        "el lockfile tenía que acabar en «{}», que es donde apunta ~",
-        banco.lockfile().display()
+        bench.lockfile().is_file(),
+        "the lockfile had to end up at `{}`, which is where ~ points",
+        bench.lockfile().display()
     );
     assert!(
-        !banco.ruta("~").exists(),
-        "no puede haberse creado un directorio llamado literalmente «~»"
+        !bench.path("~").exists(),
+        "a directory literally named `~` cannot have been created"
     );
 }
 
-// ── Instalar plugins es un paso anterior a configurar destinos ──────────────
+// -- Installing plugins is a step that comes before configuring targets ------
 //
-// El lockfile solo depende del directorio de plugins, así que los comandos que
-// lo manejan tienen que funcionar con una configuración que todavía no declara
-// ningún `[[target]]`. Los que sí respaldan algo siguen exigiéndolos: la
-// distinción es justo lo que estos tests fijan.
+// The lockfile only depends on the plugins directory, so the commands that
+// manage it have to work with a configuration that does not declare any
+// `[[target]]` yet. The ones that do back something up keep requiring them: the
+// distinction is exactly what these tests pin down.
 
 #[test]
-fn plugin_lock_funciona_con_una_config_de_solo_plugins() {
-    let banco = Banco::nuevo();
-    let config = banco.config_solo_plugins();
-    std::fs::write(banco.dir_plugins().join("sb-plugin-uno"), b"binario uno").unwrap();
-    std::fs::write(banco.dir_plugins().join("sb-plugin-dos"), b"binario dos").unwrap();
+fn plugin_lock_works_with_a_plugins_only_config() {
+    let bench = Bench::new();
+    let config = bench.config_plugins_only();
+    std::fs::write(bench.plugins_dir().join("sb-plugin-one"), b"binary one").unwrap();
+    std::fs::write(bench.plugins_dir().join("sb-plugin-two"), b"binary two").unwrap();
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
 
     assert!(
-        salida.status.success(),
-        "sellar el lockfile no necesita ningún target; stderr: {}",
-        String::from_utf8_lossy(&salida.stderr)
+        out.status.success(),
+        "sealing the lockfile needs no target; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let lock = std::fs::read_to_string(banco.lockfile()).unwrap();
+    let lock = std::fs::read_to_string(bench.lockfile()).unwrap();
     assert!(
-        lock.contains("uno"),
-        "el lockfile debe registrar uno: {lock}"
+        lock.contains("one"),
+        "the lockfile must register one: {lock}"
     );
     assert!(
-        lock.contains("dos"),
-        "el lockfile debe registrar dos: {lock}"
+        lock.contains("two"),
+        "the lockfile must register two: {lock}"
     );
 }
 
 #[test]
-fn plugin_verify_y_list_funcionan_con_una_config_de_solo_plugins() {
-    let banco = Banco::nuevo();
-    let config = banco.config_solo_plugins();
-    std::fs::write(banco.dir_plugins().join("sb-plugin-uno"), b"binario uno").unwrap();
+fn plugin_verify_and_list_work_with_a_plugins_only_config() {
+    let bench = Bench::new();
+    let config = bench.config_plugins_only();
+    std::fs::write(bench.plugins_dir().join("sb-plugin-one"), b"binary one").unwrap();
 
-    let lock = banco
+    let lock = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
     assert!(lock.status.success());
 
-    let verify = banco
+    let verify = bench
         .cmd()
         .args([
             "--config",
@@ -372,9 +372,9 @@ fn plugin_verify_y_list_funcionan_con_una_config_de_solo_plugins() {
         "stderr: {}",
         String::from_utf8_lossy(&verify.stderr)
     );
-    assert_eq!(json_de(&verify.stdout)["fallidos"], 0);
+    assert_eq!(json_of(&verify.stdout)["failed"], 0);
 
-    let list = banco
+    let list = bench
         .cmd()
         .args([
             "--config",
@@ -391,47 +391,47 @@ fn plugin_verify_y_list_funcionan_con_una_config_de_solo_plugins() {
         "stderr: {}",
         String::from_utf8_lossy(&list.stderr)
     );
-    let json = json_de(&list.stdout);
-    assert_eq!(json["plugins"][0]["nombre"], "uno");
-    assert_eq!(json["plugins"][0]["estado"], "registrado");
+    let json = json_of(&list.stdout);
+    assert_eq!(json["plugins"][0]["name"], "one");
+    assert_eq!(json["plugins"][0]["status"], "registered");
 }
 
 #[test]
-fn backup_con_una_config_de_solo_plugins_sigue_exigiendo_targets() {
-    // Lo contrario sería peor que el problema que se arregla: un `backup` que
-    // arranca, no encuentra nada que respaldar y termina «bien».
-    let banco = Banco::nuevo();
-    let config = banco.config_solo_plugins();
+fn backup_with_a_plugins_only_config_still_requires_targets() {
+    // The opposite would be worse than the problem it fixes: a `backup` that
+    // starts, finds nothing to back up and finishes "fine".
+    let bench = Bench::new();
+    let config = bench.config_plugins_only();
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "backup"])
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_lowercase();
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let text = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(
-        texto.contains("target"),
-        "el error debe decir que faltan targets: {texto}"
+        text.contains("target"),
+        "the error must say targets are missing: {text}"
     );
 }
 
 #[test]
-fn doctor_con_una_config_de_solo_plugins_sigue_exigiendo_targets() {
-    let banco = Banco::nuevo();
-    let config = banco.config_solo_plugins();
+fn doctor_with_a_plugins_only_config_still_requires_targets() {
+    let bench = Bench::new();
+    let config = bench.config_plugins_only();
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "doctor"])
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(CODIGO_CONFIG));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_lowercase();
+    assert_eq!(out.status.code(), Some(EXIT_CONFIG));
+    let text = String::from_utf8_lossy(&out.stderr).to_lowercase();
     assert!(
-        texto.contains("target"),
-        "el error debe decir que faltan targets: {texto}"
+        text.contains("target"),
+        "the error must say targets are missing: {text}"
     );
 }

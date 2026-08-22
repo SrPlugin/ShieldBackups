@@ -1,16 +1,15 @@
-//! El error de la CLI y, con él, el código con el que termina el proceso.
+//! The CLI's error and, with it, the code the process ends with.
 //!
-//! Un script que llama a `shieldbk` desde un `cron` necesita reaccionar
-//! distinto según **qué** haya fallado: una configuración mal escrita se
-//! arregla editando un fichero y no tiene sentido reintentarla, un plugin
-//! alterado es un incidente de seguridad, y un backup que se rompe a mitad
-//! probablemente se pueda repetir dentro de una hora. Un único «salió mal»
-//! obligaría a todos ellos a leer el mensaje, que es justo lo que un programa
-//! no debería tener que hacer.
+//! A script calling `shieldbk` from a `cron` needs to react differently
+//! depending on **what** failed: a badly written configuration is fixed by
+//! editing a file and there is no point retrying it, an altered plugin is a
+//! security incident, and a backup that breaks halfway can probably be repeated
+//! in an hour. A single "it went wrong" would force all of them to read the
+//! message, which is exactly what a program should not have to do.
 //!
-//! Por eso este enum tiene exactamente tres variantes y no una por cada tipo
-//! de error del núcleo: las clases son las que un script puede distinguir, no
-//! las que el código produce. El detalle completo va dentro del mensaje.
+//! That is why this enum has exactly three variants and not one per kind of
+//! core error: the classes are the ones a script can tell apart, not the ones
+//! the code produces. The full detail goes inside the message.
 
 use sb_config::{ConfigError, ValidationError};
 use sb_core::lockfile::LockfileError;
@@ -19,113 +18,117 @@ use sb_core::ops::BackupError;
 use sb_core::plugin::PluginError;
 use sb_crypto::AgeError;
 
-/// La configuración no sirve: falta, no se entiende o dice algo imposible.
-pub const CODIGO_CONFIG: i32 = 2;
-/// Un plugin no se pudo usar: no está, no está registrado, o cambió.
-pub const CODIGO_PLUGIN: i32 = 3;
-/// La operación falló: el volcado, la subida, la descarga o el diagnóstico.
-pub const CODIGO_OPERACION: i32 = 4;
+/// The configuration is unusable: it is missing, unreadable or says something
+/// impossible.
+pub const EXIT_CONFIG: i32 = 2;
+/// A plugin could not be used: it is not there, it is not registered, or it
+/// changed.
+pub const EXIT_PLUGIN: i32 = 3;
+/// The operation failed: the dump, the upload, the download or the diagnosis.
+pub const EXIT_OPERATION: i32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    /// Nada llegó a ejecutarse porque lo que se pidió no tiene sentido.
+    /// Nothing got to run because what was asked for makes no sense.
     #[error("{0}")]
     Config(String),
-    /// El plugin no se pudo poner en marcha, o no se debía.
+    /// The plugin could not be started, or should not have been.
     #[error("{0}")]
     Plugin(String),
-    /// Todo estaba en su sitio y la operación falló igualmente.
+    /// Everything was in place and the operation failed anyway.
     #[error("{0}")]
-    Operacion(String),
+    Operation(String),
 }
 
 impl CliError {
-    pub fn config(mensaje: impl Into<String>) -> Self {
-        Self::Config(mensaje.into())
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::Config(message.into())
     }
 
-    pub fn plugin(mensaje: impl Into<String>) -> Self {
-        Self::Plugin(mensaje.into())
+    pub fn plugin(message: impl Into<String>) -> Self {
+        Self::Plugin(message.into())
     }
 
-    pub fn operacion(mensaje: impl Into<String>) -> Self {
-        Self::Operacion(mensaje.into())
+    pub fn operation(message: impl Into<String>) -> Self {
+        Self::Operation(message.into())
     }
 
-    /// El código con el que termina el proceso.
+    /// The code the process ends with.
     #[must_use]
-    pub fn codigo(&self) -> i32 {
+    pub fn code(&self) -> i32 {
         match self {
-            Self::Config(_) => CODIGO_CONFIG,
-            Self::Plugin(_) => CODIGO_PLUGIN,
-            Self::Operacion(_) => CODIGO_OPERACION,
+            Self::Config(_) => EXIT_CONFIG,
+            Self::Plugin(_) => EXIT_PLUGIN,
+            Self::Operation(_) => EXIT_OPERATION,
         }
     }
 
-    /// El nombre de la clase, para el JSON. Es el mismo dato que el código,
-    /// pero legible: `jq '.clase'` es más claro que memorizar que 3 es plugin.
+    /// The class name, for the JSON. It is the same fact as the code, but
+    /// readable: `jq '.class'` is clearer than memorising that 3 means plugin.
     #[must_use]
-    pub fn clase(&self) -> &'static str {
+    pub fn class(&self) -> &'static str {
         match self {
             Self::Config(_) => "config",
             Self::Plugin(_) => "plugin",
-            Self::Operacion(_) => "operacion",
+            Self::Operation(_) => "operation",
         }
     }
 
-    /// Una copia con la misma clase y el mismo mensaje.
+    /// A copy with the same class and the same message.
     ///
-    /// `CliError` no es `Clone` a propósito: un error se propaga, no se
-    /// duplica. Las dos excepciones son reales y están acotadas —emitirlo por
-    /// la salida y agrupar los de varios targets sin sacarlos del informe—, y
-    /// tener la copia aquí evita que cada una se escriba su propio `match`.
+    /// `CliError` is deliberately not `Clone`: an error is propagated, not
+    /// duplicated. The two exceptions are real and bounded -- emitting it on
+    /// the output and grouping several targets' errors without taking them out
+    /// of the report -- and having the copy here keeps each of them from
+    /// writing its own `match`.
     #[must_use]
-    pub fn duplicar(&self) -> Self {
+    pub fn duplicate(&self) -> Self {
         match self {
             Self::Config(m) => Self::Config(m.clone()),
             Self::Plugin(m) => Self::Plugin(m.clone()),
-            Self::Operacion(m) => Self::Operacion(m.clone()),
+            Self::Operation(m) => Self::Operation(m.clone()),
         }
     }
 
-    /// Junta los fallos de varios targets en uno solo.
+    /// Joins several targets' failures into a single one.
     ///
-    /// La clase se conserva **solo si todos coinciden**. Con un único target
-    /// eso significa que un plugin sin registrar sale con el código de plugin,
-    /// que es lo que un script necesita para no reintentar algo que nunca va a
-    /// funcionar solo. Con varios targets fallando por motivos distintos no hay
-    /// una clase que los represente, y fingir que sí la hay sería peor que
-    /// decir «falló la operación»: mandaría al script a arreglar lo que no era.
+    /// The class is kept **only if they all agree**. With a single target that
+    /// means an unregistered plugin exits with the plugin code, which is what a
+    /// script needs in order not to retry something that will never fix itself.
+    /// With several targets failing for different reasons there is no class
+    /// that represents them, and pretending there is would be worse than saying
+    /// "the operation failed": it would send the script off to fix the wrong
+    /// thing.
     ///
-    /// Con la lista vacía no hay nada que agrupar y devuelve `None`.
+    /// With an empty list there is nothing to group and it returns `None`.
     #[must_use]
-    pub fn agrupar(mensaje: impl Into<String>, fallos: &[Self]) -> Option<Self> {
-        let primera = fallos.first()?.clase();
-        let mensaje = mensaje.into();
-        if fallos.iter().all(|f| f.clase() == primera) {
-            Some(match fallos[0] {
-                Self::Config(_) => Self::Config(mensaje),
-                Self::Plugin(_) => Self::Plugin(mensaje),
-                Self::Operacion(_) => Self::Operacion(mensaje),
+    pub fn group(message: impl Into<String>, failures: &[Self]) -> Option<Self> {
+        let first = failures.first()?.class();
+        let message = message.into();
+        if failures.iter().all(|f| f.class() == first) {
+            Some(match failures[0] {
+                Self::Config(_) => Self::Config(message),
+                Self::Plugin(_) => Self::Plugin(message),
+                Self::Operation(_) => Self::Operation(message),
             })
         } else {
-            Some(Self::Operacion(mensaje))
+            Some(Self::Operation(message))
         }
     }
 }
 
 impl From<ConfigError> for CliError {
     fn from(e: ConfigError) -> Self {
-        Self::Config(format!("la configuración no se pudo usar: {e}"))
+        Self::Config(format!("the configuration could not be used: {e}"))
     }
 }
 
 impl From<ValidationError> for CliError {
     fn from(e: ValidationError) -> Self {
-        // Validar contra el esquema del plugin es tarde en el tiempo pero
-        // temprano en la causa: lo que está mal es el fichero de configuración,
-        // así que el código de salida tiene que ser el de configuración aunque
-        // haya hecho falta arrancar un plugin para descubrirlo.
+        // Validating against the plugin's schema is late in time but early in
+        // cause: what is wrong is the configuration file, so the exit code has
+        // to be the configuration one even though a plugin had to be started to
+        // discover it.
         Self::Config(e.to_string())
     }
 }
@@ -144,9 +147,10 @@ impl From<AgeError> for CliError {
 
 impl From<LockfileError> for CliError {
     fn from(e: LockfileError) -> Self {
-        // El mensaje de `sb-core::lockfile` ya dice qué hacer —incluido el
-        // `shieldbk plugin lock <nombre>` que hay que teclear—, así que no se
-        // envuelve en nada: envolverlo solo lo alejaría del ojo.
+        // The message from `sb-core::lockfile` already says what to do --
+        // including the `shieldbk plugin lock <name>` that has to be typed --
+        // so it is not wrapped in anything: wrapping it would only push it away
+        // from the eye.
         Self::Plugin(e.to_string())
     }
 }
@@ -159,10 +163,10 @@ impl From<PluginError> for CliError {
 
 impl From<BackupError> for CliError {
     fn from(e: BackupError) -> Self {
-        // Un `BackupError` llega cuando la operación ya estaba en marcha,
-        // incluidos los suyos que envuelven un `PluginError`: para quien
-        // reintenta, el hecho relevante es que el backup no está.
-        Self::Operacion(e.to_string())
+        // A `BackupError` arrives once the operation was already under way,
+        // including those of its own that wrap a `PluginError`: for whoever
+        // retries, the relevant fact is that the backup is not there.
+        Self::Operation(e.to_string())
     }
 }
 
@@ -171,72 +175,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cada_clase_tiene_su_propio_codigo() {
-        // Es toda la razón de ser de este módulo: un script tiene que poder
-        // distinguir «arregla el TOML» de «vuelve a intentarlo».
-        assert_eq!(CliError::config("x").codigo(), CODIGO_CONFIG);
-        assert_eq!(CliError::plugin("x").codigo(), CODIGO_PLUGIN);
-        assert_eq!(CliError::operacion("x").codigo(), CODIGO_OPERACION);
+    fn each_class_has_its_own_code() {
+        // It is this module's whole reason to exist: a script must be able to
+        // tell "fix the TOML" from "try again".
+        assert_eq!(CliError::config("x").code(), EXIT_CONFIG);
+        assert_eq!(CliError::plugin("x").code(), EXIT_PLUGIN);
+        assert_eq!(CliError::operation("x").code(), EXIT_OPERATION);
 
-        let codigos = [CODIGO_CONFIG, CODIGO_PLUGIN, CODIGO_OPERACION];
-        assert!(
-            !codigos.contains(&0),
-            "ninguna clase de error puede salir con éxito"
-        );
+        let codes = [EXIT_CONFIG, EXIT_PLUGIN, EXIT_OPERATION];
+        assert!(!codes.contains(&0), "no error class can exit successfully");
     }
 
     #[test]
-    fn un_lockfile_que_no_cuadra_es_un_error_de_plugin_y_conserva_su_remedio() {
+    fn a_lockfile_that_does_not_add_up_is_a_plugin_error_and_keeps_its_remedy() {
         let error = CliError::from(LockfileError::NotRegistered {
             name: "postgres".into(),
             path: "/opt/sb-plugin-postgres".into(),
         });
-        assert_eq!(error.codigo(), CODIGO_PLUGIN);
+        assert_eq!(error.code(), EXIT_PLUGIN);
         assert!(
             error.to_string().contains("plugin lock postgres"),
-            "el remedio del núcleo tiene que llegar intacto: {error}"
+            "the core's remedy has to arrive intact: {error}"
         );
     }
 
     #[test]
-    fn agrupar_un_solo_fallo_conserva_su_clase() {
-        // El caso que importa: un target, un plugin sin registrar. El script
-        // tiene que ver un 3 y no reintentar algo que nunca va a arreglarse
-        // solo.
-        let agrupado = CliError::agrupar("1 de 1 falló", &[CliError::plugin("no registrado")]);
-        assert_eq!(agrupado.map(|e| e.codigo()), Some(CODIGO_PLUGIN));
+    fn grouping_a_single_failure_keeps_its_class() {
+        // The case that matters: one target, one unregistered plugin. The
+        // script has to see a 3 and not retry something that will never fix
+        // itself.
+        let grouped = CliError::group("1 of 1 failed", &[CliError::plugin("not registered")]);
+        assert_eq!(grouped.map(|e| e.code()), Some(EXIT_PLUGIN));
     }
 
     #[test]
-    fn agrupar_fallos_de_la_misma_clase_la_conserva() {
-        let agrupado = CliError::agrupar("2 de 2", &[CliError::plugin("a"), CliError::plugin("b")]);
-        assert_eq!(agrupado.map(|e| e.codigo()), Some(CODIGO_PLUGIN));
+    fn grouping_failures_of_the_same_class_keeps_it() {
+        let grouped = CliError::group("2 of 2", &[CliError::plugin("a"), CliError::plugin("b")]);
+        assert_eq!(grouped.map(|e| e.code()), Some(EXIT_PLUGIN));
     }
 
     #[test]
-    fn agrupar_clases_distintas_cae_en_la_general() {
-        // No hay una clase que represente a «uno por el TOML y otro por la
-        // red»: fingir que sí la hay mandaría al script a arreglar lo que no
-        // era.
-        let agrupado =
-            CliError::agrupar("2 de 3", &[CliError::config("a"), CliError::operacion("b")]);
-        assert_eq!(agrupado.map(|e| e.codigo()), Some(CODIGO_OPERACION));
+    fn grouping_different_classes_falls_back_to_the_general_one() {
+        // There is no class that represents "one because of the TOML and
+        // another because of the network": pretending there is would send the
+        // script off to fix the wrong thing.
+        let grouped = CliError::group("2 of 3", &[CliError::config("a"), CliError::operation("b")]);
+        assert_eq!(grouped.map(|e| e.code()), Some(EXIT_OPERATION));
     }
 
     #[test]
-    fn agrupar_sin_fallos_no_inventa_ninguno() {
-        assert!(CliError::agrupar("nada", &[]).is_none());
+    fn grouping_no_failures_does_not_invent_one() {
+        assert!(CliError::group("nothing", &[]).is_none());
     }
 
     #[test]
-    fn un_fallo_de_validacion_se_cuenta_como_configuracion() {
-        // Hace falta un plugin vivo para descubrirlo, pero lo que hay que
-        // arreglar es el fichero: reintentarlo no lo va a cambiar.
+    fn a_validation_failure_counts_as_configuration() {
+        // A live plugin is needed to discover it, but what has to be fixed is
+        // the file: retrying will not change it.
         let error = CliError::from(ValidationError::MissingRequiredField {
             section: "engine".into(),
             field: "host".into(),
         });
-        assert_eq!(error.codigo(), CODIGO_CONFIG);
-        assert_eq!(error.clase(), "config");
+        assert_eq!(error.code(), EXIT_CONFIG);
+        assert_eq!(error.class(), "config");
     }
 }

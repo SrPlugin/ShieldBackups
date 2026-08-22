@@ -1,33 +1,33 @@
-// Igual que en el resto de los tests del workspace: aquí un `unwrap` es lo que
-// se quiere, que el test explote justo donde falló.
+// Just as in the rest of the workspace's tests: here an `unwrap` is what is
+// wanted, for the test to blow up exactly where it failed.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! El ciclo real de la CLI contra `sb-plugin-mock`.
+//! The CLI's real cycle against `sb-plugin-mock`.
 //!
-//! `cli.rs` comprueba la superficie; esto comprueba que la superficie está
-//! conectada a algo. Se ejecuta el binario de verdad, arrancando plugins de
-//! verdad, y se mira el directorio del destino para ver si el artefacto está
-//! donde la CLI dice que lo dejó.
+//! `cli.rs` checks the surface; this checks that the surface is connected to
+//! something. The real binary is run, starting real plugins, and the storage
+//! target's directory is inspected to see whether the artifact is where the CLI
+//! says it left it.
 //!
-//! Dos de estos tests no son del ciclo feliz y son los que más importan: el
-//! que comprueba que **sin `plugin lock` no se ejecuta nada** y el que
-//! comprueba que **un binario alterado después del `lock` tampoco**. Un plugin
-//! recibe las credenciales de la base de datos y del almacenamiento; que esa
-//! puerta esté cerrada es la propiedad de seguridad que sostiene la
-//! arquitectura entera.
+//! Two of these tests are not from the happy path and they are the ones that
+//! matter most: the one checking that **without `plugin lock` nothing runs**
+//! and the one checking that **a binary altered after the `lock` does not run
+//! either**. A plugin receives the database's and the storage's credentials;
+//! that this door is shut is the security property that holds the whole
+//! architecture up.
 
-mod comun;
+mod common;
 
-use comun::{Banco, alterar, json_de};
+use common::{Bench, alter, json_of};
 
 use sb_crypto::Identity;
 
-/// Una identidad nueva y su fichero de clave, como los escribiría `age-keygen`.
-fn identidad(banco: &Banco) -> (Identity, std::path::PathBuf) {
+/// A fresh identity and its key file, as `age-keygen` would write them.
+fn identity(bench: &Bench) -> (Identity, std::path::PathBuf) {
     let id = Identity::generate();
-    let ruta = banco.ruta("clave.age");
+    let path = bench.path("key.age");
     std::fs::write(
-        &ruta,
+        &path,
         format!(
             "# created: 2026-08-21T00:00:00Z\n# public key: {}\n{}\n",
             id.to_recipient(),
@@ -35,212 +35,212 @@ fn identidad(banco: &Banco) -> (Identity, std::path::PathBuf) {
         ),
     )
     .unwrap();
-    (id, ruta)
+    (id, path)
 }
 
-/// Deja el banco listo: mock instalado, registrado y una config que lo usa.
-fn preparado() -> (Banco, std::path::PathBuf, Identity, std::path::PathBuf) {
-    let banco = Banco::nuevo();
-    banco.instalar_mock();
-    let (id, clave) = identidad(&banco);
-    let config = banco.config_mock(&id.to_recipient().to_string());
+/// Leaves the bench ready: mock installed, registered and a config using it.
+fn prepared() -> (Bench, std::path::PathBuf, Identity, std::path::PathBuf) {
+    let bench = Bench::new();
+    bench.install_mock();
+    let (id, key) = identity(&bench);
+    let config = bench.config_mock(&id.to_recipient().to_string());
 
-    let lock = banco
+    let lock = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
     assert!(
         lock.status.success(),
-        "plugin lock falló: {}",
+        "plugin lock failed: {}",
         String::from_utf8_lossy(&lock.stderr)
     );
 
-    (banco, config, id, clave)
+    (bench, config, id, key)
 }
 
 #[test]
-fn el_ciclo_lock_doctor_backup_verify_funciona_de_principio_a_fin() {
-    let (banco, config, _id, _clave) = preparado();
+fn the_lock_doctor_backup_verify_cycle_works_end_to_end() {
+    let (bench, config, _id, _key) = prepared();
     let config = config.to_string_lossy().into_owned();
 
-    let doctor = banco
+    let doctor = bench
         .cmd()
         .args(["--config", &config, "doctor"])
         .output()
         .unwrap();
     assert!(
         doctor.status.success(),
-        "doctor falló:\nstdout: {}\nstderr: {}",
+        "doctor failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
 
-    let backup = banco
+    let backup = bench
         .cmd()
         .args(["--config", &config, "backup"])
         .output()
         .unwrap();
     assert!(
         backup.status.success(),
-        "backup falló:\nstdout: {}\nstderr: {}",
+        "backup failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&backup.stdout),
         String::from_utf8_lossy(&backup.stderr)
     );
 
-    // El artefacto tiene que estar de verdad en el destino, no solo dicho.
-    let artefactos: Vec<_> = walk(&banco.dir_datos())
+    // The artifact has to really be in the storage target, not just claimed.
+    let artifacts: Vec<_> = walk(&bench.data_dir())
         .into_iter()
         .filter(|r| !r.ends_with(".manifest.json"))
         .collect();
     assert_eq!(
-        artefactos.len(),
+        artifacts.len(),
         1,
-        "se esperaba un artefacto: {artefactos:?}"
+        "one artifact was expected: {artifacts:?}"
     );
 
-    let verify = banco
+    let verify = bench
         .cmd()
-        .args(["--config", &config, "verify", "produccion"])
+        .args(["--config", &config, "verify", "production"])
         .output()
         .unwrap();
     assert!(
         verify.status.success(),
-        "verify falló:\nstdout: {}\nstderr: {}",
+        "verify failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&verify.stdout),
         String::from_utf8_lossy(&verify.stderr)
     );
-    let texto = String::from_utf8_lossy(&verify.stdout).to_string();
+    let text = String::from_utf8_lossy(&verify.stdout).to_string();
     assert!(
-        texto.contains("1/1"),
-        "verify sin artefacto debe comprobar todos los del target: {texto}"
+        text.contains("1/1"),
+        "verify with no artifact must check every artifact of the target: {text}"
     );
 }
 
 #[test]
-fn sin_plugin_lock_previo_el_backup_se_niega_y_dice_como_registrarlo() {
-    // La puerta que sostiene la arquitectura: shieldbk no ejecuta binarios que
-    // no ha verificado, porque a un plugin se le entregan las credenciales de
-    // la base de datos.
-    let banco = Banco::nuevo();
-    banco.instalar_mock();
-    let (id, _clave) = identidad(&banco);
-    let config = banco.config_mock(&id.to_recipient().to_string());
+fn without_a_previous_plugin_lock_the_backup_refuses_and_says_how_to_register_it() {
+    // The door that holds the architecture up: shieldbk does not run binaries
+    // it has not verified, because a plugin is handed the database's
+    // credentials.
+    let bench = Bench::new();
+    bench.install_mock();
+    let (id, _key) = identity(&bench);
+    let config = bench.config_mock(&id.to_recipient().to_string());
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "backup"])
         .output()
         .unwrap();
 
     assert_eq!(
-        salida.status.code(),
+        out.status.code(),
         Some(3),
-        "un plugin sin registrar es un error de plugin"
+        "an unregistered plugin is a plugin error"
     );
-    let texto = String::from_utf8_lossy(&salida.stderr).to_string();
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        texto.contains("plugin lock"),
-        "el mensaje debe decir cómo registrarlo: {texto}"
+        text.contains("plugin lock"),
+        "the message must say how to register it: {text}"
     );
     assert!(
-        texto.contains("mock"),
-        "y qué plugin es el que no está registrado: {texto}"
+        text.contains("mock"),
+        "and which plugin is the unregistered one: {text}"
     );
 
-    // Y sobre todo: no puede haber quedado nada en el destino.
+    // And above all: nothing can have been left in the storage target.
     assert!(
-        walk(&banco.dir_datos()).is_empty(),
-        "un backup que se negó a ejecutarse no puede haber escrito nada"
+        walk(&bench.data_dir()).is_empty(),
+        "a backup that refused to run cannot have written anything"
     );
 }
 
 #[test]
-fn si_el_binario_cambia_despues_del_lock_el_backup_se_niega_y_lo_explica() {
-    let (banco, config, _id, _clave) = preparado();
-    alterar(&banco.dir_plugins().join("sb-plugin-mock"));
+fn if_the_binary_changes_after_the_lock_the_backup_refuses_and_explains_it() {
+    let (bench, config, _id, _key) = prepared();
+    alter(&bench.plugins_dir().join("sb-plugin-mock"));
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "backup"])
         .output()
         .unwrap();
 
-    assert_eq!(salida.status.code(), Some(3));
-    let texto = String::from_utf8_lossy(&salida.stderr).to_string();
+    assert_eq!(out.status.code(), Some(3));
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        texto.contains("has changed"),
-        "el mensaje debe explicar que el binario cambió: {texto}"
+        text.contains("has changed"),
+        "the message must explain that the binary changed: {text}"
     );
     assert!(
-        texto.contains("sha256"),
-        "y enseñar los dos hashes para poder comprobarlo: {texto}"
+        text.contains("sha256"),
+        "and show both hashes so it can be checked: {text}"
     );
-    assert!(walk(&banco.dir_datos()).is_empty());
+    assert!(walk(&bench.data_dir()).is_empty());
 }
 
 #[test]
-fn restore_reproduce_los_datos_que_el_motor_habia_volcado() {
-    // Es lo único que justifica el proyecto: un backup que no restaura no es
-    // un backup.
-    let (banco, config, _id, clave) = preparado();
+fn restore_reproduces_the_data_the_engine_had_dumped() {
+    // It is the only thing that justifies the project: a backup that does not
+    // restore is not a backup.
+    let (bench, config, _id, key) = prepared();
     let config = config.to_string_lossy().into_owned();
 
-    let backup = banco
+    let backup = bench
         .cmd()
         .args(["--config", &config, "--format", "json", "backup"])
         .output()
         .unwrap();
     assert!(backup.status.success());
-    let json = json_de(&backup.stdout);
-    let artefacto = json["targets"][0]["artifact_key"].as_str().unwrap();
+    let json = json_of(&backup.stdout);
+    let artifact = json["targets"][0]["artifact_key"].as_str().unwrap();
 
-    let restore = banco
+    let restore = bench
         .cmd()
         .args([
             "--config",
             &config,
             "restore",
-            "produccion",
-            artefacto,
+            "production",
+            artifact,
             "--identity",
-            &clave.to_string_lossy(),
+            &key.to_string_lossy(),
         ])
         .output()
         .unwrap();
     assert!(
         restore.status.success(),
-        "restore falló:\nstdout: {}\nstderr: {}",
+        "restore failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&restore.stdout),
         String::from_utf8_lossy(&restore.stderr)
     );
 
-    // El motor mock deja en `restore.bin` lo que recibe, y su volcado es
-    // determinista: se puede regenerar aquí y comparar byte a byte.
-    let restaurado = std::fs::read(banco.dir_datos().join("restore.bin")).unwrap();
-    let esperado: Vec<u8> = sb_plugin_mock::deterministic_data(7, 65536).collect();
+    // The mock engine leaves what it receives in `restore.bin`, and its dump is
+    // deterministic: it can be regenerated here and compared byte for byte.
+    let restored = std::fs::read(bench.data_dir().join("restore.bin")).unwrap();
+    let expected: Vec<u8> = sb_plugin_mock::deterministic_data(7, 65536).collect();
     assert_eq!(
-        restaurado, esperado,
-        "el ciclo completo por la CLI no reprodujo los datos originales"
+        restored, expected,
+        "the full cycle through the CLI did not reproduce the original data"
     );
 }
 
 #[test]
-fn doctor_detecta_un_recipient_invalido_en_la_configuracion() {
-    // Una errata en la clave pública no da ningún error hasta que alguien
-    // intenta restaurar, y entonces ya no hay nada que hacer. `doctor` la
-    // convierte en un fallo inmediato.
-    let banco = Banco::nuevo();
-    banco.instalar_mock();
-    let config = banco.config_mock("age1esto-no-es-una-clave-publica");
-    let lock = banco
+fn doctor_detects_an_invalid_recipient_in_the_configuration() {
+    // A typo in the public key gives no error until somebody tries to restore,
+    // and then there is nothing to be done. `doctor` turns it into an immediate
+    // failure.
+    let bench = Bench::new();
+    bench.install_mock();
+    let config = bench.config_mock("age1this-is-not-a-public-key");
+    let lock = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
     assert!(lock.status.success());
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args([
             "--config",
@@ -253,37 +253,34 @@ fn doctor_detecta_un_recipient_invalido_en_la_configuracion() {
         .unwrap();
 
     assert_eq!(
-        salida.status.code(),
+        out.status.code(),
         Some(4),
-        "un diagnóstico con fallos es un error de operación"
+        "a diagnosis with failures is an operation error"
     );
-    let json = json_de(&salida.stdout);
+    let json = json_of(&out.stdout);
     assert_eq!(json["ok"], serde_json::Value::Bool(false));
 
     let checks = json["targets"][0]["checks"].as_array().unwrap();
-    let recipiente = checks
+    let recipient = checks
         .iter()
-        .find(|c| c["nombre"] == "recipient")
-        .expect("doctor tiene que comprobar el recipient");
-    assert_eq!(recipiente["ok"], serde_json::Value::Bool(false));
+        .find(|c| c["name"] == "recipient")
+        .expect("doctor has to check the recipient");
+    assert_eq!(recipient["ok"], serde_json::Value::Bool(false));
     assert_eq!(
-        recipiente["origen"], "config",
-        "el problema está en el fichero, no en un plugin"
+        recipient["origin"], "config",
+        "the problem is in the file, not in a plugin"
     );
     assert!(
-        !recipiente["remedio"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty(),
-        "un check que falla sin remedio no sirve de nada"
+        !recipient["remedy"].as_str().unwrap_or_default().is_empty(),
+        "a check that fails without a remedy is useless"
     );
 }
 
 #[test]
-fn el_backup_en_json_da_la_clave_del_artefacto() {
-    let (banco, config, _id, _clave) = preparado();
+fn the_backup_in_json_gives_the_artifacts_key() {
+    let (bench, config, _id, _key) = prepared();
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args([
             "--config",
@@ -295,31 +292,29 @@ fn el_backup_en_json_da_la_clave_del_artefacto() {
         ])
         .output()
         .unwrap();
-    assert!(salida.status.success());
+    assert!(out.status.success());
 
-    // Con `-vv` hay registros de sobra; ninguno puede haberse colado aquí.
-    let json = json_de(&salida.stdout);
+    // With `-vv` there are plenty of logs; none of them can have slipped in
+    // here.
+    let json = json_of(&out.stdout);
     assert_eq!(json["ok"], serde_json::Value::Bool(true));
-    let clave = json["targets"][0]["artifact_key"].as_str().unwrap();
+    let key = json["targets"][0]["artifact_key"].as_str().unwrap();
     assert!(
-        clave.starts_with("produccion/"),
-        "la clave sale de la plantilla del target: {clave}"
+        key.starts_with("production/"),
+        "the key comes from the target's template: {key}"
     );
-    assert!(clave.ends_with(".dump.zst.age"), "{clave}");
+    assert!(key.ends_with(".dump.zst.age"), "{key}");
     assert!(
-        banco.dir_datos().join(clave).is_file(),
-        "el artefacto que dice el JSON tiene que existir: {clave}"
+        bench.data_dir().join(key).is_file(),
+        "the artifact the JSON names has to exist: {key}"
     );
-    assert!(
-        !salida.stderr.is_empty(),
-        "con -vv hay registros, en stderr"
-    );
+    assert!(!out.stderr.is_empty(), "with -vv there are logs, on stderr");
 }
 
 #[test]
-fn storage_gc_habla_con_el_destino_y_cuenta_lo_que_abortó() {
-    let (banco, config, _id, _clave) = preparado();
-    let salida = banco
+fn storage_gc_talks_to_the_storage_target_and_counts_what_it_aborted() {
+    let (bench, config, _id, _key) = prepared();
+    let out = bench
         .cmd()
         .args([
             "--config",
@@ -328,28 +323,29 @@ fn storage_gc_habla_con_el_destino_y_cuenta_lo_que_abortó() {
             "json",
             "storage",
             "gc",
-            "produccion",
+            "production",
         ])
         .output()
         .unwrap();
 
     assert!(
-        salida.status.success(),
+        out.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&salida.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
-    let json = json_de(&salida.stdout);
-    assert_eq!(json["target"], "produccion");
-    // El destino mock escribe cada artefacto de una vez: no hay multipart que
-    // abortar y por eso son cero. Lo que se comprueba es que la llamada llegó.
-    assert_eq!(json["abortadas"], 0);
-    assert_eq!(json["prefijo"], "produccion/");
+    let json = json_of(&out.stdout);
+    assert_eq!(json["target"], "production");
+    // The mock storage target writes each artifact in one go: there is no
+    // multipart to abort and that is why it is zero. What is being checked is
+    // that the call arrived.
+    assert_eq!(json["aborted"], 0);
+    assert_eq!(json["prefix"], "production/");
 }
 
 #[test]
-fn plugin_docs_ensena_el_esquema_del_plugin_y_ningun_valor() {
-    let (banco, config, _id, _clave) = preparado();
-    let salida = banco
+fn plugin_docs_shows_the_plugins_schema_and_no_value() {
+    let (bench, config, _id, _key) = prepared();
+    let out = bench
         .cmd()
         .args([
             "--config",
@@ -362,27 +358,27 @@ fn plugin_docs_ensena_el_esquema_del_plugin_y_ningun_valor() {
         .unwrap();
 
     assert!(
-        salida.status.success(),
+        out.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&salida.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
-    let texto = String::from_utf8_lossy(&salida.stdout).to_string();
-    for esperado in ["CAMPO", "TIPO", "REQ", "SECRETO", "dir", "seed", "size"] {
-        assert!(texto.contains(esperado), "falta «{esperado}»:\n{texto}");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    for expected in ["FIELD", "TYPE", "REQ", "SECRET", "dir", "seed", "size"] {
+        assert!(text.contains(expected), "`{expected}` is missing:\n{text}");
     }
     assert!(
-        !texto.contains(&banco.dir_datos().to_string_lossy().to_string()),
-        "docs describe el esquema, nunca lo que hay configurado:\n{texto}"
+        !text.contains(&bench.data_dir().to_string_lossy().to_string()),
+        "docs describes the schema, never what is configured:\n{text}"
     );
 }
 
 #[test]
-fn plugin_list_ensena_el_estado_de_cada_binario() {
-    let banco = Banco::nuevo();
-    banco.instalar_mock();
-    let config = banco.config_mock("age1qqqqqqqqqq");
+fn plugin_list_shows_the_status_of_each_binary() {
+    let bench = Bench::new();
+    bench.install_mock();
+    let config = bench.config_mock("age1qqqqqqqqqq");
 
-    let antes = banco
+    let before = bench
         .cmd()
         .args([
             "--config",
@@ -395,20 +391,20 @@ fn plugin_list_ensena_el_estado_de_cada_binario() {
         .output()
         .unwrap();
     assert!(
-        antes.status.success(),
-        "listar no falla por no estar el lock"
+        before.status.success(),
+        "listing does not fail for the lock being absent"
     );
-    let json = json_de(&antes.stdout);
-    assert_eq!(json["plugins"][0]["nombre"], "mock");
+    let json = json_of(&before.stdout);
+    assert_eq!(json["plugins"][0]["name"], "mock");
     assert_eq!(json["plugins"][0]["usable"], serde_json::Value::Bool(false));
 
-    banco
+    bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
 
-    let despues = banco
+    let after = bench
         .cmd()
         .args([
             "--config",
@@ -420,47 +416,48 @@ fn plugin_list_ensena_el_estado_de_cada_binario() {
         ])
         .output()
         .unwrap();
-    let json = json_de(&despues.stdout);
+    let json = json_of(&after.stdout);
     assert_eq!(json["plugins"][0]["usable"], serde_json::Value::Bool(true));
 }
 
-/// Las rutas relativas de todo lo que hay bajo `raiz`, en orden estable.
-fn walk(raiz: &std::path::Path) -> Vec<String> {
-    let mut encontrados = Vec::new();
-    let mut pendientes = vec![raiz.to_path_buf()];
-    while let Some(dir) = pendientes.pop() {
-        let Ok(entradas) = std::fs::read_dir(&dir) else {
+/// The relative paths of everything under `root`, in a stable order.
+fn walk(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entrada in entradas.flatten() {
-            let ruta = entrada.path();
-            if ruta.is_dir() {
-                pendientes.push(ruta);
-            } else if let Ok(relativa) = ruta.strip_prefix(raiz) {
-                encontrados.push(relativa.to_string_lossy().into_owned());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                found.push(relative.to_string_lossy().into_owned());
             }
         }
     }
-    encontrados.sort();
-    encontrados
+    found.sort();
+    found
 }
 
 #[test]
-fn plugin_docs_funciona_con_una_config_de_solo_plugins() {
-    // `docs` pregunta al plugin qué campos acepta. Es justo lo que se consulta
-    // *antes* de escribir el primer `[[target]]`, así que no puede exigir uno.
-    let banco = Banco::nuevo();
-    banco.instalar_mock();
-    let config = banco.config_solo_plugins();
+fn plugin_docs_works_with_a_plugins_only_config() {
+    // `docs` asks the plugin which fields it accepts. It is exactly what gets
+    // consulted *before* writing the first `[[target]]`, so it cannot require
+    // one.
+    let bench = Bench::new();
+    bench.install_mock();
+    let config = bench.config_plugins_only();
 
-    let lock = banco
+    let lock = bench
         .cmd()
         .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
         .output()
         .unwrap();
     assert!(lock.status.success());
 
-    let salida = banco
+    let out = bench
         .cmd()
         .args([
             "--config",
@@ -473,12 +470,12 @@ fn plugin_docs_funciona_con_una_config_de_solo_plugins() {
         .unwrap();
 
     assert!(
-        salida.status.success(),
+        out.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&salida.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
-    let texto = String::from_utf8_lossy(&salida.stdout).to_string();
-    for esperado in ["CAMPO", "dir", "seed", "size"] {
-        assert!(texto.contains(esperado), "falta «{esperado}»:\n{texto}");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    for expected in ["FIELD", "dir", "seed", "size"] {
+        assert!(text.contains(expected), "`{expected}` is missing:\n{text}");
     }
 }

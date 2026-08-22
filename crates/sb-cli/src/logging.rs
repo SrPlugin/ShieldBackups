@@ -1,41 +1,41 @@
-//! La traza, y la única regla que la gobierna: **nunca escribe en stdout**.
+//! Tracing, and the one rule that governs it: **it never writes to stdout**.
 //!
-//! La salida estándar de `shieldbk` pertenece al resultado. Es lo que permite
-//! que `shieldbk --format json backup | jq '.targets[].artifact_key'` funcione,
-//! y basta un registro colado ahí para romperlo —no de forma llamativa, sino
-//! con un `jq` que falla a las tres de la mañana en un `cron` que llevaba meses
-//! funcionando—. Así que el suscriptor se fija a stderr aquí, en un solo sitio,
-//! y ningún otro módulo del binario construye uno.
+//! `shieldbk`'s standard output belongs to the result. That is what lets
+//! `shieldbk --format json backup | jq '.targets[].artifact_key'` work, and a
+//! single log line slipping in there is enough to break it -- not
+//! spectacularly, but with a `jq` that fails at three in the morning inside a
+//! `cron` that had been working for months. So the subscriber is pinned to
+//! stderr here, in one single place, and no other module of the binary builds
+//! one.
 
 use tracing_subscriber::EnvFilter;
 
-/// Enciende la traza con el nivel que pida `verbosidad`.
+/// Turns on tracing at the level `verbosity` asks for.
 ///
-/// La escala sube desde `warn` porque el silencio es el comportamiento correcto
-/// de una herramienta que corre desatendida: un backup que va bien no tiene
-/// nada que contar, y un `cron` que recibe un correo por cada línea de `info`
-/// acaba filtrado a la papelera junto con los avisos que sí importaban.
+/// The scale starts at `warn` because silence is the correct behaviour of a
+/// tool that runs unattended: a backup that goes well has nothing to say, and a
+/// `cron` that mails a message for every `info` line ends up filtered into the
+/// bin together with the warnings that did matter.
 ///
-/// `RUST_LOG`, si está definida, manda sobre `-v`: quien la exporta está
-/// pidiendo un control más fino —por módulo— del que cabe en un contador de
-/// letras, y sobrescribírsela sería ignorar la petición más específica de las
-/// dos.
-pub fn iniciar(verbosidad: u8) {
-    let por_defecto = match verbosidad {
+/// `RUST_LOG`, if it is defined, wins over `-v`: whoever exports it is asking
+/// for finer control -- per module -- than fits in a letter counter, and
+/// overriding it would be ignoring the more specific of the two requests.
+pub fn init(verbosity: u8) {
+    let default = match verbosity {
         0 => "warn",
         1 => "info",
         2 => "debug",
         _ => "trace",
     };
 
-    let filtro = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(por_defecto));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 
-    // Fallar aquí solo puede significar que alguien ya instaló un suscriptor,
-    // y en un binario que arranca una sola vez eso no puede pasar. Que no sea
-    // motivo de aborto sí importa: quedarse sin registros es molesto, no poder
-    // hacer el backup es grave.
+    // Failing here can only mean somebody already installed a subscriber, and
+    // in a binary that starts once that cannot happen. That it not be a reason
+    // to abort does matter: being left without logs is annoying, not being able
+    // to make the backup is serious.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(filtro)
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();

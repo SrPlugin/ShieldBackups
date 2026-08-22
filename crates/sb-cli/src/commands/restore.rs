@@ -1,15 +1,15 @@
-//! `shieldbk restore <target> <artifact> --identity <ruta>`.
+//! `shieldbk restore <target> <artifact> --identity <path>`.
 //!
-//! Es el único comando que necesita la clave privada, y por eso es el único que
-//! la pide explícitamente en un argumento en vez de sacarla de la
-//! configuración: una clave privada referenciada desde un fichero que se
-//! versiona acabaría, antes o después, dentro del repositorio.
+//! It is the only command that needs the private key, and that is why it is the
+//! only one that asks for it explicitly in an argument instead of taking it
+//! from the configuration: a private key referenced from a file that gets
+//! versioned would end up, sooner or later, inside the repository.
 //!
-//! Antes de mover un byte se lee el manifiesto para saber qué digest debe
-//! tener el artefacto que el destino va a servir. No es redundante con el AEAD
-//! de age: un artefacto **ajeno** pero bien formado y dirigido a la misma
-//! identidad se descifraría sin protestar, y sin el digest nadie se enteraría
-//! de que la base de datos se ha restaurado con el backup de otro sistema.
+//! Before moving a byte the manifest is read to learn which digest the artifact
+//! the storage target is about to serve should have. It is not redundant with
+//! age's AEAD: a **foreign** but well-formed artifact addressed to the same
+//! identity would decrypt without complaint, and without the digest nobody
+//! would notice the database has been restored with another system's backup.
 
 use std::path::Path;
 
@@ -17,103 +17,100 @@ use sb_core::ops::restore::{RestoreRequest, run_restore};
 use sb_core::ops::verify::read_manifest;
 use sb_crypto::{Digest, Identity};
 
-use crate::context::Contexto;
+use crate::context::Context;
 use crate::error::CliError;
-use crate::output::Informe;
-use crate::plugins::{self, Papel};
+use crate::output::Report;
+use crate::plugins::{self, Role};
 
 /// # Errors
-/// Devuelve [`CliError::Config`] si el target no existe o la identidad no se
-/// puede leer, [`CliError::Plugin`] si algún plugin no arranca y
-/// [`CliError::Operacion`] si la restauración falla.
-pub async fn ejecutar(
-    ctx: &Contexto,
+/// Returns [`CliError::Config`] if the target does not exist or the identity
+/// cannot be read, [`CliError::Plugin`] if some plugin does not start and
+/// [`CliError::Operation`] if the restore fails.
+pub async fn run(
+    ctx: &Context,
     target: &str,
     artifact: &str,
     identity: &Path,
-) -> Result<Informe, CliError> {
+) -> Result<Report, CliError> {
     let target = ctx.target(target)?;
-    let identidad = leer_identidad(identity)?;
+    let identity = read_identity(identity)?;
 
-    let motor = plugins::arrancar_para(ctx, target, Papel::Motor).await?;
-    let destino = match plugins::arrancar_para(ctx, target, Papel::Destino).await {
-        Ok(destino) => destino,
+    let engine = plugins::start_for(ctx, target, Role::Engine).await?;
+    let storage = match plugins::start_for(ctx, target, Role::Storage).await {
+        Ok(storage) => storage,
         Err(error) => {
-            plugins::cerrar(motor).await;
+            plugins::close(engine).await;
             return Err(error);
         }
     };
 
-    let resultado = restaurar(&motor, &destino, artifact, &identidad).await;
+    let outcome = restore(&engine, &storage, artifact, &identity).await;
 
-    plugins::cerrar(motor).await;
-    plugins::cerrar(destino).await;
+    plugins::close(engine).await;
+    plugins::close(storage).await;
 
-    let escritos = resultado?;
-    Ok(Informe::new(
-        format!(
-            "{}: restaurados {escritos} bytes desde {artifact}",
-            target.name
-        ),
+    let written = outcome?;
+    Ok(Report::new(
+        format!("{}: restored {written} bytes from {artifact}", target.name),
         serde_json::json!({
-            "comando": "restore",
+            "command": "restore",
             "target": target.name,
             "artifact_key": artifact,
-            "plaintext_bytes": escritos,
+            "plaintext_bytes": written,
         }),
     ))
 }
 
-async fn restaurar(
-    motor: &sb_core::plugin::PluginClient,
-    destino: &sb_core::plugin::PluginClient,
+async fn restore(
+    engine: &sb_core::plugin::PluginClient,
+    storage: &sb_core::plugin::PluginClient,
     artifact: &str,
-    identidad: &Identity,
+    identity: &Identity,
 ) -> Result<u64, CliError> {
-    // El manifiesto puede no estar —un artefacto copiado a mano, un destino a
-    // medio migrar— y eso no puede impedir la restauración: si falta, se avisa
-    // y se sigue sin la comprobación extra. Negarse sería dejar sin recuperar
-    // datos que sí se pueden recuperar.
-    let esperado = match read_manifest(destino, artifact).await {
-        Ok(manifiesto) => Digest::from_hex(&manifiesto.ciphertext_sha256).ok(),
-        Err(fuente) => {
+    // The manifest may be missing -- an artifact copied by hand, a half-migrated
+    // storage target -- and that cannot stop the restore: if it is missing, a
+    // warning is issued and the extra check is skipped. Refusing would mean
+    // leaving unrecovered data that can in fact be recovered.
+    let expected = match read_manifest(storage, artifact).await {
+        Ok(manifest) => Digest::from_hex(&manifest.ciphertext_sha256).ok(),
+        Err(source) => {
             tracing::warn!(
-                clave = artifact,
-                %fuente,
-                "sin manifiesto: se restaura sin comprobar que el destino sirvió el artefacto \
-                 que se pidió"
+                key = artifact,
+                %source,
+                "no manifest: restoring without checking that the storage target served the \
+                 artifact that was asked for"
             );
             None
         }
     };
 
     Ok(run_restore(RestoreRequest {
-        engine: motor,
-        storage: destino,
+        engine,
+        storage,
         artifact_key: artifact.to_owned(),
-        identity: identidad,
-        expected_ciphertext_sha256: esperado,
+        identity,
+        expected_ciphertext_sha256: expected,
     })
     .await?)
 }
 
-/// Lee el fichero de clave privada.
+/// Reads the private key file.
 ///
-/// El error nombra la ruta pero **nunca el contenido**: lo que se estaba
-/// leyendo es una clave privada, y un mensaje que la citara la dejaría escrita
-/// en el log de quien se equivocó de fichero.
-fn leer_identidad(ruta: &Path) -> Result<Identity, CliError> {
-    let texto = std::fs::read_to_string(ruta).map_err(|fuente| {
+/// The error names the path but **never the content**: what was being read is a
+/// private key, and a message quoting it would leave it written in the log of
+/// whoever picked the wrong file.
+fn read_identity(path: &Path) -> Result<Identity, CliError> {
+    let text = std::fs::read_to_string(path).map_err(|source| {
         CliError::config(format!(
-            "no se pudo leer la clave privada «{}»: {fuente}",
-            ruta.display()
+            "could not read the private key `{}`: {source}",
+            path.display()
         ))
     })?;
 
-    Identity::parse(&texto).map_err(|fuente| {
+    Identity::parse(&text).map_err(|source| {
         CliError::config(format!(
-            "«{}» no contiene una clave privada age: {fuente}",
-            ruta.display()
+            "`{}` does not contain an age private key: {source}",
+            path.display()
         ))
     })
 }
@@ -123,12 +120,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn una_identidad_se_lee_del_fichero_que_escribe_age_keygen() {
+    fn an_identity_is_read_from_the_file_age_keygen_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = dir.path().join("clave.txt");
+        let path = dir.path().join("key.txt");
         let original = Identity::generate();
         std::fs::write(
-            &ruta,
+            &path,
             format!(
                 "# created: 2026-08-21T00:00:00Z\n# public key: {}\n{}\n",
                 original.to_recipient(),
@@ -137,35 +134,35 @@ mod tests {
         )
         .unwrap();
 
-        let leida = leer_identidad(&ruta).unwrap();
+        let read = read_identity(&path).unwrap();
         assert_eq!(
-            leida.to_recipient().to_string(),
+            read.to_recipient().to_string(),
             original.to_recipient().to_string()
         );
     }
 
     #[test]
-    fn un_fichero_que_no_existe_se_explica_nombrando_la_ruta() {
-        let error = leer_identidad(Path::new("/no/existe/clave.txt"))
+    fn a_file_that_does_not_exist_is_explained_by_naming_the_path() {
+        let error = read_identity(Path::new("/does/not/exist/key.txt"))
             .err()
             .unwrap();
-        assert_eq!(error.clase(), "config");
-        assert!(error.to_string().contains("/no/existe/clave.txt"));
+        assert_eq!(error.class(), "config");
+        assert!(error.to_string().contains("/does/not/exist/key.txt"));
     }
 
     #[test]
-    fn un_fichero_que_no_es_una_clave_no_delata_su_contenido() {
-        // El caso real: alguien apunta `--identity` a un fichero equivocado que
-        // resulta contener otro secreto.
+    fn a_file_that_is_not_a_key_does_not_give_away_its_content() {
+        // The real case: somebody points `--identity` at the wrong file that
+        // happens to contain another secret.
         let dir = tempfile::tempdir().unwrap();
-        let ruta = dir.path().join("otro.txt");
-        std::fs::write(&ruta, "contrasena-de-produccion-1234").unwrap();
+        let path = dir.path().join("other.txt");
+        std::fs::write(&path, "production-password-1234").unwrap();
 
-        let error = leer_identidad(&ruta).err().unwrap();
-        assert_eq!(error.clase(), "config");
+        let error = read_identity(&path).err().unwrap();
+        assert_eq!(error.class(), "config");
         assert!(
-            !error.to_string().contains("contrasena-de-produccion-1234"),
-            "el mensaje no puede repetir lo que había dentro: {error}"
+            !error.to_string().contains("production-password-1234"),
+            "the message cannot repeat what was inside: {error}"
         );
     }
 }

@@ -1,80 +1,77 @@
-//! Expansión de `~` en las rutas que vienen de la configuración.
+//! Expansion of `~` in the paths that come from the configuration.
 //!
-//! El fichero de configuración se escribe a mano y se comparte entre máquinas,
-//! así que sus rutas se escriben como las escribiría una persona:
-//! `~/.shieldbk/plugins`. La shell expande esa tilde cuando el argumento pasa
-//! por ella, pero una ruta leída de un TOML no pasa por ninguna shell, y sin
-//! esto `shieldbk` buscaría los plugins en un directorio llamado literalmente
-//! `~`, creado dentro del directorio de trabajo. El fallo no sería un error
-//! sino algo peor: funcionaría, en el sitio equivocado.
+//! The configuration file is written by hand and shared between machines, so
+//! its paths are written the way a person would write them:
+//! `~/.shieldbk/plugins`. The shell expands that tilde when the argument goes
+//! through it, but a path read from a TOML goes through no shell, and without
+//! this `shieldbk` would look for the plugins in a directory literally named
+//! `~`, created inside the working directory. The failure would not be an
+//! error but something worse: it would work, in the wrong place.
 
 use std::path::PathBuf;
 
-/// Convierte una ruta de la configuración en una ruta del sistema.
+/// Turns a configuration path into a system path.
 ///
-/// Solo se expande `~` a secas y `~/…`: la forma `~usuario` exigiría consultar
-/// la base de datos de usuarios del sistema y se deja tal cual, que es lo que
-/// hacen la mayoría de las herramientas y lo que evita fingir que se entiende
-/// algo que no se entiende.
+/// Only bare `~` and `~/...` are expanded: the `~user` form would require
+/// querying the system's user database and is left as is, which is what most
+/// tools do and what avoids pretending to understand something that is not
+/// understood.
 ///
-/// Si `HOME` no está definida la ruta se devuelve intacta: es preferible que
-/// falle luego nombrando la ruta literal —que es lo que se buscó— a inventarse
-/// un directorio personal.
+/// If `HOME` is not defined the path is returned intact: it is preferable for
+/// it to fail later naming the literal path -- which is what was looked for --
+/// than to invent a home directory.
 #[must_use]
-pub fn expandir(ruta: &str) -> PathBuf {
-    let Some(hogar) = std::env::var_os("HOME") else {
-        return PathBuf::from(ruta);
+pub fn expand(path: &str) -> PathBuf {
+    let Some(home) = std::env::var_os("HOME") else {
+        return PathBuf::from(path);
     };
 
-    if ruta == "~" {
-        return PathBuf::from(hogar);
+    if path == "~" {
+        return PathBuf::from(home);
     }
-    if let Some(resto) = ruta.strip_prefix("~/") {
-        return PathBuf::from(hogar).join(resto);
+    if let Some(rest) = path.strip_prefix("~/") {
+        return PathBuf::from(home).join(rest);
     }
-    PathBuf::from(ruta)
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // `HOME` no se toca aquí: cambiar el entorno del proceso es `unsafe` desde
-    // la edición 2024 y el workspace lo prohíbe. Estas pruebas se apoyan en el
-    // `HOME` real —siempre definido bajo cargo— y son los tests de `tests/` los
-    // que comprueban la expansión con un hogar de mentira, porque ahí el
-    // binario es un proceso hijo y su entorno sí se puede fijar.
+    // `HOME` is not touched here: changing the process environment is `unsafe`
+    // as of edition 2024 and the workspace forbids it. These checks lean on the
+    // real `HOME` -- always defined under cargo -- and it is the tests in
+    // `tests/` that check the expansion with a fake home, because there the
+    // binary is a child process and its environment can be set.
 
     #[test]
-    fn una_ruta_absoluta_no_se_toca() {
-        assert_eq!(expandir("/opt/plugins"), PathBuf::from("/opt/plugins"));
+    fn an_absolute_path_is_left_alone() {
+        assert_eq!(expand("/opt/plugins"), PathBuf::from("/opt/plugins"));
     }
 
     #[test]
-    fn una_ruta_relativa_no_se_toca() {
-        assert_eq!(
-            expandir("plugins/locales"),
-            PathBuf::from("plugins/locales")
-        );
+    fn a_relative_path_is_left_alone() {
+        assert_eq!(expand("plugins/local"), PathBuf::from("plugins/local"));
     }
 
     #[test]
-    fn la_tilde_se_expande_al_hogar() {
-        let Some(hogar) = std::env::var_os("HOME") else {
+    fn the_tilde_expands_to_the_home() {
+        let Some(home) = std::env::var_os("HOME") else {
             return;
         };
         assert_eq!(
-            expandir("~/.shieldbk/plugins"),
-            PathBuf::from(&hogar).join(".shieldbk/plugins")
+            expand("~/.shieldbk/plugins"),
+            PathBuf::from(&home).join(".shieldbk/plugins")
         );
-        assert_eq!(expandir("~"), PathBuf::from(&hogar));
+        assert_eq!(expand("~"), PathBuf::from(&home));
     }
 
     #[test]
-    fn una_tilde_a_media_ruta_no_significa_nada() {
-        // Solo el prefijo es especial: `/datos/~/x` es un directorio que se
-        // llama así, no el hogar de nadie.
-        assert_eq!(expandir("/datos/~/x"), PathBuf::from("/datos/~/x"));
-        assert_eq!(expandir("~otro/x"), PathBuf::from("~otro/x"));
+    fn a_tilde_in_the_middle_of_a_path_means_nothing() {
+        // Only the prefix is special: `/data/~/x` is a directory named that
+        // way, not anybody's home.
+        assert_eq!(expand("/data/~/x"), PathBuf::from("/data/~/x"));
+        assert_eq!(expand("~other/x"), PathBuf::from("~other/x"));
     }
 }

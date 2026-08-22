@@ -1,120 +1,122 @@
-//! La forma de la línea de órdenes, y nada más.
+//! The shape of the command line, and nothing else.
 //!
-//! Aquí no se ejecuta nada: este archivo es la única descripción de qué se
-//! puede teclear. Tenerlo aparte hace que añadir una opción no obligue a leer
-//! ninguna implementación, y que leer la implementación de un comando no
-//! obligue a bucear entre atributos de `clap`.
+//! Nothing runs here: this file is the single description of what can be typed.
+//! Keeping it apart means adding an option does not force reading any
+//! implementation, and reading a command's implementation does not force diving
+//! through `clap` attributes.
 
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
-use crate::output::Formato;
+use crate::output::Format;
 
-/// Ruta de la configuración cuando no se pasa `--config`.
-pub const CONFIG_POR_DEFECTO: &str = "~/.shieldbk/config.toml";
+/// Path of the configuration when `--config` is not passed.
+pub const DEFAULT_CONFIG: &str = "~/.shieldbk/config.toml";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "shieldbk",
     version,
-    about = "Backups de bases de datos cifrados de extremo a extremo",
-    long_about = "shieldbk respalda bases de datos a través de plugins que corren como procesos \
-                  aparte. El volcado se comprime, se cifra con age y se sube sin tocar el disco \
-                  local.\n\nCódigos de salida: 0 correcto, 2 error de configuración, 3 error de \
-                  plugin, 4 error de operación."
+    about = "End-to-end encrypted database backups",
+    long_about = "shieldbk backs up databases through plugins that run as separate processes. The \
+                  dump is compressed, encrypted with age and uploaded without ever touching the \
+                  local disk.\n\nExit codes: 0 success, 2 configuration error, 3 plugin error, 4 \
+                  operation error."
 )]
 pub struct Cli {
-    /// Fichero de configuración TOML.
-    #[arg(long, global = true, value_name = "RUTA")]
+    /// TOML configuration file.
+    #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Formato de la salida estándar. Los registros van siempre a stderr.
+    /// Format of standard output. Logs always go to stderr.
     #[arg(long, global = true, value_enum, default_value = "human")]
-    pub format: Formato,
+    pub format: Format,
 
-    /// Cuántos targets se procesan a la vez.
+    /// How many targets are processed at a time.
     ///
-    /// Uno por defecto: varios volcados simultáneos compiten por el mismo disco
-    /// y la misma base de datos, y el que sale perdiendo es el servidor que
-    /// está atendiendo a los usuarios.
+    /// One by default: several simultaneous dumps compete for the same disk and
+    /// the same database, and the one that loses out is the server that is
+    /// serving users.
     #[arg(long, global = true, value_name = "N", default_value_t = 1)]
     pub jobs: usize,
 
-    /// Sube el nivel de traza: `-v` info, `-vv` debug, `-vvv` trace.
+    /// Raises the trace level: `-v` info, `-vv` debug, `-vvv` trace.
     #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
     pub verbose: u8,
 
     #[command(subcommand)]
-    pub comando: Comando,
+    pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Comando {
-    /// Respalda un target, o todos si no se nombra ninguno.
+pub enum Command {
+    /// Back up one target, or all of them if none is named.
     Backup {
-        /// Target a respaldar. Sin él, se respaldan todos.
+        /// Target to back up. Without it, all of them are backed up.
         target: Option<String>,
     },
 
-    /// Restaura un artefacto sobre el motor del target.
+    /// Restore an artifact onto the target's engine.
     Restore {
-        /// Target sobre el que se restaura.
+        /// Target the restore is performed on.
         target: String,
-        /// Clave del artefacto en el destino.
+        /// Key of the artifact in the storage target.
         artifact: String,
-        /// Fichero con la clave privada age (`age-keygen`).
-        #[arg(long, value_name = "RUTA")]
+        /// File holding the age private key (`age-keygen`).
+        #[arg(long, value_name = "PATH")]
         identity: PathBuf,
     },
 
-    /// Comprueba que los artefactos siguen íntegros. No necesita la clave.
+    /// Check that the artifacts are still intact. It does not need the key.
     Verify {
-        /// Target cuyos artefactos se comprueban.
+        /// Target whose artifacts are checked.
         target: String,
-        /// Artefacto concreto. Sin él, se comprueban todos los del target.
+        /// A specific artifact. Without it, every artifact of the target is
+        /// checked.
         artifact: Option<String>,
     },
 
-    /// Diagnostica un target —o todos— antes de que falle un backup de verdad.
+    /// Diagnose a target -- or all of them -- before a real backup fails.
     Doctor {
-        /// Target a diagnosticar. Sin él, se diagnostican todos.
+        /// Target to diagnose. Without it, all of them are diagnosed.
         target: Option<String>,
     },
 
-    /// Gestiona los plugins y el lockfile que autoriza sus binarios.
+    /// Manage the plugins and the lockfile that authorises their binaries.
     Plugin {
         #[command(subcommand)]
-        accion: AccionPlugin,
+        action: PluginAction,
     },
 
-    /// Tareas de mantenimiento sobre el destino.
+    /// Maintenance tasks on the storage target.
     Storage {
         #[command(subcommand)]
-        accion: AccionStorage,
+        action: StorageAction,
     },
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AccionPlugin {
-    /// Enumera los binarios encontrados y su estado en el lockfile.
+pub enum PluginAction {
+    /// List the binaries found and their status in the lockfile.
     List,
-    /// Imprime el esquema de configuración de un plugin. Nunca imprime valores.
+    /// Print a plugin's configuration schema. It never prints values.
     Docs {
-        /// Nombre del plugin, sin el prefijo `sb-plugin-`.
+        /// Plugin name, without the `sb-plugin-` prefix.
         plugin: String,
     },
-    /// Comprueba los hashes de todos los plugins sin arrancar ninguno.
+    /// Check every plugin's hash without starting any of them.
     Verify,
-    /// Registra el hash de cada binario del directorio y escribe el lockfile.
+    /// Register the hash of every binary in the directory and write the
+    /// lockfile.
     Lock,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AccionStorage {
-    /// Aborta las subidas incompletas que el destino siga cobrando.
+pub enum StorageAction {
+    /// Abort the incomplete uploads the storage target keeps charging for.
     Gc {
-        /// Target cuyo destino se limpia.
+        /// Target whose storage is cleaned up.
         target: String,
     },
 }
@@ -125,64 +127,68 @@ mod tests {
     use clap::CommandFactory as _;
 
     #[test]
-    fn la_definicion_es_coherente() {
-        // `debug_assert` de clap detecta las incoherencias que solo se verían
-        // al ejecutar: nombres repetidos, valores por defecto que no encajan
-        // con su tipo, opciones globales en sitios imposibles.
+    fn the_definition_is_coherent() {
+        // clap's `debug_assert` catches the inconsistencies that would only
+        // show up at runtime: repeated names, default values that do not match
+        // their type, global options in impossible places.
         Cli::command().debug_assert();
     }
 
     #[test]
-    fn estan_los_seis_comandos() {
-        let nombres: Vec<String> = Cli::command()
+    fn all_six_commands_are_there() {
+        let names: Vec<String> = Cli::command()
             .get_subcommands()
             .map(|c| c.get_name().to_owned())
             .collect();
-        for esperado in ["backup", "restore", "verify", "doctor", "plugin", "storage"] {
-            assert!(nombres.contains(&esperado.to_owned()), "falta {esperado}");
+        for expected in ["backup", "restore", "verify", "doctor", "plugin", "storage"] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "{expected} is missing"
+            );
         }
     }
 
     #[test]
-    fn las_opciones_globales_valen_despues_del_subcomando() {
-        // `shieldbk backup --format json` tiene que funcionar igual que
-        // `shieldbk --format json backup`: nadie recuerda dónde va cada cosa.
+    fn the_global_options_work_after_the_subcommand() {
+        // `shieldbk backup --format json` has to work just like
+        // `shieldbk --format json backup`: nobody remembers where each thing
+        // goes.
         let cli = Cli::try_parse_from(["shieldbk", "backup", "--format", "json", "-vv"]).unwrap();
-        assert_eq!(cli.format, Formato::Json);
+        assert_eq!(cli.format, Format::Json);
         assert_eq!(cli.verbose, 2);
-        assert!(matches!(cli.comando, Comando::Backup { target: None }));
+        assert!(matches!(cli.command, Command::Backup { target: None }));
     }
 
     #[test]
-    fn jobs_es_uno_por_defecto() {
-        // El valor por defecto es una decisión de seguridad operativa, no un
-        // detalle: varios volcados a la vez saturan el servidor de base de
-        // datos, y quien quiera correr ese riesgo tiene que pedirlo.
+    fn jobs_is_one_by_default() {
+        // The default value is a decision about operational safety, not a
+        // detail: several dumps at once saturate the database server, and
+        // whoever wants to take that risk has to ask for it.
         let cli = Cli::try_parse_from(["shieldbk", "backup"]).unwrap();
         assert_eq!(cli.jobs, 1);
     }
 
     #[test]
-    fn restore_exige_la_identidad() {
-        // Sin clave privada no hay restauración posible, así que no se puede
-        // llegar a arrancar un plugin sin ella.
-        assert!(Cli::try_parse_from(["shieldbk", "restore", "t", "clave"]).is_err());
+    fn restore_requires_the_identity() {
+        // Without a private key there is no possible restore, so a plugin
+        // cannot even be started without one.
+        assert!(Cli::try_parse_from(["shieldbk", "restore", "t", "key"]).is_err());
         let cli =
-            Cli::try_parse_from(["shieldbk", "restore", "t", "clave", "--identity", "/k"]).unwrap();
-        assert!(matches!(cli.comando, Comando::Restore { .. }));
+            Cli::try_parse_from(["shieldbk", "restore", "t", "key", "--identity", "/k"]).unwrap();
+        assert!(matches!(cli.command, Command::Restore { .. }));
     }
 
     #[test]
-    fn verify_admite_un_artefacto_opcional() {
-        let todos = Cli::try_parse_from(["shieldbk", "verify", "t"]).unwrap();
+    fn verify_accepts_an_optional_artifact() {
+        let all = Cli::try_parse_from(["shieldbk", "verify", "t"]).unwrap();
         assert!(matches!(
-            todos.comando,
-            Comando::Verify { artifact: None, .. }
+            all.command,
+            Command::Verify { artifact: None, .. }
         ));
-        let uno = Cli::try_parse_from(["shieldbk", "verify", "t", "clave"]).unwrap();
+        let one = Cli::try_parse_from(["shieldbk", "verify", "t", "key"]).unwrap();
         assert!(matches!(
-            uno.comando,
-            Comando::Verify {
+            one.command,
+            Command::Verify {
                 artifact: Some(_),
                 ..
             }

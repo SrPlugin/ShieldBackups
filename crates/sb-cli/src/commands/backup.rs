@@ -1,15 +1,16 @@
 //! `shieldbk backup [target]`.
 //!
-//! Lo único que este comando decide y nadie más puede decidir por él es **cómo
-//! se llama el artefacto**: el núcleo recibe la clave ya calculada, porque una
-//! operación que mirase el reloj por su cuenta no se podría probar. Aquí es
-//! donde se mira, una sola vez por target, y en UTC: un backup nocturno no
-//! puede cambiar de nombre porque el servidor entre en horario de verano.
+//! The one thing this command decides and nobody else can decide for it is
+//! **what the artifact is called**: the core receives the key already computed,
+//! because an operation that looked at the clock on its own could not be
+//! tested. Here is where it is looked at, once per target, and in UTC: a
+//! nightly backup cannot change its name because the server switched to summer
+//! time.
 //!
-//! Lo segundo es que **un target que falla no se lleva por delante a los
-//! demás**. Quien respalda diez bases de datos con un `cron` quiere que las
-//! nueve que van bien se hagan igual, y enterarse al final de cuál fue la que
-//! no. El código de salida sigue siendo de error si alguna falló.
+//! The second thing is that **a target that fails does not take the others down
+//! with it**. Whoever backs up ten databases with a `cron` wants the nine that
+//! go well done anyway, and to find out at the end which one did not. The exit
+//! code is still an error one if any of them failed.
 
 use sb_config::Target;
 use sb_core::naming::{NamingContext, render};
@@ -17,64 +18,64 @@ use sb_core::ops::backup::{BackupRequest, run_backup};
 use sb_crypto::{CompressionLevel, Recipient};
 use time::OffsetDateTime;
 
-use crate::commands::concurrencia::por_lotes;
-use crate::context::Contexto;
+use crate::commands::concurrency::in_batches;
+use crate::context::Context;
 use crate::error::CliError;
-use crate::output::Informe;
-use crate::plugins::{self, Papel};
+use crate::output::Report;
+use crate::plugins::{self, Role};
 
-/// Lo que queda de respaldar un target, bien o mal.
-struct Resultado {
+/// What is left of backing up a target, well or badly.
+struct Outcome {
     target: String,
-    /// La clave solo existe si el backup llegó a nombrarse.
-    clave: Option<String>,
-    /// El fallo se guarda entero, no como texto: su clase es lo que decide el
-    /// código de salida, y un plugin sin registrar tiene que salir con el
-    /// código de plugin aunque el fallo se haya descubierto respaldando.
-    fallo: Option<CliError>,
+    /// The key only exists if the backup got as far as being named.
+    key: Option<String>,
+    /// The failure is kept whole, not as text: its class is what decides the
+    /// exit code, and an unregistered plugin has to exit with the plugin code
+    /// even though the failure was discovered while backing up.
+    failure: Option<CliError>,
     plaintext: u64,
     ciphertext: u64,
     digest: String,
 }
 
 /// # Errors
-/// Devuelve [`CliError::Config`] si el target no existe. Los backups que fallan
-/// **no** se propagan como error: viajan dentro del informe, para que el que
-/// respalda diez bases de datos vea las nueve que fueron bien.
-pub async fn ejecutar(ctx: &Contexto, target: Option<&str>) -> Result<Informe, CliError> {
+/// Returns [`CliError::Config`] if the target does not exist. Backups that fail
+/// are **not** propagated as an error: they travel inside the report, so that
+/// whoever backs up ten databases sees the nine that went well.
+pub async fn run(ctx: &Context, target: Option<&str>) -> Result<Report, CliError> {
     let targets = ctx.targets(target)?;
     let total = targets.len();
 
-    let resultados = por_lotes(targets, ctx.jobs, |t| respaldar(ctx, t)).await;
+    let outcomes = in_batches(targets, ctx.jobs, |t| back_up(ctx, t)).await;
 
-    let fallos: Vec<CliError> = resultados
+    let failures: Vec<CliError> = outcomes
         .iter()
-        .filter_map(|r| r.fallo.as_ref().map(CliError::duplicar))
+        .filter_map(|r| r.failure.as_ref().map(CliError::duplicate))
         .collect();
-    let informe = componer(&resultados, total, fallos.len());
+    let report = compose(&outcomes, total, failures.len());
 
-    let resumen = format!(
-        "{} de {total} backups fallaron:\n{}",
-        fallos.len(),
-        detalle_de_fallos(&resultados)
+    let summary = format!(
+        "{} of {total} backups failed:\n{}",
+        failures.len(),
+        failure_detail(&outcomes)
     );
-    Ok(match CliError::agrupar(resumen, &fallos) {
-        Some(fallo) => informe.con_fallo(fallo),
-        None => informe,
+    Ok(match CliError::group(summary, &failures) {
+        Some(failure) => report.with_failure(failure),
+        None => report,
     })
 }
 
-/// Respalda un target de principio a fin. Nunca propaga: devuelve el fallo
-/// dentro del resultado para que el resto de targets siga su curso.
-async fn respaldar(ctx: &Contexto, target: &Target) -> Resultado {
-    match intentar(ctx, target).await {
-        Ok(resultado) => resultado,
-        Err(fallo) => {
-            tracing::error!(target = %target.name, %fallo, "el backup falló");
-            Resultado {
+/// Backs up a target from beginning to end. It never propagates: it returns the
+/// failure inside the outcome so that the rest of the targets carry on.
+async fn back_up(ctx: &Context, target: &Target) -> Outcome {
+    match attempt(ctx, target).await {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            tracing::error!(target = %target.name, %failure, "the backup failed");
+            Outcome {
                 target: target.name.clone(),
-                clave: None,
-                fallo: Some(fallo),
+                key: None,
+                failure: Some(failure),
                 plaintext: 0,
                 ciphertext: 0,
                 digest: String::new(),
@@ -83,154 +84,158 @@ async fn respaldar(ctx: &Contexto, target: &Target) -> Resultado {
     }
 }
 
-async fn intentar(ctx: &Contexto, target: &Target) -> Result<Resultado, CliError> {
-    // El destinatario se comprueba **antes** de arrancar ningún plugin: una
-    // errata en la clave pública cuesta un segundo descubrirla aquí y cuesta un
-    // artefacto ilegible para siempre descubrirla luego.
-    let recipient = Recipient::parse(&target.recipient).map_err(|fuente| {
+async fn attempt(ctx: &Context, target: &Target) -> Result<Outcome, CliError> {
+    // The recipient is checked **before** starting any plugin: a typo in the
+    // public key costs a second to discover here and costs an artifact that is
+    // unreadable forever to discover later.
+    let recipient = Recipient::parse(&target.recipient).map_err(|source| {
         CliError::config(format!(
-            "el `recipient` del target «{}» no es una clave age válida: {fuente}",
+            "the `recipient` of target `{}` is not a valid age key: {source}",
             target.name
         ))
     })?;
 
-    let nivel =
-        CompressionLevel::new(target.effective_level(&ctx.config.defaults)).map_err(|fuente| {
+    let level =
+        CompressionLevel::new(target.effective_level(&ctx.config.defaults)).map_err(|source| {
             CliError::config(format!(
-                "el nivel de compresión del target «{}» no vale: {fuente}",
+                "the compression level of target `{}` is not valid: {source}",
                 target.name
             ))
         })?;
 
-    let ahora = OffsetDateTime::now_utc();
-    let contexto = NamingContext::new(
+    let now = OffsetDateTime::now_utc();
+    let naming = NamingContext::new(
         &target.name,
         &target.engine,
         &target.storage,
-        ahora.unix_timestamp(),
+        now.unix_timestamp(),
     );
-    let clave = render(target.effective_template(&ctx.config.defaults), &contexto)?;
+    let key = render(target.effective_template(&ctx.config.defaults), &naming)?;
 
-    let motor = plugins::arrancar_para(ctx, target, Papel::Motor).await?;
-    let destino = match plugins::arrancar_para(ctx, target, Papel::Destino).await {
-        Ok(destino) => destino,
+    let engine = plugins::start_for(ctx, target, Role::Engine).await?;
+    let storage = match plugins::start_for(ctx, target, Role::Storage).await {
+        Ok(storage) => storage,
         Err(error) => {
-            plugins::cerrar(motor).await;
+            plugins::close(engine).await;
             return Err(error);
         }
     };
 
-    let resultado = ejecutar_con(&motor, &destino, target, clave, recipient, nivel, ahora).await;
+    let outcome = run_with(&engine, &storage, target, key, recipient, level, now).await;
 
-    plugins::cerrar(motor).await;
-    plugins::cerrar(destino).await;
-    resultado
+    plugins::close(engine).await;
+    plugins::close(storage).await;
+    outcome
 }
 
-async fn ejecutar_con(
-    motor: &sb_core::plugin::PluginClient,
-    destino: &sb_core::plugin::PluginClient,
+async fn run_with(
+    engine: &sb_core::plugin::PluginClient,
+    storage: &sb_core::plugin::PluginClient,
     target: &Target,
-    clave: String,
+    key: String,
     recipient: Recipient,
-    nivel: CompressionLevel,
-    ahora: OffsetDateTime,
-) -> Result<Resultado, CliError> {
-    // La versión del plugin y la del servidor van al manifiesto. La segunda la
-    // reporta el motor en su preflight, que además es la comprobación barata
-    // que descarta una credencial caducada antes de mover un byte.
-    let version_plugin = motor.info().await?.version;
-    let version_servidor = motor.preflight().await?.server_version;
+    level: CompressionLevel,
+    now: OffsetDateTime,
+) -> Result<Outcome, CliError> {
+    // The plugin's version and the server's go into the manifest. The second is
+    // reported by the engine in its preflight, which is also the cheap check
+    // that rules out an expired credential before moving a byte.
+    let plugin_version = engine.info().await?.version;
+    let server_version = engine.preflight().await?.server_version;
 
-    let salida = run_backup(BackupRequest {
+    let out = run_backup(BackupRequest {
         target: target.name.clone(),
-        engine: motor,
-        storage: destino,
-        artifact_key: clave,
+        engine,
+        storage,
+        artifact_key: key,
         recipient,
-        level: nivel,
-        engine_version: version_plugin,
-        server_version: version_servidor,
-        created_at: iso8601_utc(ahora),
+        level,
+        engine_version: plugin_version,
+        server_version,
+        created_at: iso8601_utc(now),
     })
     .await?;
 
-    Ok(Resultado {
+    Ok(Outcome {
         target: target.name.clone(),
-        clave: Some(salida.artifact_key),
-        fallo: None,
-        plaintext: salida.summary.plaintext_bytes,
-        ciphertext: salida.summary.ciphertext_bytes,
-        digest: salida.summary.ciphertext_sha256.to_hex(),
+        key: Some(out.artifact_key),
+        failure: None,
+        plaintext: out.summary.plaintext_bytes,
+        ciphertext: out.summary.ciphertext_bytes,
+        digest: out.summary.ciphertext_sha256.to_hex(),
     })
 }
 
-/// La marca que va al manifiesto, en UTC y sin depender de la localización.
+/// The stamp that goes into the manifest, in UTC and without depending on the
+/// locale.
 ///
-/// Se compone a mano en vez de con el formateador de `time` para no arrastrar
-/// sus features de `formatting`: el formato es fijo y el manifiesto lo lee un
-/// programa.
-fn iso8601_utc(momento: OffsetDateTime) -> String {
+/// It is composed by hand instead of with `time`'s formatter so as not to drag
+/// in its `formatting` features: the format is fixed and the manifest is read
+/// by a program.
+fn iso8601_utc(instant: OffsetDateTime) -> String {
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        momento.year(),
-        u8::from(momento.month()),
-        momento.day(),
-        momento.hour(),
-        momento.minute(),
-        momento.second()
+        instant.year(),
+        u8::from(instant.month()),
+        instant.day(),
+        instant.hour(),
+        instant.minute(),
+        instant.second()
     )
 }
 
-fn componer(resultados: &[Resultado], total: usize, fallidos: usize) -> Informe {
-    let mut lineas = Vec::with_capacity(resultados.len() + 1);
-    let mut json = Vec::with_capacity(resultados.len());
+fn compose(outcomes: &[Outcome], total: usize, failed: usize) -> Report {
+    let mut lines = Vec::with_capacity(outcomes.len() + 1);
+    let mut json = Vec::with_capacity(outcomes.len());
 
-    for r in resultados {
-        match (&r.clave, &r.fallo) {
-            (Some(clave), _) => {
-                lineas.push(format!(
-                    "{}: {clave} ({} bytes en claro → {} cifrados)",
+    for r in outcomes {
+        match (&r.key, &r.failure) {
+            (Some(key), _) => {
+                lines.push(format!(
+                    "{}: {key} ({} plaintext bytes -> {} encrypted)",
                     r.target, r.plaintext, r.ciphertext
                 ));
                 json.push(serde_json::json!({
                     "target": r.target,
                     "ok": true,
-                    "artifact_key": clave,
+                    "artifact_key": key,
                     "plaintext_bytes": r.plaintext,
                     "ciphertext_bytes": r.ciphertext,
                     "ciphertext_sha256": r.digest,
                 }));
             }
-            (None, fallo) => {
-                let motivo = fallo.as_ref().map(ToString::to_string).unwrap_or_default();
-                lineas.push(format!("{}: FALLÓ — {motivo}", r.target));
+            (None, failure) => {
+                let reason = failure
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                lines.push(format!("{}: FAILED - {reason}", r.target));
                 json.push(serde_json::json!({
                     "target": r.target,
                     "ok": false,
-                    "error": motivo,
+                    "error": reason,
                 }));
             }
         }
     }
 
-    lineas.push(format!("{}/{total} backups completados", total - fallidos));
+    lines.push(format!("{}/{total} backups completed", total - failed));
 
-    Informe::new(
-        lineas.join("\n"),
+    Report::new(
+        lines.join("\n"),
         serde_json::json!({
-            "comando": "backup",
+            "command": "backup",
             "total": total,
-            "fallidos": fallidos,
+            "failed": failed,
             "targets": json,
         }),
     )
 }
 
-fn detalle_de_fallos(resultados: &[Resultado]) -> String {
-    resultados
+fn failure_detail(outcomes: &[Outcome]) -> String {
+    outcomes
         .iter()
-        .filter_map(|r| r.fallo.as_ref().map(|f| format!("  {}: {f}", r.target)))
+        .filter_map(|r| r.failure.as_ref().map(|f| format!("  {}: {f}", r.target)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -239,22 +244,22 @@ fn detalle_de_fallos(resultados: &[Resultado]) -> String {
 mod tests {
     use super::*;
 
-    fn ok(target: &str, clave: &str) -> Resultado {
-        Resultado {
+    fn ok(target: &str, key: &str) -> Outcome {
+        Outcome {
             target: target.into(),
-            clave: Some(clave.into()),
-            fallo: None,
+            key: Some(key.into()),
+            failure: None,
             plaintext: 10,
             ciphertext: 5,
             digest: "abc".into(),
         }
     }
 
-    fn mal(target: &str, motivo: &str) -> Resultado {
-        Resultado {
+    fn bad(target: &str, reason: &str) -> Outcome {
+        Outcome {
             target: target.into(),
-            clave: None,
-            fallo: Some(CliError::operacion(motivo)),
+            key: None,
+            failure: Some(CliError::operation(reason)),
             plaintext: 0,
             ciphertext: 0,
             digest: String::new(),
@@ -262,47 +267,44 @@ mod tests {
     }
 
     #[test]
-    fn la_marca_de_tiempo_es_iso8601_en_utc() {
-        // El manifiesto la lee un programa: el formato tiene que ser fijo y no
-        // depender de la localización del servidor.
-        let momento = OffsetDateTime::from_unix_timestamp(1_755_770_400).unwrap();
-        let texto = iso8601_utc(momento);
-        assert_eq!(texto.len(), 20, "{texto}");
-        assert!(texto.ends_with('Z'), "{texto}");
-        assert_eq!(&texto[4..5], "-");
-        assert_eq!(&texto[10..11], "T");
+    fn the_timestamp_is_iso8601_in_utc() {
+        // The manifest is read by a program: the format has to be fixed and not
+        // depend on the server's locale.
+        let instant = OffsetDateTime::from_unix_timestamp(1_755_770_400).unwrap();
+        let text = iso8601_utc(instant);
+        assert_eq!(text.len(), 20, "{text}");
+        assert!(text.ends_with('Z'), "{text}");
+        assert_eq!(&text[4..5], "-");
+        assert_eq!(&text[10..11], "T");
     }
 
     #[test]
-    fn el_json_lleva_la_clave_de_cada_artefacto() {
-        // Es lo que un script busca: `jq '.targets[].artifact_key'`.
-        let informe = componer(&[ok("prod", "prod/2026/x.age")], 1, 0);
-        assert_eq!(
-            informe.json["targets"][0]["artifact_key"],
-            "prod/2026/x.age"
-        );
-        assert_eq!(informe.json["fallidos"], 0);
+    fn the_json_carries_each_artifacts_key() {
+        // It is what a script looks for: `jq '.targets[].artifact_key'`.
+        let report = compose(&[ok("prod", "prod/2026/x.age")], 1, 0);
+        assert_eq!(report.json["targets"][0]["artifact_key"], "prod/2026/x.age");
+        assert_eq!(report.json["failed"], 0);
     }
 
     #[test]
-    fn un_target_que_falla_no_borra_a_los_que_fueron_bien() {
-        // Quien respalda diez bases de datos quiere las nueve buenas hechas y
-        // saber cuál fue la décima.
-        let informe = componer(&[ok("a", "a.age"), mal("b", "sin espacio")], 2, 1);
-        assert_eq!(informe.json["targets"][0]["ok"], true);
-        assert_eq!(informe.json["targets"][1]["ok"], false);
-        assert_eq!(informe.json["targets"][1]["error"], "sin espacio");
-        assert!(informe.humano.contains("1/2 backups completados"));
+    fn a_target_that_fails_does_not_erase_the_ones_that_went_well() {
+        // Whoever backs up ten databases wants the nine good ones done and to
+        // know which was the tenth.
+        let report = compose(&[ok("a", "a.age"), bad("b", "no space left")], 2, 1);
+        assert_eq!(report.json["targets"][0]["ok"], true);
+        assert_eq!(report.json["targets"][1]["ok"], false);
+        assert_eq!(report.json["targets"][1]["error"], "no space left");
+        assert!(report.human.contains("1/2 backups completed"));
     }
 
     #[test]
-    fn el_detalle_de_los_fallos_nombra_su_target() {
-        let texto = detalle_de_fallos(&[ok("a", "a.age"), mal("b", "disco lleno")]);
-        assert!(texto.contains('b'), "{texto}");
-        assert!(texto.contains("disco lleno"), "{texto}");
+    fn the_failure_detail_names_its_target() {
+        let text = failure_detail(&[ok("a", "a.age"), bad("b", "disk full")]);
+        assert!(text.contains('b'), "{text}");
+        assert!(text.contains("disk full"), "{text}");
         assert!(
-            !texto.contains("a.age"),
-            "los que fueron bien no son fallos"
+            !text.contains("a.age"),
+            "the ones that went well are not failures"
         );
     }
 }

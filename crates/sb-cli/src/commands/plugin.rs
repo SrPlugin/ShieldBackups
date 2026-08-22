@@ -1,299 +1,303 @@
 //! `shieldbk plugin list | docs <plugin> | verify | lock`.
 //!
-//! Los cuatro giran alrededor del lockfile, que es lo que separa «un binario
-//! que está en el directorio» de «un binario que este sistema autoriza a
-//! recibir las credenciales de su base de datos». `lock` da esa autorización,
-//! `verify` la comprueba sin ejecutar nada, `list` la enseña y `docs` es el
-//! único que arranca un plugin —y solo para preguntarle qué campos acepta—.
+//! All four revolve around the lockfile, which is what separates "a binary that
+//! is in the directory" from "a binary this system authorises to receive its
+//! database's credentials". `lock` grants that authorisation, `verify` checks
+//! it without running anything, `list` shows it and `docs` is the only one that
+//! starts a plugin -- and only to ask it which fields it accepts.
 //!
-//! `docs` **nunca imprime valores**, solo el esquema. La diferencia no es
-//! cosmética: el esquema dice que existe un campo `password`, y un comando que
-//! imprimiera «lo que hay configurado» lo imprimiría también.
+//! `docs` **never prints values**, only the schema. The difference is not
+//! cosmetic: the schema says there is a `password` field, and a command that
+//! also printed "what is configured" would print it too.
 
 use std::fmt::Write as _;
 
 use sb_core::lockfile::{Lockfile, LockfileError};
 use sb_proto::{Field, FieldType};
 
-use crate::context::Contexto;
+use crate::context::Context;
 use crate::error::CliError;
-use crate::output::Informe;
+use crate::output::Report;
 use crate::plugins;
 
-/// Estado de un binario respecto al lockfile.
+/// A binary's status with respect to the lockfile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Estado {
-    /// Está registrado y su hash sigue siendo el mismo.
-    Registrado,
-    /// El binario está pero nadie lo ha autorizado.
-    SinRegistrar,
-    /// Está registrado con **otro** hash: alguien lo ha cambiado.
-    Alterado,
-    /// El lockfile lo autoriza pero el binario no está en el directorio.
-    Ausente,
+enum Status {
+    /// It is registered and its hash is still the same.
+    Registered,
+    /// The binary is there but nobody has authorised it.
+    Unregistered,
+    /// It is registered with **another** hash: somebody has changed it.
+    Altered,
+    /// The lockfile authorises it but the binary is not in the directory.
+    Missing,
 }
 
-impl Estado {
-    const fn como_cadena(self) -> &'static str {
+impl Status {
+    const fn as_str(self) -> &'static str {
         match self {
-            Self::Registrado => "registrado",
-            Self::SinRegistrar => "sin registrar",
-            Self::Alterado => "ALTERADO",
-            Self::Ausente => "ausente",
+            Self::Registered => "registered",
+            Self::Unregistered => "unregistered",
+            Self::Altered => "ALTERED",
+            Self::Missing => "missing",
         }
     }
 
-    /// Si este estado impide ejecutar el binario.
-    const fn es_fallo(self) -> bool {
-        !matches!(self, Self::Registrado)
+    /// Whether this status prevents running the binary.
+    const fn is_failure(self) -> bool {
+        !matches!(self, Self::Registered)
     }
 }
 
-/// `plugin list`: qué hay en el directorio y qué dice el lockfile de ello.
+/// `plugin list`: what is in the directory and what the lockfile says about it.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el directorio o el lockfile no se pueden
-/// leer. Que un plugin esté sin registrar **no** es un error aquí: es
-/// justamente lo que este comando existe para enseñar.
-pub fn listar(ctx: &Contexto) -> Result<Informe, CliError> {
-    let (estados, _) = inventario(ctx)?;
+/// Returns [`CliError::Plugin`] if the directory or the lockfile cannot be
+/// read. A plugin being unregistered is **not** an error here: it is exactly
+/// what this command exists to show.
+pub fn list(ctx: &Context) -> Result<Report, CliError> {
+    let (statuses, _) = inventory(ctx)?;
 
-    let humano = if estados.is_empty() {
-        format!("no hay ningún plugin en «{}»", ctx.dir_plugins.display())
+    let human = if statuses.is_empty() {
+        format!("there is no plugin in `{}`", ctx.plugins_dir.display())
     } else {
-        estados
+        statuses
             .iter()
-            .map(|(nombre, estado)| format!("{nombre}: {}", estado.como_cadena()))
+            .map(|(name, status)| format!("{name}: {}", status.as_str()))
             .collect::<Vec<_>>()
             .join("\n")
     };
 
-    Ok(Informe::new(
-        humano,
+    Ok(Report::new(
+        human,
         serde_json::json!({
-            "comando": "plugin list",
-            "dir": ctx.dir_plugins.to_string_lossy(),
-            "lockfile": ctx.ruta_lockfile.to_string_lossy(),
-            "plugins": estados.iter().map(|(nombre, estado)| serde_json::json!({
-                "nombre": nombre,
-                "estado": estado.como_cadena(),
-                "usable": !estado.es_fallo(),
+            "command": "plugin list",
+            "dir": ctx.plugins_dir.to_string_lossy(),
+            "lockfile": ctx.lockfile_path.to_string_lossy(),
+            "plugins": statuses.iter().map(|(name, status)| serde_json::json!({
+                "name": name,
+                "status": status.as_str(),
+                "usable": !status.is_failure(),
             })).collect::<Vec<_>>(),
         }),
     ))
 }
 
-/// `plugin verify`: comprobar todos los hashes **sin arrancar nada**.
+/// `plugin verify`: check every hash **without starting anything**.
 ///
-/// Es la comprobación que se puede hacer en una máquina en la que no se quiere
-/// ejecutar ningún plugin: leer ficheros y comparar digests, nada más.
+/// It is the check that can be run on a machine where no plugin is meant to be
+/// executed: read files and compare digests, nothing else.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el directorio o el lockfile no se pueden
-/// leer. Los binarios que no cuadran salen **dentro** del informe con el fallo
-/// puesto: el comando existe para enumerarlos, no para pararse en el primero.
-pub fn verificar(ctx: &Contexto) -> Result<Informe, CliError> {
-    let (estados, _) = inventario(ctx)?;
+/// Returns [`CliError::Plugin`] if the directory or the lockfile cannot be
+/// read. The binaries that do not add up come out **inside** the report with
+/// the failure set: the command exists to enumerate them, not to stop at the
+/// first one.
+pub fn verify(ctx: &Context) -> Result<Report, CliError> {
+    let (statuses, _) = inventory(ctx)?;
 
-    let fallos: Vec<&(String, Estado)> = estados.iter().filter(|(_, e)| e.es_fallo()).collect();
-    let informe = Informe::new(
-        estados
+    let failures: Vec<&(String, Status)> =
+        statuses.iter().filter(|(_, e)| e.is_failure()).collect();
+    let report = Report::new(
+        statuses
             .iter()
-            .map(|(nombre, estado)| format!("{nombre}: {}", estado.como_cadena()))
+            .map(|(name, status)| format!("{name}: {}", status.as_str()))
             .collect::<Vec<_>>()
             .join("\n"),
         serde_json::json!({
-            "comando": "plugin verify",
-            "total": estados.len(),
-            "fallidos": fallos.len(),
-            "plugins": estados.iter().map(|(nombre, estado)| serde_json::json!({
-                "nombre": nombre,
-                "estado": estado.como_cadena(),
-                "usable": !estado.es_fallo(),
+            "command": "plugin verify",
+            "total": statuses.len(),
+            "failed": failures.len(),
+            "plugins": statuses.iter().map(|(name, status)| serde_json::json!({
+                "name": name,
+                "status": status.as_str(),
+                "usable": !status.is_failure(),
             })).collect::<Vec<_>>(),
         }),
     );
 
-    if fallos.is_empty() {
-        return Ok(informe);
+    if failures.is_empty() {
+        return Ok(report);
     }
 
-    let detalle = fallos
+    let detail = failures
         .iter()
-        .map(|(nombre, estado)| format!("  {nombre}: {}", estado.como_cadena()))
+        .map(|(name, status)| format!("  {name}: {}", status.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(informe.con_fallo(CliError::plugin(format!(
-        "{} de {} plugins no se pueden ejecutar:\n{detalle}\nSi los cambios son esperados, \
-         vuelve a registrarlos con `shieldbk plugin lock`. Si no lo son, NO los ejecutes: un \
-         plugin recibe las credenciales de tu base de datos y de tu almacenamiento",
-        fallos.len(),
-        estados.len()
+    Ok(report.with_failure(CliError::plugin(format!(
+        "{} of {} plugins cannot be run:\n{detail}\nIf the changes are expected, register them \
+         again with `shieldbk plugin lock`. If they are not, do NOT run them: a plugin receives \
+         your database's and your storage's credentials",
+        failures.len(),
+        statuses.len()
     ))))
 }
 
-/// `plugin lock`: registrar el hash de cada binario del directorio.
+/// `plugin lock`: register the hash of every binary in the directory.
 ///
-/// Registra **lo que hay ahora**, sin preguntar. Es lo correcto: quien ejecuta
-/// este comando está diciendo «estos binarios son los que quiero», y la
-/// confianza en su origen es una decisión suya. Lo que el lockfile garantiza a
-/// partir de aquí es que sigan siendo esos.
+/// It registers **what is there now**, without asking. That is right: whoever
+/// runs this command is saying "these binaries are the ones I want", and trust
+/// in their origin is their decision. What the lockfile guarantees from here on
+/// is that they stay those.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el directorio no se puede leer o el
-/// lockfile no se puede escribir.
-pub fn lock(ctx: &Contexto) -> Result<Informe, CliError> {
-    let binarios = plugins::binarios(&ctx.dir_plugins)?;
+/// Returns [`CliError::Plugin`] if the directory cannot be read or the lockfile
+/// cannot be written.
+pub fn lock(ctx: &Context) -> Result<Report, CliError> {
+    let binaries = plugins::binaries(&ctx.plugins_dir)?;
 
-    // Se parte del lockfile existente y no de uno vacío: un `lock` no puede
-    // borrar en silencio la autorización de un plugin que hoy no está montado.
-    let mut lockfile = Lockfile::load(&ctx.ruta_lockfile)?;
-    let mut registrados = Vec::with_capacity(binarios.len());
-    for (nombre, ruta) in &binarios {
-        lockfile.register(nombre, ruta)?;
-        registrados.push(nombre.clone());
+    // It starts from the existing lockfile and not from an empty one: a `lock`
+    // must not silently erase the authorisation of a plugin that is not mounted
+    // today.
+    let mut lockfile = Lockfile::load(&ctx.lockfile_path)?;
+    let mut registered = Vec::with_capacity(binaries.len());
+    for (name, path) in &binaries {
+        lockfile.register(name, path)?;
+        registered.push(name.clone());
     }
 
-    crear_directorio_de(ctx)?;
-    lockfile.save(&ctx.ruta_lockfile)?;
+    create_lockfile_dir(ctx)?;
+    lockfile.save(&ctx.lockfile_path)?;
 
-    let humano = if registrados.is_empty() {
+    let human = if registered.is_empty() {
         format!(
-            "no había ningún plugin que registrar en «{}»",
-            ctx.dir_plugins.display()
+            "there was no plugin to register in `{}`",
+            ctx.plugins_dir.display()
         )
     } else {
         format!(
-            "{} plugins registrados en «{}»: {}",
-            registrados.len(),
-            ctx.ruta_lockfile.display(),
-            registrados.join(", ")
+            "{} plugins registered in `{}`: {}",
+            registered.len(),
+            ctx.lockfile_path.display(),
+            registered.join(", ")
         )
     };
 
-    Ok(Informe::new(
-        humano,
+    Ok(Report::new(
+        human,
         serde_json::json!({
-            "comando": "plugin lock",
-            "lockfile": ctx.ruta_lockfile.to_string_lossy(),
-            "registrados": registrados,
+            "command": "plugin lock",
+            "lockfile": ctx.lockfile_path.to_string_lossy(),
+            "registered": registered,
         }),
     ))
 }
 
-/// `plugin docs <plugin>`: el esquema de configuración, en una tabla.
+/// `plugin docs <plugin>`: the configuration schema, as a table.
 ///
 /// # Errors
-/// Devuelve [`CliError::Plugin`] si el binario no está, no está autorizado o no
-/// arranca.
-pub async fn docs(ctx: &Contexto, nombre: &str) -> Result<Informe, CliError> {
-    let cliente = plugins::arrancar(ctx, nombre).await?;
-    let esquema = cliente.schema().await;
-    plugins::cerrar(cliente).await;
-    let esquema = esquema?;
+/// Returns [`CliError::Plugin`] if the binary is not there, is not authorised
+/// or does not start.
+pub async fn docs(ctx: &Context, name: &str) -> Result<Report, CliError> {
+    let client = plugins::start(ctx, name).await?;
+    let schema = client.schema().await;
+    plugins::close(client).await;
+    let schema = schema?;
 
-    Ok(Informe::new(
-        tabla(nombre, &esquema),
+    Ok(Report::new(
+        table(name, &schema),
         serde_json::json!({
-            "comando": "plugin docs",
-            "plugin": nombre,
-            "campos": esquema.iter().map(|campo| serde_json::json!({
-                "nombre": campo.name,
-                "tipo": tipo_de(campo),
-                "requerido": campo.required,
-                "secreto": campo.secret,
-                "descripcion": campo.description,
-                "por_defecto": campo.default_value,
+            "command": "plugin docs",
+            "plugin": name,
+            "fields": schema.iter().map(|field| serde_json::json!({
+                "name": field.name,
+                "type": type_name(field),
+                "required": field.required,
+                "secret": field.secret,
+                "description": field.description,
+                "default": field.default_value,
             })).collect::<Vec<_>>(),
         }),
     ))
 }
 
-/// Cruza lo que hay en el directorio con lo que dice el lockfile.
+/// Crosses what is in the directory with what the lockfile says.
 ///
-/// Se mira en las dos direcciones a propósito: un binario que está pero no
-/// está registrado y un registro cuyo binario ha desaparecido son problemas
-/// distintos, y solo mirando el directorio se vería el primero.
-fn inventario(ctx: &Contexto) -> Result<(Vec<(String, Estado)>, Lockfile), CliError> {
-    let binarios = plugins::binarios(&ctx.dir_plugins)?;
-    let lockfile = Lockfile::load(&ctx.ruta_lockfile)?;
+/// Both directions are looked at on purpose: a binary that is there but is not
+/// registered and a registration whose binary has disappeared are different
+/// problems, and only looking at the directory would show the first.
+fn inventory(ctx: &Context) -> Result<(Vec<(String, Status)>, Lockfile), CliError> {
+    let binaries = plugins::binaries(&ctx.plugins_dir)?;
+    let lockfile = Lockfile::load(&ctx.lockfile_path)?;
 
-    let mut estados: Vec<(String, Estado)> = binarios
+    let mut statuses: Vec<(String, Status)> = binaries
         .iter()
-        .map(|(nombre, ruta)| {
-            let estado = match lockfile.verify(nombre, ruta) {
-                Ok(()) => Estado::Registrado,
-                Err(LockfileError::NotRegistered { .. }) => Estado::SinRegistrar,
-                Err(_) => Estado::Alterado,
+        .map(|(name, path)| {
+            let status = match lockfile.verify(name, path) {
+                Ok(()) => Status::Registered,
+                Err(LockfileError::NotRegistered { .. }) => Status::Unregistered,
+                Err(_) => Status::Altered,
             };
-            (nombre.clone(), estado)
+            (name.clone(), status)
         })
         .collect();
 
-    for registrado in lockfile.names() {
-        if !binarios.iter().any(|(nombre, _)| nombre == &registrado) {
-            estados.push((registrado, Estado::Ausente));
+    for registered in lockfile.names() {
+        if !binaries.iter().any(|(name, _)| name == &registered) {
+            statuses.push((registered, Status::Missing));
         }
     }
 
-    estados.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok((estados, lockfile))
+    statuses.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((statuses, lockfile))
 }
 
-/// Crea el directorio del lockfile si hace falta.
+/// Creates the lockfile's directory if it is needed.
 ///
-/// Es la primera escritura de una instalación nueva: sin esto, `plugin lock`
-/// fallaría con un «no such file or directory» que habla del directorio padre
-/// y no del lockfile, que es lo que el usuario cree estar creando.
-fn crear_directorio_de(ctx: &Contexto) -> Result<(), CliError> {
-    let Some(padre) = ctx.ruta_lockfile.parent() else {
+/// It is the first write of a new installation: without this, `plugin lock`
+/// would fail with a "no such file or directory" that talks about the parent
+/// directory and not about the lockfile, which is what the user believes they
+/// are creating.
+fn create_lockfile_dir(ctx: &Context) -> Result<(), CliError> {
+    let Some(parent) = ctx.lockfile_path.parent() else {
         return Ok(());
     };
-    if padre.as_os_str().is_empty() || padre.is_dir() {
+    if parent.as_os_str().is_empty() || parent.is_dir() {
         return Ok(());
     }
-    std::fs::create_dir_all(padre).map_err(|fuente| {
+    std::fs::create_dir_all(parent).map_err(|source| {
         CliError::plugin(format!(
-            "no se pudo crear el directorio del lockfile «{}»: {fuente}",
-            padre.display()
+            "could not create the lockfile's directory `{}`: {source}",
+            parent.display()
         ))
     })
 }
 
-/// El nombre legible del tipo de un campo.
-fn tipo_de(campo: &Field) -> &'static str {
-    match FieldType::try_from(campo.r#type) {
+/// The readable name of a field's type.
+fn type_name(field: &Field) -> &'static str {
+    match FieldType::try_from(field.r#type) {
         Ok(FieldType::String) => "string",
         Ok(FieldType::Int) => "int",
         Ok(FieldType::Bool) => "bool",
         Ok(FieldType::Duration) => "duration",
         Ok(FieldType::Path) => "path",
         Ok(FieldType::List) => "list",
-        Ok(FieldType::Unspecified) | Err(_) => "desconocido",
+        Ok(FieldType::Unspecified) | Err(_) => "unknown",
     }
 }
 
-/// La tabla que se lee. Columnas alineadas al ancho de su contenido: una
-/// tabla con anchos fijos se rompe con el primer plugin que tenga un campo de
-/// nombre largo.
-fn tabla(plugin: &str, campos: &[Field]) -> String {
-    if campos.is_empty() {
-        return format!("el plugin «{plugin}» no acepta ningún campo de configuración");
+/// The table that gets read. Columns aligned to the width of their content: a
+/// table with fixed widths breaks with the first plugin that has a long field
+/// name.
+fn table(plugin: &str, fields: &[Field]) -> String {
+    if fields.is_empty() {
+        return format!("the plugin `{plugin}` accepts no configuration field");
     }
 
-    let cabeceras = ["CAMPO", "TIPO", "REQ", "SECRETO", "POR DEFECTO"];
-    let filas: Vec<[String; 5]> = campos
+    let headers = ["FIELD", "TYPE", "REQ", "SECRET", "DEFAULT"];
+    let rows: Vec<[String; 5]> = fields
         .iter()
         .map(|c| {
             [
                 c.name.clone(),
-                tipo_de(c).to_owned(),
-                si_no(c.required),
-                si_no(c.secret),
-                // El valor por defecto es parte del esquema que el plugin
-                // publica, no un valor configurado: no hay nada que ocultar.
+                type_name(c).to_owned(),
+                yes_no(c.required),
+                yes_no(c.secret),
+                // The default value is part of the schema the plugin publishes,
+                // not a configured value: there is nothing to hide.
                 if c.default_value.is_empty() {
-                    "—".to_owned()
+                    "-".to_owned()
                 } else {
                     c.default_value.clone()
                 },
@@ -301,111 +305,114 @@ fn tabla(plugin: &str, campos: &[Field]) -> String {
         })
         .collect();
 
-    let mut anchos = cabeceras.map(str::len);
-    for fila in &filas {
-        for (ancho, celda) in anchos.iter_mut().zip(fila) {
-            *ancho = (*ancho).max(celda.chars().count());
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
         }
     }
 
-    let mut texto = format!("campos de configuración de «{plugin}»\n\n");
-    for (i, cabecera) in cabeceras.iter().enumerate() {
-        let _ = write!(texto, "{cabecera:<ancho$}  ", ancho = anchos[i]);
+    let mut text = format!("configuration fields of `{plugin}`\n\n");
+    for (i, header) in headers.iter().enumerate() {
+        let _ = write!(text, "{header:<width$}  ", width = widths[i]);
     }
-    texto.push('\n');
+    text.push('\n');
 
-    for (fila, campo) in filas.iter().zip(campos) {
-        for (i, celda) in fila.iter().enumerate() {
-            let relleno = anchos[i].saturating_sub(celda.chars().count());
-            let _ = write!(texto, "{celda}{:relleno$}  ", "");
+    for (row, field) in rows.iter().zip(fields) {
+        for (i, cell) in row.iter().enumerate() {
+            let padding = widths[i].saturating_sub(cell.chars().count());
+            let _ = write!(text, "{cell}{:padding$}  ", "");
         }
-        texto.push('\n');
-        if !campo.description.is_empty() {
-            let _ = writeln!(texto, "    {}", campo.description);
+        text.push('\n');
+        if !field.description.is_empty() {
+            let _ = writeln!(text, "    {}", field.description);
         }
     }
 
-    texto.trim_end().to_owned()
+    text.trim_end().to_owned()
 }
 
-fn si_no(valor: bool) -> String {
-    if valor { "sí" } else { "no" }.to_owned()
+fn yes_no(value: bool) -> String {
+    if value { "yes" } else { "no" }.to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn campo(nombre: &str, tipo: FieldType, requerido: bool, secreto: bool) -> Field {
+    fn field(name: &str, kind: FieldType, required: bool, secret: bool) -> Field {
         Field {
-            name: nombre.into(),
-            r#type: tipo as i32,
-            required: requerido,
-            secret: secreto,
-            description: format!("descripción de {nombre}"),
+            name: name.into(),
+            r#type: kind as i32,
+            required,
+            secret,
+            description: format!("description of {name}"),
             default_value: String::new(),
         }
     }
 
     #[test]
-    fn solo_el_estado_registrado_permite_ejecutar() {
-        assert!(!Estado::Registrado.es_fallo());
-        for malo in [Estado::SinRegistrar, Estado::Alterado, Estado::Ausente] {
-            assert!(
-                malo.es_fallo(),
-                "{malo:?} no puede dar por bueno un binario"
-            );
+    fn only_the_registered_status_allows_running() {
+        assert!(!Status::Registered.is_failure());
+        for bad in [Status::Unregistered, Status::Altered, Status::Missing] {
+            assert!(bad.is_failure(), "{bad:?} cannot bless a binary");
         }
     }
 
     #[test]
-    fn la_tabla_muestra_las_cinco_columnas_del_esquema() {
-        let texto = tabla(
+    fn the_table_shows_the_schemas_five_columns() {
+        let text = table(
             "postgres",
             &[
-                campo("host", FieldType::String, true, false),
-                campo("password", FieldType::String, true, true),
+                field("host", FieldType::String, true, false),
+                field("password", FieldType::String, true, true),
             ],
         );
-        for cabecera in ["CAMPO", "TIPO", "REQ", "SECRETO", "POR DEFECTO"] {
-            assert!(texto.contains(cabecera), "falta «{cabecera}»:\n{texto}");
+        for header in ["FIELD", "TYPE", "REQ", "SECRET", "DEFAULT"] {
+            assert!(text.contains(header), "`{header}` is missing:\n{text}");
         }
-        assert!(texto.contains("host"));
-        assert!(texto.contains("password"));
-        assert!(texto.contains("descripción de host"));
+        assert!(text.contains("host"));
+        assert!(text.contains("password"));
+        assert!(text.contains("description of host"));
     }
 
     #[test]
-    fn la_tabla_marca_los_campos_secretos_sin_ensenar_ningun_valor() {
-        // `docs` describe el esquema. Un comando que además imprimiera «lo que
-        // hay configurado» imprimiría la contraseña.
-        let mut secreto = campo("password", FieldType::String, true, true);
-        secreto.default_value = String::new();
-        let texto = tabla("postgres", &[secreto]);
-        assert!(texto.contains("sí"), "el campo secreto se marca:\n{texto}");
+    fn the_table_marks_the_secret_fields_without_showing_any_value() {
+        // `docs` describes the schema. A command that also printed "what is
+        // configured" would print the password.
+        let mut secret = field("password", FieldType::String, true, true);
+        secret.default_value = String::new();
+        let text = table("postgres", &[secret]);
+        assert!(text.contains("yes"), "the secret field is marked:\n{text}");
         assert!(
-            !texto.to_lowercase().contains("hunter2"),
-            "no puede haber valores aquí"
+            !text.to_lowercase().contains("hunter2"),
+            "there cannot be values here"
         );
     }
 
     #[test]
-    fn un_plugin_sin_campos_lo_dice_en_vez_de_ensenar_una_tabla_vacia() {
-        let texto = tabla("trivial", &[]);
-        assert!(texto.contains("no acepta ningún campo"), "{texto}");
+    fn a_plugin_with_no_fields_says_so_instead_of_showing_an_empty_table() {
+        let text = table("trivial", &[]);
+        assert!(text.contains("accepts no configuration field"), "{text}");
     }
 
     #[test]
-    fn los_tipos_del_protocolo_tienen_nombre_legible() {
-        assert_eq!(tipo_de(&campo("a", FieldType::Path, false, false)), "path");
-        assert_eq!(tipo_de(&campo("a", FieldType::Int, false, false)), "int");
-        assert_eq!(tipo_de(&campo("a", FieldType::List, false, false)), "list");
-        // Un plugin más nuevo puede mandar un tipo que este núcleo no conoce:
-        // se dice, no se rompe.
-        let raro = Field {
+    fn the_protocols_types_have_a_readable_name() {
+        assert_eq!(
+            type_name(&field("a", FieldType::Path, false, false)),
+            "path"
+        );
+        assert_eq!(type_name(&field("a", FieldType::Int, false, false)), "int");
+        assert_eq!(
+            type_name(&field("a", FieldType::List, false, false)),
+            "list"
+        );
+        // A newer plugin may send a type this core does not know: it is
+        // reported, not a crash.
+        let odd = Field {
             r#type: 99,
-            ..campo("a", FieldType::Int, false, false)
+            ..field("a", FieldType::Int, false, false)
         };
-        assert_eq!(tipo_de(&raro), "desconocido");
+        assert_eq!(type_name(&odd), "unknown");
     }
 }

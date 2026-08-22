@@ -1,47 +1,48 @@
 //! `shieldbk storage gc <target>`.
 //!
-//! Una subida que se corta a mitad —el proceso muere, la red se cae— no
-//! desaparece sola: en un destino con subidas multipart quedan las partes ya
-//! escritas, invisibles al listado y **facturables**. Nadie las ve y todo el
-//! mundo las paga, hasta que alguien mira la factura y no entiende por qué el
-//! bucket «vacío» cuesta dinero.
+//! An upload that gets cut halfway -- the process dies, the network goes down
+//! -- does not disappear on its own: in a storage target with multipart uploads
+//! the parts already written stay there, invisible to the listing and
+//! **billable**. Nobody sees them and everybody pays for them, until somebody
+//! looks at the invoice and does not understand why the "empty" bucket costs
+//! money.
 //!
-//! Este comando es la única forma de barrerlas. Se acota al prefijo del target
-//! y no al bucket entero a propósito: un destino puede tener más cosas dentro
-//! que los backups de este `shieldbk`, y abortar subidas ajenas sería peor que
-//! el problema que se venía a resolver.
+//! This command is the only way to sweep them up. It is deliberately scoped to
+//! the target's prefix and not to the whole bucket: a storage target may hold
+//! more than this `shieldbk`'s backups, and aborting somebody else's uploads
+//! would be worse than the problem it came to solve.
 
 use crate::artifacts;
-use crate::context::Contexto;
+use crate::context::Context;
 use crate::error::CliError;
-use crate::output::Informe;
-use crate::plugins::{self, Papel};
+use crate::output::Report;
+use crate::plugins::{self, Role};
 
 /// # Errors
-/// Devuelve [`CliError::Config`] si el target no existe, [`CliError::Plugin`]
-/// si el destino no arranca y [`CliError::Operacion`] si el destino rechaza la
-/// limpieza.
-pub async fn gc(ctx: &Contexto, target: &str) -> Result<Informe, CliError> {
+/// Returns [`CliError::Config`] if the target does not exist,
+/// [`CliError::Plugin`] if the storage target does not start and
+/// [`CliError::Operation`] if the storage target rejects the cleanup.
+pub async fn gc(ctx: &Context, target: &str) -> Result<Report, CliError> {
     let target = ctx.target(target)?;
-    let prefijo = artifacts::prefijo_de(target, &ctx.config.defaults);
+    let prefix = artifacts::prefix_for(target, &ctx.config.defaults);
 
-    let destino = plugins::arrancar_para(ctx, target, Papel::Destino).await?;
-    let resultado = artifacts::abortar_incompletas(&destino, &prefijo).await;
-    plugins::cerrar(destino).await;
+    let storage = plugins::start_for(ctx, target, Role::Storage).await?;
+    let outcome = artifacts::abort_incomplete(&storage, &prefix).await;
+    plugins::close(storage).await;
 
-    let abortadas = resultado?;
-    tracing::info!(target = %target.name, %prefijo, abortadas, "limpieza del destino terminada");
+    let aborted = outcome?;
+    tracing::info!(target = %target.name, %prefix, aborted, "storage cleanup finished");
 
-    Ok(Informe::new(
+    Ok(Report::new(
         format!(
-            "{}: {abortadas} subidas incompletas abortadas bajo «{prefijo}»",
+            "{}: {aborted} incomplete uploads aborted under `{prefix}`",
             target.name
         ),
         serde_json::json!({
-            "comando": "storage gc",
+            "command": "storage gc",
             "target": target.name,
-            "prefijo": prefijo,
-            "abortadas": abortadas,
+            "prefix": prefix,
+            "aborted": aborted,
         }),
     ))
 }

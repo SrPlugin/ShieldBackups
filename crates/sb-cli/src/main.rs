@@ -1,16 +1,16 @@
-//! `shieldbk`: la cara visible de `ShieldBackups`.
+//! `shieldbk`: the visible face of `ShieldBackups`.
 //!
-//! Este archivo no hace nada más que arrancar. Interpretar los argumentos vive
-//! en [`cli`], decidir qué se ejecuta en [`commands`], y cómo se cuenta el
-//! resultado en [`output`]. Aquí solo queda el orden en que se encadenan y la
-//! única decisión que no cabe en ninguno de los tres: **con qué código de
-//! salida termina el proceso**.
+//! This file does nothing but start up. Parsing the arguments lives in [`cli`],
+//! deciding what runs in [`commands`], and how the result is told in
+//! [`output`]. What is left here is only the order in which they are chained
+//! and the single decision that fits in none of the three: **which exit code
+//! the process ends with**.
 //!
-//! Ese código es lo que convierte la herramienta en algo automatizable. Un
-//! `cron` que solo distinga «cero» de «no cero» acaba mandando el mismo aviso
-//! cuando falta una coma en el TOML que cuando la base de datos no responde,
-//! así que [`error::CliError`] separa los tres casos y esta función los
-//! traduce.
+//! That code is what makes the tool automatable. A `cron` that only tells
+//! "zero" from "non-zero" ends up sending the same alert when a comma is
+//! missing in the TOML as when the database does not answer, so
+//! [`error::CliError`] separates the three cases and this function translates
+//! them.
 
 mod artifacts;
 mod cli;
@@ -27,42 +27,41 @@ use std::process::ExitCode;
 use clap::Parser as _;
 
 use crate::cli::Cli;
-use crate::output::Salida;
+use crate::output::Output;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // La traza se enciende antes que nada: los fallos de carga de la
-    // configuración también merecen contexto cuando alguien pide `-v`.
-    logging::iniciar(cli.verbose);
+    // Tracing is switched on before anything else: configuration loading
+    // failures also deserve context when somebody asks for `-v`.
+    logging::init(cli.verbose);
 
-    let salida = Salida::new(cli.format);
+    let output = Output::new(cli.format);
 
-    // El runtime se construye aquí y no con `#[tokio::main]` para que el
-    // código de salida siga siendo lo último que decide este archivo: una
-    // macro que envuelva `main` obligaría a devolver el error por `Termination`
-    // y a renunciar a distinguir sus tres clases.
+    // The runtime is built here and not with `#[tokio::main]` so that the exit
+    // code remains the last thing this file decides: a macro wrapping `main`
+    // would force returning the error through `Termination` and giving up on
+    // telling its three classes apart.
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
-        Err(fuente) => {
-            let error = error::CliError::operacion(format!(
-                "no se pudo arrancar el runtime asíncrono: {fuente}"
-            ));
-            salida.fallo(&error);
-            return ExitCode::from(u8::try_from(error.codigo()).unwrap_or(1));
+        Err(source) => {
+            let error =
+                error::CliError::operation(format!("could not start the async runtime: {source}"));
+            output.failure(&error);
+            return ExitCode::from(u8::try_from(error.code()).unwrap_or(1));
         }
     };
 
-    match runtime.block_on(commands::ejecutar(&cli)) {
-        // Un informe puede traer un fallo dentro: es lo que distingue «no pude
-        // hacerlo» de «lo hice y esto es lo que encontré».
-        Ok(informe) => {
-            salida.emitir(&informe);
-            ExitCode::from(u8::try_from(informe.codigo()).unwrap_or(1))
+    match runtime.block_on(commands::run(&cli)) {
+        // A report can carry a failure inside: that is what tells "I could not
+        // do it" from "I did it and this is what I found".
+        Ok(report) => {
+            output.emit(&report);
+            ExitCode::from(u8::try_from(report.code()).unwrap_or(1))
         }
         Err(error) => {
-            salida.fallo(&error);
-            ExitCode::from(u8::try_from(error.codigo()).unwrap_or(1))
+            output.failure(&error);
+            ExitCode::from(u8::try_from(error.code()).unwrap_or(1))
         }
     }
 }
