@@ -2,44 +2,45 @@ use std::path::{Path, PathBuf};
 
 use tokio::net::UnixStream;
 
-/// Canal por el que fluyen los bytes de un backup.
+/// The channel the bytes of a backup flow through.
 ///
-/// # Por qué no lleva TLS
+/// # Why it carries no TLS
 ///
-/// Es deliberado. Ambos extremos son procesos del mismo usuario en la misma
-/// máquina, hablando por un socket dentro de un directorio `0700`. Quien pueda
-/// leer ese socket ya *es* ese usuario y tiene acceso directo a las
-/// credenciales: cifrar aquí no cambiaría el modelo de amenaza y costaría CPU
-/// en el camino caliente, que mueve cientos de gigabytes.
+/// That is deliberate. Both ends are processes of the same user on the same
+/// machine, talking over a socket inside a `0700` directory. Anyone who can
+/// read that socket already *is* that user and has direct access to the
+/// credentials: encrypting here would not change the threat model and would
+/// cost CPU on the hot path, which moves hundreds of gigabytes.
 ///
-/// El plano de control sí va cifrado y autenticado, porque por ahí viajan los
-/// secretos y porque su volumen es despreciable.
+/// The control plane *is* encrypted and authenticated, because that is where
+/// the secrets travel and because its volume is negligible.
 ///
-/// El socket se borra al destruirse el canal.
+/// The socket is removed when the channel is dropped.
 pub struct DataChannel {
-    /// Se enlaza con la API de `std` a propósito: `create` es síncrona y debe
-    /// poder llamarse antes de que exista un runtime. El listener se registra
-    /// en el reactor de tokio solo dentro de `accept`.
+    /// Bound to the `std` API on purpose: `create` is synchronous and must be
+    /// callable before a runtime exists. The listener is registered with the
+    /// tokio reactor only inside `accept`.
     listener: std::os::unix::net::UnixListener,
     path: PathBuf,
 }
 
 impl DataChannel {
-    /// Crea el canal dentro de `dir`, que se fuerza a permisos `0700`.
+    /// Creates the channel inside `dir`, whose permissions are forced to `0700`.
     ///
-    /// Si ya existe un socket con ese nombre —un plugin que murió sin limpiar—
-    /// se elimina antes de enlazar, en vez de fallar con «address in use».
+    /// If a socket with that name already exists — a plugin that died without
+    /// cleaning up — it is removed before binding, instead of failing with
+    /// "address in use".
     ///
     /// # Errors
-    /// Devuelve error si no se puede crear el directorio, ajustar sus permisos
-    /// o enlazar el socket.
-    pub fn create(dir: &Path, nombre: &str) -> std::io::Result<Self> {
+    /// Returns an error if the directory cannot be created, its permissions
+    /// cannot be set, or the socket cannot be bound.
+    pub fn create(dir: &Path, name: &str) -> std::io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
 
-        let path = dir.join(format!("{nombre}.sock"));
+        let path = dir.join(format!("{name}.sock"));
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
@@ -52,17 +53,18 @@ impl DataChannel {
         &self.path
     }
 
-    /// Espera a que el plugin se conecte.
+    /// Waits for the plugin to connect.
     ///
-    /// **Quien llama debe imponer un tiempo límite.** Un plugin que nunca se
-    /// conecta dejaría el backup colgado indefinidamente, y un backup colgado
-    /// a las tres de la mañana es peor que uno que falla.
+    /// **The caller must impose a deadline.** A plugin that never connects
+    /// would leave the backup hanging indefinitely, and a backup hanging at
+    /// three in the morning is worse than one that fails.
     ///
     /// # Errors
-    /// Devuelve error si falla el `accept`.
+    /// Returns an error if the `accept` fails.
     pub async fn accept(&self) -> std::io::Result<UnixStream> {
-        // Se duplica el descriptor para registrarlo en el reactor sin
-        // consumir el listener propio del canal, que sobrevive al `accept`.
+        // The descriptor is duplicated so it can be registered with the reactor
+        // without consuming the channel's own listener, which outlives the
+        // `accept`.
         let dup = self.listener.try_clone()?;
         dup.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(dup)?;
@@ -73,15 +75,16 @@ impl DataChannel {
 
 impl Drop for DataChannel {
     fn drop(&mut self) {
-        // Best-effort: si falla, el directorio temporal se lleva el socket.
+        // Best-effort: if it fails, the temporary directory takes the socket
+        // with it.
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-/// Lado del plugin: se conecta al canal que creó el núcleo.
+/// The plugin's side: connects to the channel the core created.
 ///
 /// # Errors
-/// Devuelve error si el socket no existe o no se puede abrir.
+/// Returns an error if the socket does not exist or cannot be opened.
 pub async fn connect_data(path: &Path) -> std::io::Result<UnixStream> {
     UnixStream::connect(path).await
 }
@@ -92,83 +95,83 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn el_plugin_escribe_y_el_nucleo_lee() {
-        // El sentido del backup: el motor produce, el núcleo consume.
+    async fn the_plugin_writes_and_the_core_reads() {
+        // The direction of a backup: the engine produces, the core consumes.
         let dir = tempfile::tempdir().unwrap();
-        let canal = DataChannel::create(dir.path(), "dump").unwrap();
-        let ruta = canal.path().to_path_buf();
+        let channel = DataChannel::create(dir.path(), "dump").unwrap();
+        let path = channel.path().to_path_buf();
 
         let plugin = tokio::spawn(async move {
-            let mut s = connect_data(&ruta).await.unwrap();
-            s.write_all(b"bytes del dump").await.unwrap();
+            let mut s = connect_data(&path).await.unwrap();
+            s.write_all(b"dump bytes").await.unwrap();
             s.shutdown().await.unwrap();
         });
 
-        let mut stream = canal.accept().await.unwrap();
+        let mut stream = channel.accept().await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
 
-        assert_eq!(buf, b"bytes del dump");
+        assert_eq!(buf, b"dump bytes");
         plugin.await.unwrap();
     }
 
     #[tokio::test]
-    async fn el_nucleo_escribe_y_el_plugin_lee() {
-        // El sentido del restore, y el de la subida al destino.
+    async fn the_core_writes_and_the_plugin_reads() {
+        // The direction of a restore, and of the upload to the target.
         let dir = tempfile::tempdir().unwrap();
-        let canal = DataChannel::create(dir.path(), "put").unwrap();
-        let ruta = canal.path().to_path_buf();
+        let channel = DataChannel::create(dir.path(), "put").unwrap();
+        let path = channel.path().to_path_buf();
 
         let plugin = tokio::spawn(async move {
-            let mut s = connect_data(&ruta).await.unwrap();
+            let mut s = connect_data(&path).await.unwrap();
             let mut buf = Vec::new();
             s.read_to_end(&mut buf).await.unwrap();
             buf
         });
 
-        let mut stream = canal.accept().await.unwrap();
-        stream.write_all(b"artefacto cifrado").await.unwrap();
+        let mut stream = channel.accept().await.unwrap();
+        stream.write_all(b"encrypted artifact").await.unwrap();
         stream.shutdown().await.unwrap();
 
-        assert_eq!(plugin.await.unwrap(), b"artefacto cifrado");
+        assert_eq!(plugin.await.unwrap(), b"encrypted artifact");
     }
 
     #[tokio::test]
-    async fn mueve_volumen_sin_corromper_nada() {
+    async fn it_moves_bulk_data_without_corrupting_anything() {
         let dir = tempfile::tempdir().unwrap();
-        let canal = DataChannel::create(dir.path(), "grande").unwrap();
-        let ruta = canal.path().to_path_buf();
-        let esperado: Vec<u8> = (0..8_u32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        let copia = esperado.clone();
+        let channel = DataChannel::create(dir.path(), "large").unwrap();
+        let path = channel.path().to_path_buf();
+        let expected: Vec<u8> = (0..8_u32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let copy = expected.clone();
 
         let plugin = tokio::spawn(async move {
-            let mut s = connect_data(&ruta).await.unwrap();
-            s.write_all(&copia).await.unwrap();
+            let mut s = connect_data(&path).await.unwrap();
+            s.write_all(&copy).await.unwrap();
             s.shutdown().await.unwrap();
         });
 
-        let mut stream = canal.accept().await.unwrap();
+        let mut stream = channel.accept().await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
 
-        assert_eq!(buf.len(), esperado.len());
-        assert_eq!(buf, esperado);
+        assert_eq!(buf.len(), expected.len());
+        assert_eq!(buf, expected);
         plugin.await.unwrap();
     }
 
     #[tokio::test]
-    async fn un_flujo_de_cero_bytes_termina_limpiamente() {
-        // Una base de datos vacía sigue produciendo un artefacto válido.
+    async fn a_zero_byte_stream_ends_cleanly() {
+        // An empty database still produces a valid artifact.
         let dir = tempfile::tempdir().unwrap();
-        let canal = DataChannel::create(dir.path(), "vacio").unwrap();
-        let ruta = canal.path().to_path_buf();
+        let channel = DataChannel::create(dir.path(), "empty").unwrap();
+        let path = channel.path().to_path_buf();
 
         let plugin = tokio::spawn(async move {
-            let mut s = connect_data(&ruta).await.unwrap();
+            let mut s = connect_data(&path).await.unwrap();
             s.shutdown().await.unwrap();
         });
 
-        let mut stream = canal.accept().await.unwrap();
+        let mut stream = channel.accept().await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
 
@@ -177,44 +180,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn el_cierre_del_escritor_se_ve_como_fin_de_flujo() {
-        // Es la señal con la que el núcleo sabe que el dump terminó. Sin ella
-        // el backup se quedaría esperando para siempre.
+    async fn the_writer_closing_shows_up_as_end_of_stream() {
+        // This is the signal that tells the core the dump is over. Without it
+        // the backup would wait forever.
         let dir = tempfile::tempdir().unwrap();
-        let canal = DataChannel::create(dir.path(), "eof").unwrap();
-        let ruta = canal.path().to_path_buf();
+        let channel = DataChannel::create(dir.path(), "eof").unwrap();
+        let path = channel.path().to_path_buf();
 
         let plugin = tokio::spawn(async move {
-            let mut s = connect_data(&ruta).await.unwrap();
-            s.write_all(b"algo").await.unwrap();
+            let mut s = connect_data(&path).await.unwrap();
+            s.write_all(b"something").await.unwrap();
             s.shutdown().await.unwrap();
         });
 
-        let mut stream = canal.accept().await.unwrap();
+        let mut stream = channel.accept().await.unwrap();
         let mut buf = [0_u8; 64];
         let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"algo");
-        // La siguiente lectura debe devolver 0: fin de flujo, no bloqueo.
+        assert_eq!(&buf[..n], b"something");
+        // The next read must return 0: end of stream, not a block.
         assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
         plugin.await.unwrap();
     }
 
     #[tokio::test]
-    async fn dos_canales_en_el_mismo_directorio_no_se_pisan() {
-        // Un backup usa dos a la vez: uno del motor y otro hacia el destino.
+    async fn two_channels_in_the_same_directory_do_not_collide() {
+        // A backup uses two at once: one from the engine and one to the target.
         let dir = tempfile::tempdir().unwrap();
         let a = DataChannel::create(dir.path(), "dump").unwrap();
         let b = DataChannel::create(dir.path(), "put").unwrap();
         assert_ne!(a.path(), b.path());
 
-        let ruta_a = a.path().to_path_buf();
-        let ruta_b = b.path().to_path_buf();
+        let path_a = a.path().to_path_buf();
+        let path_b = b.path().to_path_buf();
 
         let t = tokio::spawn(async move {
-            let mut sa = connect_data(&ruta_a).await.unwrap();
+            let mut sa = connect_data(&path_a).await.unwrap();
             sa.write_all(b"AAA").await.unwrap();
             sa.shutdown().await.unwrap();
-            let mut sb = connect_data(&ruta_b).await.unwrap();
+            let mut sb = connect_data(&path_b).await.unwrap();
             sb.write_all(b"BBB").await.unwrap();
             sb.shutdown().await.unwrap();
         });
@@ -233,52 +236,54 @@ mod tests {
     }
 
     #[test]
-    fn el_directorio_del_socket_es_privado() {
-        // La única defensa del canal de datos: nadie más puede abrirlo.
+    fn the_socket_directory_is_private() {
+        // The data channel's only defence: nobody else can open it.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let canal = DataChannel::create(dir.path(), "perm").unwrap();
-        let modo = std::fs::metadata(canal.path().parent().unwrap())
+        let channel = DataChannel::create(dir.path(), "perm").unwrap();
+        let mode = std::fs::metadata(channel.path().parent().unwrap())
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(
-            modo & 0o777,
+            mode & 0o777,
             0o700,
-            "el directorio debe ser accesible solo por el propietario"
+            "the directory must be reachable by its owner only"
         );
     }
 
     #[test]
-    fn el_socket_se_borra_al_destruir_el_canal() {
+    fn the_socket_is_removed_when_the_channel_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let ruta = {
-            let canal = DataChannel::create(dir.path(), "efimero").unwrap();
-            canal.path().to_path_buf()
+        let path = {
+            let channel = DataChannel::create(dir.path(), "ephemeral").unwrap();
+            channel.path().to_path_buf()
         };
-        assert!(!ruta.exists(), "el socket no debe sobrevivir al canal");
+        assert!(!path.exists(), "the socket must not outlive the channel");
     }
 
     #[test]
-    fn se_puede_crear_sobre_un_socket_huerfano() {
-        // Un plugin que murió sin limpiar deja el socket atrás. El backup
-        // siguiente debe funcionar igual, no fallar con "address in use".
+    fn it_can_be_created_over_an_orphaned_socket() {
+        // A plugin that died without cleaning up leaves the socket behind. The
+        // next backup must work just the same, not fail with "address in use".
         let dir = tempfile::tempdir().unwrap();
-        let primero = DataChannel::create(dir.path(), "reuso").unwrap();
-        let ruta = primero.path().to_path_buf();
-        std::mem::forget(primero); // simula una muerte sin limpieza
+        let first = DataChannel::create(dir.path(), "reuse").unwrap();
+        let path = first.path().to_path_buf();
+        std::mem::forget(first); // simulates a death without cleanup
 
-        assert!(ruta.exists(), "el socket huérfano sigue ahí");
-        let segundo = DataChannel::create(dir.path(), "reuso").unwrap();
-        assert_eq!(segundo.path(), ruta);
+        assert!(path.exists(), "the orphaned socket is still there");
+        let second = DataChannel::create(dir.path(), "reuse").unwrap();
+        assert_eq!(second.path(), path);
     }
 
     #[tokio::test]
-    async fn conectar_a_un_canal_inexistente_da_error() {
+    async fn connecting_to_a_channel_that_does_not_exist_fails() {
         assert!(
-            connect_data(std::path::Path::new("/tmp/no-existe-shieldbk-data.sock"))
-                .await
-                .is_err()
+            connect_data(std::path::Path::new(
+                "/tmp/does-not-exist-shieldbk-data.sock"
+            ))
+            .await
+            .is_err()
         );
     }
 }

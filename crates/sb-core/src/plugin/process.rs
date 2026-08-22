@@ -176,7 +176,7 @@ impl PluginProcess {
         let salida = hijo.stdout.take();
         reemitir_stderr(nombre, hijo.stderr.take());
 
-        let sobre = Bootstrap::nuevo(
+        let sobre = Bootstrap::new(
             vec![sb_proto::PROTOCOL_VERSION],
             control_socket.display().to_string(),
             pki.server_bundle(),

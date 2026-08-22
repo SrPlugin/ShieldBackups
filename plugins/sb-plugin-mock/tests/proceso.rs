@@ -49,7 +49,7 @@ impl PluginVivo {
         let sockets = tempfile::tempdir().unwrap();
         let socket = sockets.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
-        let sobre = Bootstrap::nuevo(vec![1], socket.display().to_string(), pki.server_bundle());
+        let sobre = Bootstrap::new(vec![1], socket.display().to_string(), pki.server_bundle());
 
         let mut hijo = Command::new(env!("CARGO_BIN_EXE_sb-plugin-mock"))
             .stdin(Stdio::piped())

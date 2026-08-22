@@ -9,7 +9,7 @@ async fn el_plugin_arranca_se_anuncia_y_responde() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let pki = EphemeralPki::generate().unwrap();
-    let boot = Bootstrap::nuevo(vec![1], socket.display().to_string(), pki.server_bundle());
+    let boot = Bootstrap::new(vec![1], socket.display().to_string(), pki.server_bundle());
 
     let mut hijo = Command::new(env!("CARGO_BIN_EXE_sb-plugin-smoke"))
         .env("RUST_LOG", "debug")

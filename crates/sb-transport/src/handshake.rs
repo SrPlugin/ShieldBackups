@@ -2,69 +2,71 @@ use serde::{Deserialize, Serialize};
 
 use crate::pki::ServerBundle;
 
-/// Marcador que abre ambos mensajes del handshake.
+/// Marker that opens both handshake messages.
 ///
-/// Sirve para que un binario que no es un plugin de shieldbk falle de inmediato
-/// y con un mensaje claro, en vez de colgarse esperando algo que nunca llega.
+/// It exists so that a binary which is not a shieldbk plugin fails immediately
+/// and with a clear message, instead of hanging while it waits for something
+/// that will never arrive.
 pub const MAGIC: &str = "SHIELDBK_PLUGIN";
 
-/// Versión del sobre del handshake.
+/// Version of the handshake envelope.
 ///
-/// Distinta de `core_protocol_versions`, que negocia el protocolo gRPC
-/// posterior. Esta versiona el propio JSON de arranque, para que añadir un
-/// campo obligatorio en el futuro haga fallar al plugin viejo **al arrancar**,
-/// con un mensaje claro, en vez de más tarde y peor.
+/// Distinct from `core_protocol_versions`, which negotiates the gRPC protocol
+/// that follows. This one versions the startup JSON itself, so that adding a
+/// mandatory field in the future makes an old plugin fail **at startup**, with
+/// a clear message, instead of later and worse.
 pub const HANDSHAKE_VERSION: u32 = 1;
 
-/// Cuánto espera el núcleo a que el plugin se anuncie, por defecto.
-/// Generoso para arranques lentos, acotado para que nada se cuelgue de noche.
+/// How long the core waits, by default, for the plugin to announce itself.
+/// Generous for slow startups, bounded so nothing hangs overnight.
 pub const READY_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
-    #[error("la respuesta no es JSON válido: {0}")]
-    JsonInvalido(#[from] serde_json::Error),
-    #[error("el binario no se identificó como un plugin de shieldbk")]
-    MagicIncorrecto,
-    #[error("sin versión de protocolo en común: el núcleo soporta {core:?}, el plugin {plugin:?}")]
-    SinVersionComun { core: Vec<u32>, plugin: Vec<u32> },
+    #[error("the response is not valid JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("the binary did not identify itself as a shieldbk plugin")]
+    BadMagic,
+    #[error("no protocol version in common: the core supports {core:?}, the plugin {plugin:?}")]
+    NoCommonVersion { core: Vec<u32>, plugin: Vec<u32> },
     #[error(
-        "sobre de handshake versión {encontrada}; esta versión de shieldbk entiende hasta la {soportada}"
+        "handshake envelope version {found}; this version of shieldbk understands up to {supported}"
     )]
-    SobreNoSoportado { encontrada: u32, soportada: u32 },
+    UnsupportedEnvelope { found: u32, supported: u32 },
 }
 
-/// Lo que el núcleo escribe en el stdin del plugin.
+/// What the core writes to the plugin's stdin.
 ///
-/// Deliberadamente JSON de una línea: un plugin en cualquier lenguaje lo lee
-/// con un `read_line` y lo parsea con la librería estándar. No hace falta
-/// hablar protobuf para arrancar.
+/// Deliberately single-line JSON: a plugin in any language reads it with one
+/// `read_line` and parses it with its standard library. Speaking protobuf is
+/// not a prerequisite for starting up.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Bootstrap {
     pub magic: String,
-    /// Versión de este sobre. `default` = 0 para sobres anteriores al campo.
+    /// Version of this envelope. `default` = 0 for envelopes older than the
+    /// field.
     #[serde(default)]
     pub handshake_version: u32,
     pub core_protocol_versions: Vec<u32>,
     pub control_socket: String,
-    /// Nombre que el plugin debe presentar en su certificado de servidor.
-    /// Va explícito para que un plugin escrito en otro lenguaje no tenga que
-    /// parsear el certificado ni conocer una constante de Rust.
+    /// Name the plugin must present in its server certificate. It is sent
+    /// explicitly so that a plugin written in another language does not have to
+    /// parse the certificate or know about a Rust constant.
     #[serde(default)]
     pub server_name: String,
-    /// Nombre que el plugin debe exigir al cliente. Hace que la política de
-    /// mTLS sean datos y no conocimiento tribal.
+    /// Name the plugin must require of the client. It makes the mTLS policy
+    /// data rather than tribal knowledge.
     #[serde(default)]
     pub client_name: String,
-    /// Margen que tiene el plugin para anunciarse antes de que el núcleo lo
-    /// dé por perdido. El contrato temporal es bidireccional.
+    /// How long the plugin has to announce itself before the core gives it up
+    /// for lost. The timing contract goes both ways.
     #[serde(default)]
     pub ready_timeout_ms: u64,
     pub tls: ServerBundle,
 }
 
-/// `Debug` redactado a mano: este struct contiene la clave privada del
-/// servidor y jamás debe poder acabar íntegro en un log.
+/// `Debug` redacted by hand: this struct holds the server's private key and
+/// must never be able to end up whole in a log.
 impl std::fmt::Debug for Bootstrap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bootstrap")
@@ -75,19 +77,20 @@ impl std::fmt::Debug for Bootstrap {
             .field("server_name", &self.server_name)
             .field("client_name", &self.client_name)
             .field("ready_timeout_ms", &self.ready_timeout_ms)
-            .field("tls", &"<redactado>")
+            .field("tls", &"<redacted>")
             .finish()
     }
 }
 
 impl Bootstrap {
-    /// Construye el sobre que el núcleo envía al plugin.
+    /// Builds the envelope the core sends to the plugin.
     ///
-    /// Es la vía recomendada: rellena el marcador, la versión del sobre, los
-    /// nombres TLS y el timeout con los valores correctos, de modo que añadir
-    /// un campo en el futuro no obligue a revisar cada sitio que lo construye.
+    /// This is the recommended route: it fills in the marker, the envelope
+    /// version, the TLS names and the timeout with the right values, so that
+    /// adding a field in the future does not force a review of every place that
+    /// constructs one.
     #[must_use]
-    pub fn nuevo(
+    pub fn new(
         core_protocol_versions: Vec<u32>,
         control_socket: String,
         tls: ServerBundle,
@@ -105,47 +108,47 @@ impl Bootstrap {
     }
 
     /// # Errors
-    /// Devuelve error si la serialización falla.
+    /// Returns an error if serialization fails.
     pub fn to_line(&self) -> Result<String, HandshakeError> {
         Ok(serde_json::to_string(self)?)
     }
 
     /// # Errors
-    /// Devuelve error si la línea no es JSON válido, no lleva el marcador o
-    /// declara una versión de sobre que esta versión no sabe leer.
-    pub fn from_line(linea: &str) -> Result<Self, HandshakeError> {
-        let b: Self = serde_json::from_str(linea.trim())?;
+    /// Returns an error if the line is not valid JSON, does not carry the
+    /// marker, or declares an envelope version this build cannot read.
+    pub fn from_line(line: &str) -> Result<Self, HandshakeError> {
+        let b: Self = serde_json::from_str(line.trim())?;
         if b.magic != MAGIC {
-            return Err(HandshakeError::MagicIncorrecto);
+            return Err(HandshakeError::BadMagic);
         }
         if b.handshake_version > HANDSHAKE_VERSION {
-            return Err(HandshakeError::SobreNoSoportado {
-                encontrada: b.handshake_version,
-                soportada: HANDSHAKE_VERSION,
+            return Err(HandshakeError::UnsupportedEnvelope {
+                found: b.handshake_version,
+                supported: HANDSHAKE_VERSION,
             });
         }
         Ok(b)
     }
 
-    /// Elige la versión más alta soportada por ambos lados.
+    /// Picks the highest version both sides support.
     ///
     /// # Errors
-    /// Devuelve `SinVersionComun` si no hay ninguna en común, con las dos
-    /// listas en el mensaje para que quien lo lea sepa qué actualizar.
-    pub fn negotiate(&self, del_plugin: &[u32]) -> Result<u32, HandshakeError> {
+    /// Returns `NoCommonVersion` if there is none in common, with both lists in
+    /// the message so that whoever reads it knows what to upgrade.
+    pub fn negotiate(&self, plugin_versions: &[u32]) -> Result<u32, HandshakeError> {
         self.core_protocol_versions
             .iter()
-            .filter(|v| del_plugin.contains(v))
+            .filter(|v| plugin_versions.contains(v))
             .max()
             .copied()
-            .ok_or_else(|| HandshakeError::SinVersionComun {
+            .ok_or_else(|| HandshakeError::NoCommonVersion {
                 core: self.core_protocol_versions.clone(),
-                plugin: del_plugin.to_vec(),
+                plugin: plugin_versions.to_vec(),
             })
     }
 }
 
-/// Lo que el plugin escribe en su stdout cuando ya está escuchando.
+/// What the plugin writes to its stdout once it is listening.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ready {
     pub magic: String,
@@ -156,17 +159,18 @@ pub struct Ready {
 
 impl Ready {
     /// # Errors
-    /// Devuelve error si la serialización falla.
+    /// Returns an error if serialization fails.
     pub fn to_line(&self) -> Result<String, HandshakeError> {
         Ok(serde_json::to_string(self)?)
     }
 
     /// # Errors
-    /// Devuelve error si la línea no es JSON válido o no lleva el marcador.
-    pub fn from_line(linea: &str) -> Result<Self, HandshakeError> {
-        let r: Self = serde_json::from_str(linea.trim())?;
+    /// Returns an error if the line is not valid JSON or does not carry the
+    /// marker.
+    pub fn from_line(line: &str) -> Result<Self, HandshakeError> {
+        let r: Self = serde_json::from_str(line.trim())?;
         if r.magic != MAGIC {
-            return Err(HandshakeError::MagicIncorrecto);
+            return Err(HandshakeError::BadMagic);
         }
         Ok(r)
     }
@@ -176,8 +180,8 @@ impl Ready {
 mod tests {
     use super::*;
 
-    fn bootstrap_de_ejemplo() -> Bootstrap {
-        Bootstrap::nuevo(
+    fn sample_bootstrap() -> Bootstrap {
+        Bootstrap::new(
             vec![1],
             "/run/user/1000/shieldbk-abc/control.sock".into(),
             crate::pki::ServerBundle {
@@ -188,7 +192,7 @@ mod tests {
         )
     }
 
-    fn ready_de_ejemplo() -> Ready {
+    fn sample_ready() -> Ready {
         Ready {
             magic: MAGIC.into(),
             protocol_version: 1,
@@ -198,137 +202,138 @@ mod tests {
     }
 
     #[test]
-    fn el_bootstrap_viaja_como_una_sola_linea_json() {
-        // Una línea: el plugin lo lee con un read_line normal, sin necesitar
-        // un parser de streaming ni saber cuántos bytes esperar.
-        let linea = bootstrap_de_ejemplo().to_line().unwrap();
-        assert!(!linea.contains('\n'), "debe ser exactamente una línea");
-        let vuelta = Bootstrap::from_line(&linea).unwrap();
+    fn the_bootstrap_travels_as_a_single_json_line() {
+        // One line: the plugin reads it with an ordinary read_line, without
+        // needing a streaming parser or knowing how many bytes to expect.
+        let line = sample_bootstrap().to_line().unwrap();
+        assert!(!line.contains('\n'), "it must be exactly one line");
+        let round_tripped = Bootstrap::from_line(&line).unwrap();
         assert_eq!(
-            vuelta.control_socket,
+            round_tripped.control_socket,
             "/run/user/1000/shieldbk-abc/control.sock"
         );
-        assert_eq!(vuelta.tls.server_key_pem, "KEY");
+        assert_eq!(round_tripped.tls.server_key_pem, "KEY");
     }
 
     #[test]
-    fn se_rechaza_un_bootstrap_con_magic_incorrecto() {
-        let mut b = bootstrap_de_ejemplo();
-        b.magic = "OTRA-COSA".into();
-        let linea = serde_json::to_string(&b).unwrap();
+    fn a_bootstrap_with_the_wrong_magic_is_rejected() {
+        let mut b = sample_bootstrap();
+        b.magic = "SOMETHING-ELSE".into();
+        let line = serde_json::to_string(&b).unwrap();
         assert!(matches!(
-            Bootstrap::from_line(&linea).unwrap_err(),
-            HandshakeError::MagicIncorrecto
+            Bootstrap::from_line(&line).unwrap_err(),
+            HandshakeError::BadMagic
         ));
     }
 
     #[test]
-    fn se_rechaza_un_bootstrap_que_no_es_json() {
+    fn a_bootstrap_that_is_not_json_is_rejected() {
         assert!(matches!(
-            Bootstrap::from_line("esto no es json").unwrap_err(),
-            HandshakeError::JsonInvalido(_)
+            Bootstrap::from_line("this is not json").unwrap_err(),
+            HandshakeError::InvalidJson(_)
         ));
     }
 
     #[test]
-    fn se_rechaza_una_linea_vacia() {
-        // Es lo que se lee de un binario que murió sin escribir nada.
+    fn an_empty_line_is_rejected() {
+        // This is what you read from a binary that died without writing
+        // anything.
         assert!(Bootstrap::from_line("").is_err());
         assert!(Ready::from_line("").is_err());
     }
 
     #[test]
-    fn el_ready_viaja_como_una_sola_linea_json() {
-        let linea = ready_de_ejemplo().to_line().unwrap();
-        assert!(!linea.contains('\n'));
-        let vuelta = Ready::from_line(&linea).unwrap();
-        assert_eq!(vuelta.pid, 4242);
-        assert_eq!(vuelta.capabilities, vec!["engine".to_string()]);
+    fn the_ready_travels_as_a_single_json_line() {
+        let line = sample_ready().to_line().unwrap();
+        assert!(!line.contains('\n'));
+        let round_tripped = Ready::from_line(&line).unwrap();
+        assert_eq!(round_tripped.pid, 4242);
+        assert_eq!(round_tripped.capabilities, vec!["engine".to_string()]);
     }
 
     #[test]
-    fn se_rechaza_un_ready_con_magic_incorrecto() {
-        let mut r = ready_de_ejemplo();
-        r.magic = "NO-SOY-UN-PLUGIN".into();
-        let linea = serde_json::to_string(&r).unwrap();
+    fn a_ready_with_the_wrong_magic_is_rejected() {
+        let mut r = sample_ready();
+        r.magic = "I-AM-NOT-A-PLUGIN".into();
+        let line = serde_json::to_string(&r).unwrap();
         assert!(matches!(
-            Ready::from_line(&linea).unwrap_err(),
-            HandshakeError::MagicIncorrecto
+            Ready::from_line(&line).unwrap_err(),
+            HandshakeError::BadMagic
         ));
     }
 
     #[test]
-    fn los_espacios_y_saltos_alrededor_no_estorban() {
-        // Un plugin en otro lenguaje puede escribir con println y dejar \r\n.
-        let linea = ready_de_ejemplo().to_line().unwrap();
-        let sucia = format!("  {linea}\r\n");
-        assert_eq!(Ready::from_line(&sucia).unwrap().pid, 4242);
+    fn surrounding_whitespace_and_newlines_do_not_get_in_the_way() {
+        // A plugin in another language may write with println and leave \r\n.
+        let line = sample_ready().to_line().unwrap();
+        let dirty = format!("  {line}\r\n");
+        assert_eq!(Ready::from_line(&dirty).unwrap().pid, 4242);
     }
 
     #[test]
-    fn el_plugin_elige_una_version_que_el_nucleo_soporta() {
-        let b = bootstrap_de_ejemplo();
+    fn the_plugin_picks_a_version_the_core_supports() {
+        let b = sample_bootstrap();
         assert_eq!(b.negotiate(&[1, 2]).unwrap(), 1);
     }
 
     #[test]
-    fn se_elige_la_version_mas_alta_en_comun() {
-        let mut b = bootstrap_de_ejemplo();
+    fn the_highest_common_version_is_chosen() {
+        let mut b = sample_bootstrap();
         b.core_protocol_versions = vec![1, 2, 3];
         assert_eq!(b.negotiate(&[1, 2]).unwrap(), 2);
     }
 
     #[test]
-    fn sin_version_en_comun_se_falla_con_un_mensaje_util() {
-        let mut b = bootstrap_de_ejemplo();
+    fn with_no_version_in_common_it_fails_with_a_useful_message() {
+        let mut b = sample_bootstrap();
         b.core_protocol_versions = vec![3, 4];
         let err = b.negotiate(&[1, 2]).unwrap_err();
-        let texto = err.to_string();
+        let text = err.to_string();
         assert!(
-            texto.contains('3'),
-            "el mensaje debe decir qué pide el núcleo"
+            text.contains('3'),
+            "the message must say what the core asks for"
         );
-        assert!(texto.contains('1'), "y qué ofrece el plugin");
+        assert!(text.contains('1'), "and what the plugin offers");
     }
 
     #[test]
-    fn un_plugin_sin_versiones_no_negocia_nada() {
-        let b = bootstrap_de_ejemplo();
+    fn a_plugin_with_no_versions_negotiates_nothing() {
+        let b = sample_bootstrap();
         assert!(b.negotiate(&[]).is_err());
     }
 
     #[test]
-    fn un_nucleo_sin_versiones_no_negocia_nada() {
-        let mut b = bootstrap_de_ejemplo();
+    fn a_core_with_no_versions_negotiates_nothing() {
+        let mut b = sample_bootstrap();
         b.core_protocol_versions = vec![];
         assert!(b.negotiate(&[1]).is_err());
     }
 
     #[test]
-    fn el_bootstrap_no_revela_la_clave_privada_al_imprimirse() {
-        // Este struct contiene la clave del servidor. Si alguien lo loguea para
-        // depurar el arranque de un plugin, no puede filtrarla.
-        let texto = format!("{:?}", bootstrap_de_ejemplo());
+    fn the_bootstrap_does_not_reveal_the_private_key_when_printed() {
+        // This struct holds the server's key. If somebody logs it to debug a
+        // plugin startup, it must not leak.
+        let text = format!("{:?}", sample_bootstrap());
         assert!(
-            !texto.contains("KEY"),
-            "la clave privada no puede aparecer en Debug"
+            !text.contains("KEY"),
+            "the private key must not appear in Debug"
         );
     }
 
     #[test]
-    fn el_json_del_bootstrap_si_lleva_la_clave() {
-        // Lo contrario del test anterior: redactar el Debug no debe haber
-        // roto la serialización, o el plugin no recibiría su clave.
-        let linea = bootstrap_de_ejemplo().to_line().unwrap();
-        assert!(linea.contains("KEY"));
+    fn the_bootstrap_json_does_carry_the_key() {
+        // The converse of the previous test: redacting Debug must not have
+        // broken serialization, or the plugin would never receive its key.
+        let line = sample_bootstrap().to_line().unwrap();
+        assert!(line.contains("KEY"));
     }
 
     #[test]
-    fn el_bootstrap_lleva_los_nombres_tls_para_plugins_de_otros_lenguajes() {
-        // Un plugin en Go o Python no puede importar SERVER_NAME/CLIENT_NAME
-        // del crate de Rust. Sin estos campos tendría que parsear el DER del
-        // certificado solo para saber a quién autorizar.
-        let b = Bootstrap::nuevo(
+    fn the_bootstrap_carries_the_tls_names_for_plugins_in_other_languages() {
+        // A plugin in Go or Python cannot import SERVER_NAME/CLIENT_NAME from
+        // the Rust crate. Without these fields it would have to parse the
+        // certificate's DER just to know who to authorize.
+        let b = Bootstrap::new(
             vec![1],
             "/tmp/x.sock".into(),
             crate::pki::ServerBundle {
@@ -342,51 +347,51 @@ mod tests {
     }
 
     #[test]
-    fn el_bootstrap_declara_su_propia_version_de_sobre() {
-        let b = bootstrap_de_ejemplo();
+    fn the_bootstrap_declares_its_own_envelope_version() {
+        let b = sample_bootstrap();
         assert_eq!(b.handshake_version, HANDSHAKE_VERSION);
     }
 
     #[test]
-    fn el_bootstrap_anuncia_cuanto_tiempo_tiene_el_plugin_para_arrancar() {
-        // Sin esto el contrato temporal es unilateral: el plugin no sabe si lo
-        // van a matar antes de terminar de abrir su socket.
-        let b = bootstrap_de_ejemplo();
+    fn the_bootstrap_announces_how_long_the_plugin_has_to_start_up() {
+        // Without this the timing contract is one-sided: the plugin has no idea
+        // whether it will be killed before it finishes opening its socket.
+        let b = sample_bootstrap();
         assert!(b.ready_timeout_ms > 0);
     }
 
     #[test]
-    fn se_rechaza_un_sobre_de_version_futura() {
-        // Un núcleo nuevo podría añadir campos obligatorios. Mejor que el
-        // plugin viejo lo diga al arrancar que fallar más tarde y peor.
-        let mut b = bootstrap_de_ejemplo();
+    fn an_envelope_from_a_future_version_is_rejected() {
+        // A newer core might add mandatory fields. Better for the old plugin to
+        // say so at startup than to fail later and worse.
+        let mut b = sample_bootstrap();
         b.handshake_version = HANDSHAKE_VERSION + 1;
-        let linea = serde_json::to_string(&b).unwrap();
+        let line = serde_json::to_string(&b).unwrap();
         assert!(matches!(
-            Bootstrap::from_line(&linea).unwrap_err(),
-            HandshakeError::SobreNoSoportado { .. }
+            Bootstrap::from_line(&line).unwrap_err(),
+            HandshakeError::UnsupportedEnvelope { .. }
         ));
     }
 
     #[test]
-    fn el_error_de_sobre_dice_ambas_versiones() {
-        let mut b = bootstrap_de_ejemplo();
+    fn the_envelope_error_states_both_versions() {
+        let mut b = sample_bootstrap();
         b.handshake_version = 77;
-        let texto = Bootstrap::from_line(&serde_json::to_string(&b).unwrap())
+        let text = Bootstrap::from_line(&serde_json::to_string(&b).unwrap())
             .unwrap_err()
             .to_string();
-        assert!(texto.contains("77"), "debe decir qué versión llegó");
+        assert!(text.contains("77"), "it must say which version arrived");
         assert!(
-            texto.contains(&HANDSHAKE_VERSION.to_string()),
-            "y cuál se entiende"
+            text.contains(&HANDSHAKE_VERSION.to_string()),
+            "and which one is understood"
         );
     }
 
     #[test]
-    fn un_bootstrap_sin_los_campos_nuevos_sigue_deserializando() {
-        // Compatibilidad hacia atrás: los campos nuevos son #[serde(default)],
-        // así que un sobre antiguo no rompe. Es la propiedad que permite
-        // evolucionar el protocolo sin romper plugins publicados.
+    fn a_bootstrap_without_the_new_fields_still_deserializes() {
+        // Backwards compatibility: the new fields are #[serde(default)], so an
+        // older envelope does not break. This is the property that lets the
+        // protocol evolve without breaking published plugins.
         let json = r#"{
             "magic": "SHIELDBK_PLUGIN",
             "core_protocol_versions": [1],
@@ -395,21 +400,24 @@ mod tests {
         }"#;
         let b = Bootstrap::from_line(json).unwrap();
         assert_eq!(b.control_socket, "/tmp/x.sock");
-        assert_eq!(b.handshake_version, 0, "un sobre sin versión declara la 0");
+        assert_eq!(
+            b.handshake_version, 0,
+            "an envelope with no version declares version 0"
+        );
     }
 
     #[test]
-    fn los_campos_nuevos_viajan_por_json() {
-        let linea = bootstrap_de_ejemplo().to_line().unwrap();
-        assert!(linea.contains("server_name"));
-        assert!(linea.contains("client_name"));
-        assert!(linea.contains("handshake_version"));
-        assert!(linea.contains("ready_timeout_ms"));
+    fn the_new_fields_travel_over_json() {
+        let line = sample_bootstrap().to_line().unwrap();
+        assert!(line.contains("server_name"));
+        assert!(line.contains("client_name"));
+        assert!(line.contains("handshake_version"));
+        assert!(line.contains("ready_timeout_ms"));
     }
 
     #[test]
-    fn el_constructor_rellena_los_valores_correctos_por_defecto() {
-        let b = Bootstrap::nuevo(
+    fn the_constructor_fills_in_the_right_defaults() {
+        let b = Bootstrap::new(
             vec![1, 2],
             "/tmp/y.sock".into(),
             crate::pki::ServerBundle {

@@ -13,7 +13,7 @@ use sb_proto::engine_server::{Engine, EngineServer};
 use sb_proto::plugin_server::{Plugin, PluginServer};
 use sb_proto::storage_server::{Storage, StorageServer};
 use sb_transport::{
-    Bootstrap, MAGIC, Ready, serve_control_routes_con_parada, server_config_from_bundle,
+    Bootstrap, MAGIC, Ready, serve_control_routes_with_shutdown, server_config_from_bundle,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tonic::service::Routes;
@@ -189,7 +189,7 @@ impl<P: Plugin> PluginRuntime<P> {
         let socket_del_servidor = socket.clone();
         let (pedir_parada, parada) = tokio::sync::oneshot::channel::<()>();
         let mut servidor = tokio::spawn(async move {
-            serve_control_routes_con_parada(&socket_del_servidor, tls, rutas, async move {
+            serve_control_routes_with_shutdown(&socket_del_servidor, tls, rutas, async move {
                 let _ = parada.await;
             })
             .await

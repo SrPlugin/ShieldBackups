@@ -23,7 +23,7 @@ async fn shutdown_responde_y_despues_el_proceso_termina_solo() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let pki = EphemeralPki::generate().unwrap();
-    let boot = Bootstrap::nuevo(vec![1], socket.display().to_string(), pki.server_bundle());
+    let boot = Bootstrap::new(vec![1], socket.display().to_string(), pki.server_bundle());
 
     let mut hijo = Command::new(env!("CARGO_BIN_EXE_sb-plugin-smoke"))
         .stderr(Stdio::null())
@@ -89,7 +89,7 @@ async fn el_shutdown_responde_antes_de_que_el_proceso_muera() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("control.sock");
     let pki = EphemeralPki::generate().unwrap();
-    let boot = Bootstrap::nuevo(vec![1], socket.display().to_string(), pki.server_bundle());
+    let boot = Bootstrap::new(vec![1], socket.display().to_string(), pki.server_bundle());
 
     let mut hijo = Command::new(env!("CARGO_BIN_EXE_sb-plugin-smoke"))
         .stderr(Stdio::null())

@@ -1,40 +1,40 @@
 use std::sync::Arc;
 
-// El parseo de PEM vive en `rustls-pki-types` desde su 1.9: `rustls-pemfile`
-// quedó archivado en agosto de 2025 (RUSTSEC-2025-0134) y su última versión
-// no era más que una envoltura sobre este mismo código.
+// PEM parsing has lived in `rustls-pki-types` since its 1.9: `rustls-pemfile`
+// was archived in August 2025 (RUSTSEC-2025-0134) and its last release was
+// nothing more than a wrapper around this very code.
 use rustls::pki_types::pem::{Error as PemError, PemObject as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 
-/// Nombre que presenta el plugin en su certificado de servidor.
+/// Name the plugin presents in its server certificate.
 pub const SERVER_NAME: &str = "shieldbk-plugin";
-/// Nombre que presenta el núcleo en su certificado de cliente.
+/// Name the core presents in its client certificate.
 pub const CLIENT_NAME: &str = "shieldbk-core";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PkiError {
-    #[error("no se pudo generar el material criptográfico: {0}")]
-    Generacion(String),
-    #[error("material criptográfico inválido: {0}")]
+    #[error("could not generate the cryptographic material: {0}")]
+    Generation(String),
+    #[error("invalid cryptographic material: {0}")]
     Material(String),
-    #[error("configuración TLS inválida: {0}")]
+    #[error("invalid TLS configuration: {0}")]
     Tls(#[from] rustls::Error),
 }
 
-/// Instala el proveedor criptográfico de rustls si nadie lo ha hecho todavía.
+/// Installs the rustls crypto provider if nobody has done so yet.
 ///
-/// `rustls` 0.23 exige un `CryptoProvider` a nivel de proceso antes de poder
-/// construir cualquier configuración. Si dependemos de la deducción automática
-/// por *features*, el día que otra caja del grafo active `aws-lc-rs` la
-/// deducción se vuelve ambigua y rustls entra en pánico. Instalarlo de forma
-/// explícita —y desde la propia biblioteca, no solo desde los tests— hace que
-/// cualquiera que use `sb-transport` funcione sin tener que saber esto.
+/// `rustls` 0.23 requires a process-wide `CryptoProvider` before any
+/// configuration can be built. If we relied on it being inferred automatically
+/// from *features*, the day another crate in the graph enables `aws-lc-rs` that
+/// inference turns ambiguous and rustls panics. Installing it explicitly — and
+/// from the library itself, not just from the tests — makes anyone using
+/// `sb-transport` work without having to know any of this.
 ///
-/// Si el proceso anfitrión ya instaló su propio proveedor, `install_default`
-/// devuelve error y lo ignoramos a propósito: respetamos el suyo.
+/// If the host process already installed its own provider, `install_default`
+/// returns an error and we ignore it on purpose: we defer to theirs.
 fn ensure_crypto_provider() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -42,14 +42,14 @@ fn ensure_crypto_provider() {
     });
 }
 
-/// Lo que el núcleo entrega al plugin por stdin: lo justo para levantar un
-/// servidor TLS que solo acepte al núcleo.
+/// What the core hands the plugin over stdin: exactly enough to bring up a TLS
+/// server that accepts nobody but the core.
 ///
-/// **No incluye la clave del cliente.** Si la incluyera, el plugin podría
-/// suplantar al núcleo ante otro plugin y pedirle credenciales.
+/// **It does not include the client key.** If it did, the plugin could
+/// impersonate the core to another plugin and ask it for credentials.
 ///
-/// `Debug` está implementado a mano y redactado: este struct contiene una clave
-/// privada y no puede acabar íntegro en un log.
+/// `Debug` is implemented by hand and redacted: this struct holds a private key
+/// and must never end up whole in a log.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServerBundle {
     pub ca_cert_pem: String,
@@ -60,23 +60,23 @@ pub struct ServerBundle {
 impl std::fmt::Debug for ServerBundle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerBundle")
-            .field("ca_cert_pem", &"<certificado>")
-            .field("server_cert_pem", &"<certificado>")
-            .field("server_key_pem", &"<redactado>")
+            .field("ca_cert_pem", &"<certificate>")
+            .field("server_cert_pem", &"<certificate>")
+            .field("server_key_pem", &"<redacted>")
             .finish()
     }
 }
 
-/// PKI completa generada por el núcleo para una única sesión.
+/// The complete PKI the core generates for a single session.
 ///
-/// Vive en memoria y muere con el proceso: no se escribe a disco en ningún
-/// momento. Es deliberado — un certificado en disco es un certificado que
-/// alguien puede robar.
+/// It lives in memory and dies with the process: it is never written to disk at
+/// any point. That is deliberate — a certificate on disk is a certificate
+/// somebody can steal.
 ///
-/// No implementa `Debug` a propósito: contiene dos claves privadas.
+/// It deliberately does not implement `Debug`: it holds two private keys.
 #[allow(
     clippy::struct_field_names,
-    reason = "el sufijo `_pem` indica el formato de serialización y forma parte de los accesores públicos"
+    reason = "the `_pem` suffix names the serialization format and is part of the public accessors"
 )]
 pub struct EphemeralPki {
     ca_cert_pem: String,
@@ -87,11 +87,11 @@ pub struct EphemeralPki {
 }
 
 impl EphemeralPki {
-    /// Genera una autoridad certificadora nueva y, firmadas por ella, una hoja
-    /// de servidor (para el plugin) y una hoja de cliente (para el núcleo).
+    /// Generates a fresh certificate authority and, signed by it, a server leaf
+    /// (for the plugin) and a client leaf (for the core).
     ///
     /// # Errors
-    /// Devuelve error si falla la generación del material criptográfico.
+    /// Returns an error if generating the cryptographic material fails.
     pub fn generate() -> Result<Self, PkiError> {
         use rcgen::{
             BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -114,18 +114,18 @@ impl EphemeralPki {
             .push(DnType::CommonName, "shieldbk ephemeral CA");
         let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| gen_err(&e))?;
 
-        let hoja =
-            |nombre: &str, uso: ExtendedKeyUsagePurpose| -> Result<(String, String), PkiError> {
+        let leaf =
+            |name: &str, usage: ExtendedKeyUsagePurpose| -> Result<(String, String), PkiError> {
                 let key = KeyPair::generate().map_err(|e| gen_err(&e))?;
                 let mut params =
-                    CertificateParams::new(vec![nombre.to_string()]).map_err(|e| gen_err(&e))?;
-                params.distinguished_name.push(DnType::CommonName, nombre);
+                    CertificateParams::new(vec![name.to_string()]).map_err(|e| gen_err(&e))?;
+                params.distinguished_name.push(DnType::CommonName, name);
                 params.use_authority_key_identifier_extension = true;
                 params.key_usages = vec![
                     KeyUsagePurpose::DigitalSignature,
                     KeyUsagePurpose::KeyEncipherment,
                 ];
-                params.extended_key_usages = vec![uso];
+                params.extended_key_usages = vec![usage];
                 let cert = params
                     .signed_by(&key, &ca_cert, &ca_key)
                     .map_err(|e| gen_err(&e))?;
@@ -133,9 +133,9 @@ impl EphemeralPki {
             };
 
         let (server_cert_pem, server_key_pem) =
-            hoja(SERVER_NAME, ExtendedKeyUsagePurpose::ServerAuth)?;
+            leaf(SERVER_NAME, ExtendedKeyUsagePurpose::ServerAuth)?;
         let (client_cert_pem, client_key_pem) =
-            hoja(CLIENT_NAME, ExtendedKeyUsagePurpose::ClientAuth)?;
+            leaf(CLIENT_NAME, ExtendedKeyUsagePurpose::ClientAuth)?;
 
         Ok(Self {
             ca_cert_pem: ca_cert.pem(),
@@ -146,37 +146,37 @@ impl EphemeralPki {
         })
     }
 
-    /// Certificado de la CA efímera, en PEM. Lo necesitan ambos lados.
+    /// Certificate of the ephemeral CA, in PEM. Both sides need it.
     #[must_use]
     pub fn ca_cert_pem(&self) -> &str {
         &self.ca_cert_pem
     }
 
-    /// Certificado que presentará el plugin, en PEM.
+    /// Certificate the plugin will present, in PEM.
     #[must_use]
     pub fn server_cert_pem(&self) -> &str {
         &self.server_cert_pem
     }
 
-    /// Clave privada del plugin, en PEM.
+    /// The plugin's private key, in PEM.
     #[must_use]
     pub fn server_key_pem(&self) -> &str {
         &self.server_key_pem
     }
 
-    /// Certificado que presentará el núcleo, en PEM.
+    /// Certificate the core will present, in PEM.
     #[must_use]
     pub fn client_cert_pem(&self) -> &str {
         &self.client_cert_pem
     }
 
-    /// Clave privada del núcleo, en PEM. Nunca sale de este proceso.
+    /// The core's private key, in PEM. It never leaves this process.
     #[must_use]
     pub fn client_key_pem(&self) -> &str {
         &self.client_key_pem
     }
 
-    /// Lo que se le manda al plugin.
+    /// What gets sent to the plugin.
     #[must_use]
     pub fn server_bundle(&self) -> ServerBundle {
         ServerBundle {
@@ -187,16 +187,16 @@ impl EphemeralPki {
     }
 
     /// # Errors
-    /// Devuelve error si el material generado no es aceptable para rustls.
+    /// Returns an error if the generated material is not acceptable to rustls.
     pub fn server_config(&self) -> Result<Arc<ServerConfig>, PkiError> {
         server_config_from_bundle(&self.server_bundle())
     }
 
-    /// Configuración del lado del núcleo: exige que el servidor esté firmado
-    /// por nuestra CA y presenta el certificado de cliente.
+    /// Configuration for the core's side: it requires the server to be signed
+    /// by our CA and presents the client certificate.
     ///
     /// # Errors
-    /// Devuelve error si el material generado no es aceptable para rustls.
+    /// Returns an error if the generated material is not acceptable to rustls.
     pub fn client_config(&self) -> Result<Arc<ClientConfig>, PkiError> {
         ensure_crypto_provider();
         let roots = root_store(&self.ca_cert_pem)?;
@@ -209,13 +209,13 @@ impl EphemeralPki {
     }
 }
 
-/// Reconstruye la configuración del servidor a partir del bundle recibido.
+/// Rebuilds the server configuration from the bundle that was received.
 ///
-/// La usa el SDK del plugin, que nunca genera material propio: solo carga los
-/// tres PEM que le dio el núcleo.
+/// The plugin SDK uses it; the SDK never generates material of its own, it only
+/// loads the three PEMs the core gave it.
 ///
 /// # Errors
-/// Devuelve error si el material es inválido o la CA no se puede cargar.
+/// Returns an error if the material is invalid or the CA cannot be loaded.
 pub fn server_config_from_bundle(bundle: &ServerBundle) -> Result<Arc<ServerConfig>, PkiError> {
     ensure_crypto_provider();
     let roots = root_store(&bundle.ca_cert_pem)?;
@@ -231,15 +231,13 @@ pub fn server_config_from_bundle(bundle: &ServerBundle) -> Result<Arc<ServerConf
 }
 
 fn gen_err(e: &rcgen::Error) -> PkiError {
-    PkiError::Generacion(e.to_string())
+    PkiError::Generation(e.to_string())
 }
 
 fn root_store(ca_pem: &str) -> Result<RootCertStore, PkiError> {
     let certs = parse_certs(ca_pem)?;
     if certs.is_empty() {
-        return Err(PkiError::Material(
-            "no se encontró ningún certificado de CA".into(),
-        ));
+        return Err(PkiError::Material("no CA certificate was found".into()));
     }
     let mut roots = RootCertStore::empty();
     for cert in certs {
@@ -258,12 +256,11 @@ fn parse_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, PkiError> {
 
 fn parse_key(pem: &str) -> Result<PrivateKeyDer<'static>, PkiError> {
     PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|e| match e {
-        // El PEM no traía ninguna clave. Merece su propio mensaje: es el error
-        // que ve quien se equivoca de fichero, y «no items found» no ayuda.
-        PemError::NoItemsFound => {
-            PkiError::Material("no se encontró clave privada en el PEM".into())
-        }
-        otro => PkiError::Material(otro.to_string()),
+        // The PEM carried no key at all. It deserves its own message: this is
+        // the error seen by whoever picked the wrong file, and "no items found"
+        // does not help.
+        PemError::NoItemsFound => PkiError::Material("no private key was found in the PEM".into()),
+        other => PkiError::Material(other.to_string()),
     })
 }
 
@@ -272,7 +269,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn genera_una_pki_completa() {
+    fn generates_a_complete_pki() {
         let pki = EphemeralPki::generate().unwrap();
         assert!(pki.ca_cert_pem().contains("BEGIN CERTIFICATE"));
         assert!(pki.server_cert_pem().contains("BEGIN CERTIFICATE"));
@@ -282,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn cada_generacion_produce_material_distinto() {
-        // Reutilizar material entre ejecuciones convertiría un certificado
-        // efímero en uno permanente sin que nadie se diera cuenta.
+    fn every_generation_produces_different_material() {
+        // Reusing material across runs would turn an ephemeral certificate into
+        // a permanent one without anyone noticing.
         let a = EphemeralPki::generate().unwrap();
         let b = EphemeralPki::generate().unwrap();
         assert_ne!(a.ca_cert_pem(), b.ca_cert_pem());
@@ -293,28 +290,28 @@ mod tests {
     }
 
     #[test]
-    fn el_certificado_de_servidor_y_el_de_cliente_son_distintos() {
+    fn the_server_and_client_certificates_are_different() {
         let pki = EphemeralPki::generate().unwrap();
         assert_ne!(pki.server_cert_pem(), pki.client_cert_pem());
         assert_ne!(pki.server_key_pem(), pki.client_key_pem());
     }
 
     #[test]
-    fn construye_una_configuracion_de_servidor_valida() {
+    fn builds_a_valid_server_configuration() {
         let pki = EphemeralPki::generate().unwrap();
         assert!(pki.server_config().is_ok());
     }
 
     #[test]
-    fn construye_una_configuracion_de_cliente_valida() {
+    fn builds_a_valid_client_configuration() {
         let pki = EphemeralPki::generate().unwrap();
         assert!(pki.client_config().is_ok());
     }
 
     #[test]
-    fn el_bundle_del_servidor_no_incluye_la_clave_del_cliente() {
-        // Si el plugin recibiera la clave del cliente, podría hacerse pasar por
-        // el núcleo ante otro plugin y pedirle credenciales.
+    fn the_server_bundle_does_not_include_the_client_key() {
+        // If the plugin received the client key, it could pass itself off as
+        // the core to another plugin and ask it for credentials.
         let pki = EphemeralPki::generate().unwrap();
         let bundle = pki.server_bundle();
         let json = serde_json::to_string(&bundle).unwrap();
@@ -323,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn el_bundle_lleva_exactamente_lo_que_el_plugin_necesita() {
+    fn the_bundle_carries_exactly_what_the_plugin_needs() {
         let pki = EphemeralPki::generate().unwrap();
         let bundle = pki.server_bundle();
         assert_eq!(bundle.ca_cert_pem, pki.ca_cert_pem());
@@ -332,31 +329,31 @@ mod tests {
     }
 
     #[test]
-    fn una_config_de_servidor_reconstruida_desde_el_bundle_funciona() {
-        // Es lo que hará el SDK del plugin: cargar tres PEM y nada más.
+    fn a_server_config_rebuilt_from_the_bundle_works() {
+        // This is what the plugin SDK will do: load three PEMs and nothing else.
         let pki = EphemeralPki::generate().unwrap();
         let bundle = pki.server_bundle();
         assert!(server_config_from_bundle(&bundle).is_ok());
     }
 
     #[test]
-    fn el_bundle_viaja_por_json_sin_perder_nada() {
+    fn the_bundle_travels_through_json_without_losing_anything() {
         let pki = EphemeralPki::generate().unwrap();
         let json = serde_json::to_string(&pki.server_bundle()).unwrap();
-        let vuelta: ServerBundle = serde_json::from_str(&json).unwrap();
-        assert!(server_config_from_bundle(&vuelta).is_ok());
+        let round_tripped: ServerBundle = serde_json::from_str(&json).unwrap();
+        assert!(server_config_from_bundle(&round_tripped).is_ok());
     }
 
     #[test]
-    fn un_bundle_con_material_corrupto_se_rechaza() {
+    fn a_bundle_with_corrupt_material_is_rejected() {
         let pki = EphemeralPki::generate().unwrap();
         let mut bundle = pki.server_bundle();
-        bundle.server_key_pem = "esto no es una clave".into();
+        bundle.server_key_pem = "this is not a key".into();
         assert!(server_config_from_bundle(&bundle).is_err());
     }
 
     #[test]
-    fn un_bundle_sin_ca_se_rechaza() {
+    fn a_bundle_without_a_ca_is_rejected() {
         let pki = EphemeralPki::generate().unwrap();
         let mut bundle = pki.server_bundle();
         bundle.ca_cert_pem = String::new();
@@ -364,13 +361,13 @@ mod tests {
     }
 
     #[test]
-    fn el_material_criptografico_no_aparece_al_imprimir_el_bundle() {
-        // El bundle acaba en un log si alguien lo imprime por descuido.
+    fn the_cryptographic_material_does_not_show_up_when_printing_the_bundle() {
+        // The bundle ends up in a log if somebody prints it carelessly.
         let pki = EphemeralPki::generate().unwrap();
-        let texto = format!("{:?}", pki.server_bundle());
+        let text = format!("{:?}", pki.server_bundle());
         assert!(
-            !texto.contains("PRIVATE KEY"),
-            "la clave privada no puede aparecer en Debug"
+            !text.contains("PRIVATE KEY"),
+            "the private key must not appear in Debug"
         );
     }
 }

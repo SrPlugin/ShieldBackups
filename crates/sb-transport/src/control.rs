@@ -1,11 +1,11 @@
-//! Canal de control gRPC entre el núcleo y un plugin.
+//! gRPC control channel between the core and a plugin.
 //!
-//! El canal viaja sobre un socket Unix con TLS mutuo. `tonic` trae soporte TLS
-//! de fábrica, pero atado a su transporte TCP: en la versión 0.14 pedirle una
-//! configuración TLS a un `Endpoint` de tipo UDS falla con
-//! `InvalidTlsConfigForUds`. Por eso aquí el TLS se monta a mano con
-//! `tokio-rustls` y se le entrega a tonic ya envuelto, que es la única forma de
-//! combinar socket Unix con TLS mutuo.
+//! The channel runs over a Unix socket with mutual TLS. `tonic` ships TLS
+//! support out of the box, but it is tied to its TCP transport: in version 0.14
+//! asking a UDS `Endpoint` for a TLS configuration fails with
+//! `InvalidTlsConfigForUds`. That is why TLS is assembled by hand here with
+//! `tokio-rustls` and handed to tonic already wrapped, which is the only way to
+//! combine a Unix socket with mutual TLS.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -31,48 +31,49 @@ use tower::service_fn;
 use crate::pki::EphemeralPki;
 use crate::pki::{PkiError, SERVER_NAME};
 
-/// Fallos al levantar o usar el canal de control.
+/// Failures while bringing up or using the control channel.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
-    /// El núcleo no pudo abrir el canal hacia el plugin.
-    #[error("no se pudo conectar al canal de control del plugin: {0}")]
-    Conexion(String),
-    /// El plugin no pudo servir el canal de control.
-    #[error("no se pudo levantar el canal de control: {0}")]
-    Servidor(String),
-    /// Fallo del sistema de ficheros al preparar el socket.
-    #[error("error de E/S: {0}")]
+    /// The core could not open the channel to the plugin.
+    #[error("could not connect to the plugin's control channel: {0}")]
+    Connect(String),
+    /// The plugin could not serve the control channel.
+    #[error("could not bring up the control channel: {0}")]
+    Serve(String),
+    /// Filesystem failure while preparing the socket.
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Un fallo del material criptográfico visto desde el canal.
+/// A failure of the cryptographic material, seen from the channel.
 ///
-/// Quien pide un canal no puede hacer nada distinto según si lo que falló fue
-/// la CA o la clave del cliente: en ambos casos el canal no se abre. Se
-/// conserva el texto del error de PKI, que es donde está el detalle.
+/// Whoever asks for a channel cannot do anything different depending on whether
+/// it was the CA or the client key that failed: either way the channel does not
+/// open. The text of the PKI error is preserved, since that is where the detail
+/// lives.
 impl From<PkiError> for ControlError {
-    fn from(fuente: PkiError) -> Self {
-        Self::Conexion(fuente.to_string())
+    fn from(source: PkiError) -> Self {
+        Self::Connect(source.to_string())
     }
 }
 
 impl ControlError {
-    /// Igual que la conversión, pero con nombre: en el sitio donde se llama
-    /// —montando la configuración TLS del cliente— `.into()` no dejaría claro
-    /// hacia qué se convierte.
+    /// Same as the conversion, but named: at the call site — assembling the
+    /// client's TLS configuration — `.into()` would not make it clear what it
+    /// converts into.
     #[must_use]
-    pub fn from_pki(fuente: PkiError) -> Self {
-        fuente.into()
+    pub fn from_pki(source: PkiError) -> Self {
+        source.into()
     }
 }
 
-/// Envoltorio sobre una conexión TLS en socket Unix.
+/// Wrapper around a TLS connection on a Unix socket.
 ///
-/// Existe solo para satisfacer el trait `Connected` de tonic, que la regla de
-/// coherencia nos impide implementar sobre `TlsStream` directamente.
-/// No hay metadatos de conexión que exponer: la identidad del par ya la
-/// garantiza el TLS mutuo, que es más fuerte que cualquier cosa que se pudiera
-/// sacar del socket.
+/// It exists only to satisfy tonic's `Connected` trait, which the coherence
+/// rule stops us from implementing on `TlsStream` directly. There is no
+/// connection metadata to expose: the peer's identity is already guaranteed by
+/// mutual TLS, which is stronger than anything that could be dug out of the
+/// socket.
 #[derive(Debug)]
 struct TlsUnixStream(tokio_rustls::server::TlsStream<UnixStream>);
 
@@ -110,17 +111,19 @@ impl AsyncWrite for TlsUnixStream {
     }
 }
 
-/// Prepara el socket Unix y devuelve el flujo de conexiones ya cifradas.
+/// Prepares the Unix socket and returns the stream of already-encrypted
+/// connections.
 ///
-/// Lo comparte todo el que sirve el canal: el trabajo sucio
-/// —limpiar el socket huérfano, enlazar, aceptar y envolver en TLS— es idéntico
-/// en ambos casos y no debe divergir.
-fn conexiones_entrantes(
+/// Everyone who serves the channel shares it: the dirty work — clearing the
+/// orphaned socket, binding, accepting and wrapping in TLS — is identical in
+/// both cases and must not diverge.
+fn incoming_connections(
     socket: &Path,
     tls: Arc<ServerConfig>,
 ) -> Result<impl tokio_stream::Stream<Item = Result<TlsUnixStream, std::io::Error>>, ControlError> {
-    // Un plugin que murió sin limpiar deja el socket huérfano: `bind` fallaría
-    // con "address already in use" sobre un fichero que ya no sirve a nadie.
+    // A plugin that died without cleaning up leaves the socket orphaned: `bind`
+    // would fail with "address already in use" over a file that no longer
+    // serves anyone.
     if socket.exists() {
         std::fs::remove_file(socket)?;
     }
@@ -134,39 +137,40 @@ fn conexiones_entrantes(
                     let acceptor = acceptor.clone();
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => yield Ok::<_, std::io::Error>(TlsUnixStream(tls_stream)),
-                        // Un handshake fallido no debe tumbar el servidor: se
-                        // registra y se sigue aceptando. Si el error se
-                        // propagara al stream, tonic cerraría el servidor
-                        // entero y cualquiera podría dejar el plugin
-                        // inservible con una conexión basura.
-                        Err(e) => tracing::warn!(error = %e, "handshake TLS rechazado"),
+                        // A failed handshake must not take the server down: it
+                        // is logged and we keep accepting. If the error
+                        // propagated to the stream, tonic would shut the whole
+                        // server down and anyone could render the plugin
+                        // useless with one junk connection.
+                        Err(e) => tracing::warn!(error = %e, "TLS handshake rejected"),
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "accept falló"),
+                Err(e) => tracing::warn!(error = %e, "accept failed"),
             }
         }
     })
 }
 
-/// Levanta el servidor gRPC del plugin sobre un socket Unix con TLS mutuo.
+/// Brings up the plugin's gRPC server over a Unix socket with mutual TLS.
 ///
-/// Sirve **un solo** servicio. Es la vía cómoda para tests y para código que
-/// solo necesita exponer `Plugin`; un plugin real expone además `Engine` y/o
-/// `Storage`, y para eso está [`serve_control_routes`]. Esta función delega en
-/// ella con unas rutas de un único servicio, así que el comportamiento del
-/// socket, del TLS y de los handshakes rechazados es exactamente el mismo.
+/// It serves **a single** service. This is the convenient route for tests and
+/// for code that only needs to expose `Plugin`; a real plugin also exposes
+/// `Engine` and/or `Storage`, and that is what [`serve_control_routes`] is for.
+/// This function delegates to it with a single-service set of routes, so the
+/// behaviour of the socket, of TLS and of rejected handshakes is exactly the
+/// same.
 ///
-/// El futuro solo termina si el servidor muere; lo normal es abortarlo o
-/// dejarlo corriendo durante toda la vida del plugin.
+/// The future only completes if the server dies; normally it is aborted or left
+/// running for the whole lifetime of the plugin.
 ///
 /// # Errors
 ///
-/// Devuelve [`ControlError::Io`] si el socket no se puede preparar o enlazar, y
-/// [`ControlError::Servidor`] si tonic no puede servir sobre él.
+/// Returns [`ControlError::Io`] if the socket cannot be prepared or bound, and
+/// [`ControlError::Serve`] if tonic cannot serve over it.
 pub async fn serve_control<S>(
     socket: &Path,
     tls: Arc<ServerConfig>,
-    servicio: S,
+    service: S,
 ) -> Result<(), ControlError>
 where
     S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
@@ -177,135 +181,136 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    serve_control_routes(socket, tls, Routes::new(servicio)).await
+    serve_control_routes(socket, tls, Routes::new(service)).await
 }
 
-/// Levanta el servidor gRPC del plugin sirviendo **varios** servicios por el
-/// mismo canal.
+/// Brings up the plugin's gRPC server serving **several** services over the
+/// same channel.
 ///
-/// Es la función que usan los plugins reales: el protocolo obliga a todos a
-/// implementar `Plugin`, y encima cada uno expone `Engine`, `Storage` o ambos
-/// según sus capacidades. Con un solo servicio por canal —lo que ofrece
-/// [`serve_control`]— ningún plugin de verdad podría funcionar.
+/// This is the function real plugins use: the protocol requires every one of
+/// them to implement `Plugin`, and on top of that each exposes `Engine`,
+/// `Storage` or both depending on its capabilities. With a single service per
+/// channel — which is all [`serve_control`] offers — no real plugin could work.
 ///
-/// Las rutas se montan fuera y se pasan ya construidas porque cada servicio
-/// tiene su propio tipo: agruparlos en un [`Routes`] es lo que permite pasar un
-/// número variable de ellos por un único parámetro.
+/// The routes are assembled outside and passed in already built because every
+/// service has its own type: grouping them into a [`Routes`] is what allows a
+/// variable number of them to be passed through a single parameter.
 ///
-/// Un método pedido a un servicio que no se registró se responde con
-/// `Unimplemented`, que es lo que hace el fallback de [`Routes`]. Es la
-/// respuesta correcta: el núcleo se entera de que el plugin no tiene esa
-/// capacidad en lugar de quedarse colgado o ver un error de transporte opaco.
+/// A method requested from a service that was not registered is answered with
+/// `Unimplemented`, which is what [`Routes`]'s fallback does. That is the right
+/// answer: the core learns that the plugin lacks that capability instead of
+/// hanging or seeing an opaque transport error.
 ///
-/// El futuro solo termina si el servidor muere; para terminarlo de forma
-/// ordenada y a voluntad está [`serve_control_routes_con_parada`].
+/// The future only completes if the server dies; to end it in an orderly way
+/// and on demand there is [`serve_control_routes_with_shutdown`].
 ///
 /// # Errors
 ///
-/// Devuelve [`ControlError::Io`] si el socket no se puede preparar o enlazar, y
-/// [`ControlError::Servidor`] si tonic no puede servir sobre él.
+/// Returns [`ControlError::Io`] if the socket cannot be prepared or bound, and
+/// [`ControlError::Serve`] if tonic cannot serve over it.
 pub async fn serve_control_routes(
     socket: &Path,
     tls: Arc<ServerConfig>,
-    rutas: Routes,
+    routes: Routes,
 ) -> Result<(), ControlError> {
-    // Sin señal: un futuro que nunca se resuelve deja el servidor exactamente
-    // donde estaba, sirviendo hasta que lo aborten o se caiga el canal.
-    serve_control_routes_con_parada(socket, tls, rutas, std::future::pending()).await
+    // No signal: a future that never resolves leaves the server exactly where
+    // it was, serving until it is aborted or the channel goes down.
+    serve_control_routes_with_shutdown(socket, tls, routes, std::future::pending()).await
 }
 
-/// Como [`serve_control_routes`], pero con una **señal de parada** que provoca
-/// un cierre ordenado.
+/// Like [`serve_control_routes`], but with a **shutdown signal** that triggers
+/// an orderly close.
 ///
-/// Cuando el futuro `parada` se resuelve, tonic manda `GOAWAY`, deja de aceptar
-/// conexiones nuevas y **espera a que terminen los streams en vuelo** antes de
-/// cerrar; solo entonces retorna esta función.
+/// When the `shutdown` future resolves, tonic sends `GOAWAY`, stops accepting
+/// new connections and **waits for in-flight streams to finish** before
+/// closing; only then does this function return.
 ///
-/// Es lo que necesita un plugin para atender su propio `Shutdown`: el cuerpo
-/// del RPC devuelve, pero la respuesta todavía tiene que salir por el socket.
-/// Cerrar en ese instante —o esperar un margen de tiempo fijo confiando en que
-/// baste— le haría ver al núcleo un error de transporte justo en el cierre
-/// correcto. El `GOAWAY` no es un margen: es la garantía de que la respuesta ya
-/// salió.
+/// This is what a plugin needs in order to handle its own `Shutdown`: the body
+/// of the RPC returns, but the response still has to make it out over the
+/// socket. Closing at that instant — or waiting a fixed grace period and hoping
+/// it is enough — would make the core see a transport error on a perfectly
+/// correct shutdown. `GOAWAY` is not a grace period: it is the guarantee that
+/// the response has already gone out.
 ///
 /// # Errors
 ///
-/// Devuelve [`ControlError::Io`] si el socket no se puede preparar o enlazar, y
-/// [`ControlError::Servidor`] si tonic no puede servir sobre él.
-pub async fn serve_control_routes_con_parada(
+/// Returns [`ControlError::Io`] if the socket cannot be prepared or bound, and
+/// [`ControlError::Serve`] if tonic cannot serve over it.
+pub async fn serve_control_routes_with_shutdown(
     socket: &Path,
     tls: Arc<ServerConfig>,
-    rutas: Routes,
-    parada: impl Future<Output = ()>,
+    routes: Routes,
+    shutdown: impl Future<Output = ()>,
 ) -> Result<(), ControlError> {
-    let incoming = conexiones_entrantes(socket, tls)?;
+    let incoming = incoming_connections(socket, tls)?;
 
     Server::builder()
-        .add_routes(rutas)
-        .serve_with_incoming_shutdown(incoming, parada)
+        .add_routes(routes)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
-        .map_err(|e| ControlError::Servidor(e.to_string()))
+        .map_err(|e| ControlError::Serve(e.to_string()))
 }
 
-/// Presupuesto que el núcleo le concede al plugin para tener el socket listo.
-const ESPERA_SOCKET: std::time::Duration = std::time::Duration::from_millis(500);
-/// Pausa entre intentos mientras se agota [`ESPERA_SOCKET`].
-const PAUSA_ENTRE_INTENTOS: std::time::Duration = std::time::Duration::from_millis(10);
+/// Budget the core grants the plugin for having its socket ready.
+const SOCKET_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// Pause between attempts while [`SOCKET_WAIT`] runs down.
+const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// Abre el socket del plugin, tolerando que todavía no esté escuchando.
+/// Opens the plugin's socket, tolerating that it may not be listening yet.
 ///
-/// El núcleo conecta justo después de arrancar el proceso del plugin, así que
-/// es normal encontrarse el socket sin crear —o encontrarse el fichero huérfano
-/// que dejó una ejecución anterior, que el plugin borrará en cuanto arranque—.
-/// Reintentar durante un presupuesto corto evita convertir una carrera de
-/// milisegundos en un fallo de arranque; pasado el presupuesto se devuelve el
-/// último error real, no uno inventado.
-async fn conectar_socket(ruta: &Path) -> Result<UnixStream, std::io::Error> {
-    let limite = std::time::Instant::now() + ESPERA_SOCKET;
+/// The core connects right after starting the plugin's process, so it is normal
+/// to find the socket not yet created — or to find the orphaned file left by an
+/// earlier run, which the plugin will delete as soon as it starts. Retrying for
+/// a short budget avoids turning a race of a few milliseconds into a startup
+/// failure; once the budget is spent, the last real error is returned, not an
+/// invented one.
+async fn connect_socket(path: &Path) -> Result<UnixStream, std::io::Error> {
+    let deadline = std::time::Instant::now() + SOCKET_WAIT;
     loop {
-        match UnixStream::connect(ruta).await {
+        match UnixStream::connect(path).await {
             Ok(stream) => return Ok(stream),
-            Err(e) if std::time::Instant::now() < limite => {
-                tracing::trace!(error = %e, "socket de control aún no disponible, reintentando");
-                tokio::time::sleep(PAUSA_ENTRE_INTENTOS).await;
+            Err(e) if std::time::Instant::now() < deadline => {
+                tracing::trace!(error = %e, "control socket not available yet, retrying");
+                tokio::time::sleep(RETRY_PAUSE).await;
             }
             Err(e) => return Err(e),
         }
     }
 }
 
-/// Conecta el núcleo al canal de control del plugin.
+/// Connects the core to the plugin's control channel.
 ///
-/// El canal devuelto es reutilizable: multiplexa todas las llamadas sobre una
-/// sola conexión, de modo que el handshake TLS se paga una única vez.
+/// The returned channel is reusable: it multiplexes every call over a single
+/// connection, so the TLS handshake is paid for exactly once.
 ///
 /// # Errors
 ///
-/// Devuelve [`ControlError::Conexion`] si el socket no existe, si el handshake
-/// TLS no se completa o si el par no presenta un certificado de la CA esperada.
+/// Returns [`ControlError::Connect`] if the socket does not exist, if the TLS
+/// handshake does not complete, or if the peer does not present a certificate
+/// from the expected CA.
 pub async fn connect_control(
     socket: &Path,
     tls: Arc<ClientConfig>,
 ) -> Result<Channel, ControlError> {
-    let ruta = socket.to_path_buf();
+    let path = socket.to_path_buf();
     let connector = TlsConnector::from(tls);
 
-    // La URI es un marcador: la conexión real la hace el conector de abajo.
-    // El nombre debe coincidir con el SAN del certificado del servidor.
+    // The URI is a placeholder: the real connection is made by the connector
+    // below. The name must match the SAN of the server's certificate.
     Endpoint::try_from(format!("https://{SERVER_NAME}"))
-        .map_err(|e| ControlError::Conexion(e.to_string()))?
+        .map_err(|e| ControlError::Connect(e.to_string()))?
         .connect_with_connector(service_fn(move |_: http::Uri| {
-            let ruta = ruta.clone();
+            let path = path.clone();
             let connector = connector.clone();
             async move {
-                let stream = conectar_socket(&ruta).await?;
-                let nombre = ServerName::try_from(SERVER_NAME).map_err(std::io::Error::other)?;
-                let tls_stream = connector.connect(nombre, stream).await?;
+                let stream = connect_socket(&path).await?;
+                let name = ServerName::try_from(SERVER_NAME).map_err(std::io::Error::other)?;
+                let tls_stream = connector.connect(name, stream).await?;
                 Ok::<_, std::io::Error>(TokioIo::new(tls_stream))
             }
         }))
         .await
-        .map_err(|e| ControlError::Conexion(e.to_string()))
+        .map_err(|e| ControlError::Connect(e.to_string()))
 }
 
 #[cfg(test)]
@@ -319,14 +324,14 @@ mod tests {
     };
     use tonic::{Request, Response, Status};
 
-    /// Plugin trivial: solo sirve para comprobar que el transporte funciona.
-    struct PluginDePrueba;
+    /// Trivial plugin: it exists only to check that the transport works.
+    struct TestPlugin;
 
     #[tonic::async_trait]
-    impl Plugin for PluginDePrueba {
+    impl Plugin for TestPlugin {
         async fn info(&self, _: Request<InfoRequest>) -> Result<Response<InfoResponse>, Status> {
             Ok(Response::new(InfoResponse {
-                name: "prueba".into(),
+                name: "test".into(),
                 version: "0.0.1".into(),
                 protocol_version: PROTOCOL_VERSION,
                 capabilities: vec![Capability::Engine as i32],
@@ -362,14 +367,14 @@ mod tests {
         }
     }
 
-    /// Levanta el servidor y espera a que el socket exista.
-    async fn levantar(
+    /// Brings up the server and waits for the socket to exist.
+    async fn spawn_server(
         socket: &std::path::Path,
         tls: std::sync::Arc<rustls::ServerConfig>,
     ) -> tokio::task::JoinHandle<()> {
-        let ruta = socket.to_path_buf();
+        let path = socket.to_path_buf();
         let h = tokio::spawn(async move {
-            let _ = serve_control(&ruta, tls, PluginServer::new(PluginDePrueba)).await;
+            let _ = serve_control(&path, tls, PluginServer::new(TestPlugin)).await;
         });
         for _ in 0..200 {
             if socket.exists() {
@@ -381,52 +386,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn el_nucleo_habla_con_el_plugin_por_uds_con_mtls() {
+    async fn the_core_talks_to_the_plugin_over_uds_with_mtls() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
 
-        let servidor = levantar(&socket, pki.server_config().unwrap()).await;
+        let server = spawn_server(&socket, pki.server_config().unwrap()).await;
 
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut cliente = sb_proto::plugin_client::PluginClient::new(canal);
-        let info = cliente.info(InfoRequest {}).await.unwrap().into_inner();
+        let mut client = sb_proto::plugin_client::PluginClient::new(channel);
+        let info = client.info(InfoRequest {}).await.unwrap().into_inner();
 
-        assert_eq!(info.name, "prueba");
+        assert_eq!(info.name, "test");
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
-        servidor.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn varias_llamadas_reutilizan_el_mismo_canal() {
-        // El núcleo hace Info, Schema, Configure y Preflight sobre una sola
-        // conexión: si el canal no fuera reutilizable, cada RPC pagaría un
-        // handshake TLS.
+    async fn several_calls_reuse_the_same_channel() {
+        // The core does Info, Schema, Configure and Preflight over a single
+        // connection: if the channel were not reusable, every RPC would pay for
+        // a TLS handshake.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
-        let servidor = levantar(&socket, pki.server_config().unwrap()).await;
+        let server = spawn_server(&socket, pki.server_config().unwrap()).await;
 
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut cliente = sb_proto::plugin_client::PluginClient::new(canal);
+        let mut client = sb_proto::plugin_client::PluginClient::new(channel);
 
         assert_eq!(
-            cliente
-                .info(InfoRequest {})
-                .await
-                .unwrap()
-                .into_inner()
-                .name,
-            "prueba"
+            client.info(InfoRequest {}).await.unwrap().into_inner().name,
+            "test"
         );
-        assert!(cliente.schema(SchemaRequest {}).await.is_ok());
-        assert!(cliente.configure(ConfigureRequest::default()).await.is_ok());
+        assert!(client.schema(SchemaRequest {}).await.is_ok());
+        assert!(client.configure(ConfigureRequest::default()).await.is_ok());
         assert!(
-            cliente
+            client
                 .preflight(PreflightRequest {})
                 .await
                 .unwrap()
@@ -434,108 +434,105 @@ mod tests {
                 .ok
         );
 
-        servidor.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn un_cliente_de_otra_ca_es_rechazado() {
-        // La defensa que justifica el mTLS: otro proceso de la máquina que
-        // encuentre el socket no puede hacerse pasar por el núcleo.
+    async fn a_client_from_another_ca_is_rejected() {
+        // The defence that justifies mTLS: another process on the machine that
+        // finds the socket cannot pass itself off as the core.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
-        let servidor = levantar(&socket, pki.server_config().unwrap()).await;
+        let server = spawn_server(&socket, pki.server_config().unwrap()).await;
 
-        let intruso = EphemeralPki::generate().unwrap();
-        let resultado = async {
-            let canal = connect_control(&socket, intruso.client_config().unwrap()).await?;
-            let mut c = sb_proto::plugin_client::PluginClient::new(canal);
+        let intruder = EphemeralPki::generate().unwrap();
+        let result = async {
+            let channel = connect_control(&socket, intruder.client_config().unwrap()).await?;
+            let mut c = sb_proto::plugin_client::PluginClient::new(channel);
             c.info(InfoRequest {}).await?;
             Ok::<_, Box<dyn std::error::Error>>(())
         }
         .await;
 
         assert!(
-            resultado.is_err(),
-            "un cliente de otra CA nunca debe ser aceptado"
+            result.is_err(),
+            "a client from another CA must never be accepted"
         );
-        servidor.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn un_handshake_rechazado_no_tumba_el_servidor() {
-        // Un intruso que falla el handshake no puede dejar al plugin inservible
-        // para el núcleo legítimo: sería una denegación de servicio trivial.
+    async fn a_rejected_handshake_does_not_take_the_server_down() {
+        // An intruder who fails the handshake must not be able to render the
+        // plugin useless for the legitimate core: that would be a trivial
+        // denial of service.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
-        let servidor = levantar(&socket, pki.server_config().unwrap()).await;
+        let server = spawn_server(&socket, pki.server_config().unwrap()).await;
 
-        let intruso = EphemeralPki::generate().unwrap();
+        let intruder = EphemeralPki::generate().unwrap();
         let _ = async {
-            let canal = connect_control(&socket, intruso.client_config().unwrap()).await?;
-            let mut c = sb_proto::plugin_client::PluginClient::new(canal);
+            let channel = connect_control(&socket, intruder.client_config().unwrap()).await?;
+            let mut c = sb_proto::plugin_client::PluginClient::new(channel);
             c.info(InfoRequest {}).await?;
             Ok::<_, Box<dyn std::error::Error>>(())
         }
         .await;
 
-        // Y ahora el cliente legítimo debe seguir funcionando.
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        // And now the legitimate client must still work.
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut cliente = sb_proto::plugin_client::PluginClient::new(canal);
+        let mut client = sb_proto::plugin_client::PluginClient::new(channel);
         assert_eq!(
-            cliente
-                .info(InfoRequest {})
-                .await
-                .unwrap()
-                .into_inner()
-                .name,
-            "prueba",
-            "el servidor debe seguir aceptando conexiones legítimas tras un intento fallido"
+            client.info(InfoRequest {}).await.unwrap().into_inner().name,
+            "test",
+            "the server must keep accepting legitimate connections after a failed attempt"
         );
 
-        servidor.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn conectar_a_un_socket_inexistente_da_un_error_claro() {
+    async fn connecting_to_a_socket_that_does_not_exist_gives_a_clear_error() {
         let pki = EphemeralPki::generate().unwrap();
         let err = connect_control(
-            std::path::Path::new("/tmp/no-existe-este-socket-shieldbk.sock"),
+            std::path::Path::new("/tmp/this-socket-does-not-exist-shieldbk.sock"),
             pki.client_config().unwrap(),
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, ControlError::Conexion(_)));
+        assert!(matches!(err, ControlError::Connect(_)));
     }
 
     #[tokio::test]
-    async fn el_socket_se_crea_aunque_ya_existiera_un_fichero() {
-        // Un plugin que murió sin limpiar deja el socket huérfano. Arrancar
-        // debe funcionar igual, no fallar con "address already in use".
+    async fn the_socket_is_created_even_if_a_file_was_already_there() {
+        // A plugin that died without cleaning up leaves the socket orphaned.
+        // Starting up must work just the same, not fail with "address already
+        // in use".
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
-        std::fs::write(&socket, b"restos de una ejecucion anterior").unwrap();
+        std::fs::write(&socket, b"leftovers from an earlier run").unwrap();
 
         let pki = EphemeralPki::generate().unwrap();
-        let servidor = levantar(&socket, pki.server_config().unwrap()).await;
+        let server = spawn_server(&socket, pki.server_config().unwrap()).await;
 
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut cliente = sb_proto::plugin_client::PluginClient::new(canal);
-        assert!(cliente.info(InfoRequest {}).await.is_ok());
-        servidor.abort();
+        let mut client = sb_proto::plugin_client::PluginClient::new(channel);
+        assert!(client.info(InfoRequest {}).await.is_ok());
+        server.abort();
     }
 
-    /// Implementación trivial del servicio Engine, para comprobar que se puede
-    /// servir junto al de Plugin por el mismo canal.
-    struct EngineDePrueba;
+    /// Trivial implementation of the Engine service, to check that it can be
+    /// served alongside Plugin over the same channel.
+    struct TestEngine;
 
     #[tonic::async_trait]
-    impl sb_proto::engine_server::Engine for EngineDePrueba {
+    impl sb_proto::engine_server::Engine for TestEngine {
         type DumpStream = std::pin::Pin<
             Box<dyn tokio_stream::Stream<Item = Result<sb_proto::Progress, Status>> + Send>,
         >;
@@ -565,24 +562,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn un_plugin_puede_servir_varios_servicios_por_el_mismo_canal() {
-        // Un plugin real expone Plugin + Engine, o Plugin + Storage, o los tres.
-        // Si solo pudiera exponer uno, la arquitectura no funcionaría.
+    async fn a_plugin_can_serve_several_services_over_the_same_channel() {
+        // A real plugin exposes Plugin + Engine, or Plugin + Storage, or all
+        // three. If it could only expose one, the architecture would not work.
         use tokio_stream::StreamExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
 
-        let rutas = rutas_de(
-            PluginServer::new(PluginDePrueba),
-            Some(sb_proto::engine_server::EngineServer::new(EngineDePrueba)),
+        let routes = routes_for(
+            PluginServer::new(TestPlugin),
+            Some(sb_proto::engine_server::EngineServer::new(TestEngine)),
         );
 
-        let ruta = socket.clone();
+        let path = socket.clone();
         let tls = pki.server_config().unwrap();
-        let servidor = tokio::spawn(async move {
-            let _ = serve_control_routes(&ruta, tls, rutas).await;
+        let server = tokio::spawn(async move {
+            let _ = serve_control_routes(&path, tls, routes).await;
         });
         for _ in 0..200 {
             if socket.exists() {
@@ -591,19 +588,19 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
 
-        // El servicio Plugin responde.
-        let mut c1 = sb_proto::plugin_client::PluginClient::new(canal.clone());
+        // The Plugin service answers.
+        let mut c1 = sb_proto::plugin_client::PluginClient::new(channel.clone());
         assert_eq!(
             c1.info(InfoRequest {}).await.unwrap().into_inner().name,
-            "prueba"
+            "test"
         );
 
-        // Y el servicio Engine también, por el MISMO canal.
-        let mut c2 = sb_proto::engine_client::EngineClient::new(canal);
+        // And so does the Engine service, over the SAME channel.
+        let mut c2 = sb_proto::engine_client::EngineClient::new(channel);
         let mut stream = c2
             .dump(sb_proto::DumpRequest {
                 data_socket: "/tmp/x.sock".into(),
@@ -611,26 +608,26 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        let primero = stream.next().await.unwrap().unwrap();
-        assert_eq!(primero.bytes, 42);
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.bytes, 42);
 
-        servidor.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn un_servicio_no_registrado_devuelve_no_implementado() {
-        // Un plugin que solo es motor no expone Storage. Pedirle un Put debe
-        // dar un error claro del protocolo, no un cuelgue ni un error de
-        // transporte que nadie sepa interpretar.
+    async fn an_unregistered_service_returns_unimplemented() {
+        // A plugin that is only an engine does not expose Storage. Asking it
+        // for a Put must give a clear protocol error, not a hang nor a
+        // transport error nobody can interpret.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
 
-        let rutas = rutas_de(PluginServer::new(PluginDePrueba), None);
-        let ruta = socket.clone();
+        let routes = routes_for(PluginServer::new(TestPlugin), None);
+        let path = socket.clone();
         let tls = pki.server_config().unwrap();
-        let servidor = tokio::spawn(async move {
-            let _ = serve_control_routes(&ruta, tls, rutas).await;
+        let server = tokio::spawn(async move {
+            let _ = serve_control_routes(&path, tls, routes).await;
         });
         for _ in 0..200 {
             if socket.exists() {
@@ -639,10 +636,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut c = sb_proto::storage_client::StorageClient::new(canal);
+        let mut c = sb_proto::storage_client::StorageClient::new(channel);
         let err = c
             .list(sb_proto::ListRequest {
                 prefix: String::new(),
@@ -653,25 +650,25 @@ mod tests {
         assert_eq!(
             err.code(),
             tonic::Code::Unimplemented,
-            "un servicio ausente debe reportarse como Unimplemented"
+            "a missing service must be reported as Unimplemented"
         );
-        servidor.abort();
+        server.abort();
     }
 
     #[tokio::test]
-    async fn la_senal_de_parada_termina_el_servidor() {
+    async fn the_shutdown_signal_ends_the_server() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let ruta = socket.clone();
+        let path = socket.clone();
         let tls = pki.server_config().unwrap();
-        let servidor = tokio::spawn(async move {
-            serve_control_routes_con_parada(
-                &ruta,
+        let server = tokio::spawn(async move {
+            serve_control_routes_with_shutdown(
+                &path,
                 tls,
-                tonic::service::Routes::new(PluginServer::new(PluginDePrueba)),
+                tonic::service::Routes::new(PluginServer::new(TestPlugin)),
                 async {
                     let _ = rx.await;
                 },
@@ -685,38 +682,38 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // Antes de la señal, responde.
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        // Before the signal, it answers.
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut c = sb_proto::plugin_client::PluginClient::new(canal);
+        let mut c = sb_proto::plugin_client::PluginClient::new(channel);
         assert!(c.info(InfoRequest {}).await.is_ok());
 
-        // Tras la señal, el servidor retorna solo, sin abort.
+        // After the signal, the server returns on its own, with no abort.
         tx.send(()).unwrap();
-        let resultado = tokio::time::timeout(std::time::Duration::from_secs(5), servidor)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
-            .expect("el servidor debe retornar tras la señal, no colgarse");
-        assert!(resultado.is_ok());
+            .expect("the server must return after the signal, not hang");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn una_respuesta_en_vuelo_llega_antes_del_cierre() {
-        // La razón de existir de esta tarea: cerrar en cuanto el cuerpo del RPC
-        // devuelve haría que el núcleo viera un error de transporte en un
-        // cierre correcto. El GOAWAY de tonic espera a los streams en vuelo.
+    async fn an_in_flight_response_arrives_before_the_close() {
+        // The whole reason this task exists: closing as soon as the body of the
+        // RPC returns would make the core see a transport error on a perfectly
+        // correct shutdown. tonic's GOAWAY waits for the in-flight streams.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
         let pki = EphemeralPki::generate().unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let ruta = socket.clone();
+        let path = socket.clone();
         let tls = pki.server_config().unwrap();
-        let servidor = tokio::spawn(async move {
-            let _ = serve_control_routes_con_parada(
-                &ruta,
+        let server = tokio::spawn(async move {
+            let _ = serve_control_routes_with_shutdown(
+                &path,
                 tls,
-                tonic::service::Routes::new(PluginServer::new(PluginDePrueba)),
+                tonic::service::Routes::new(PluginServer::new(TestPlugin)),
                 async {
                     let _ = rx.await;
                 },
@@ -730,30 +727,30 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let canal = connect_control(&socket, pki.client_config().unwrap())
+        let channel = connect_control(&socket, pki.client_config().unwrap())
             .await
             .unwrap();
-        let mut c = sb_proto::plugin_client::PluginClient::new(canal);
+        let mut c = sb_proto::plugin_client::PluginClient::new(channel);
 
-        // Se dispara la parada y se pide una respuesta inmediatamente después.
-        // La llamada ya iniciada debe completarse.
-        let llamada = tokio::spawn(async move { c.info(InfoRequest {}).await });
+        // The shutdown is triggered and a response is requested immediately
+        // afterwards. The call that already started must complete.
+        let call = tokio::spawn(async move { c.info(InfoRequest {}).await });
         tx.send(()).unwrap();
 
-        let respuesta = tokio::time::timeout(std::time::Duration::from_secs(5), llamada)
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), call)
             .await
-            .expect("no debe colgarse")
+            .expect("it must not hang")
             .unwrap();
-        // Aceptamos que la llamada llegue o sea rechazada limpiamente, pero
-        // nunca que el proceso se quede colgado ni que el servidor entre en pánico.
-        let _ = respuesta;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), servidor).await;
+        // We accept the call either getting through or being cleanly rejected,
+        // but never the process hanging nor the server panicking.
+        let _ = response;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 
-    /// Ayudante del test: monta las rutas con Plugin y, opcionalmente, Engine.
-    fn rutas_de(
-        plugin: PluginServer<PluginDePrueba>,
-        engine: Option<sb_proto::engine_server::EngineServer<EngineDePrueba>>,
+    /// Test helper: assembles the routes with Plugin and, optionally, Engine.
+    fn routes_for(
+        plugin: PluginServer<TestPlugin>,
+        engine: Option<sb_proto::engine_server::EngineServer<TestEngine>>,
     ) -> tonic::service::Routes {
         let mut r = tonic::service::Routes::new(plugin);
         if let Some(e) = engine {
