@@ -1,4 +1,4 @@
-//! Una `Identity` contiene una clave privada age. Tampoco puede imprimirse.
+//! An `Identity` holds an age private key. It cannot be printed either.
 
 fn main() {
     let id = sb_crypto::Identity::generate();

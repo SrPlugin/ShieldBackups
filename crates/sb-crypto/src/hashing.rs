@@ -5,62 +5,62 @@ use std::task::{Context, Poll};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Digest SHA-256 de 32 bytes.
+/// A 32-byte SHA-256 digest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Digest([u8; 32]);
 
 #[derive(Debug, thiserror::Error)]
-#[error("digest hexadecimal inválido: se esperaban 64 caracteres hex")]
+#[error("invalid hexadecimal digest: 64 hex characters were expected")]
 pub struct DigestParseError;
 
 impl Digest {
-    /// Representación hexadecimal en minúsculas, 64 caracteres.
+    /// Lowercase hexadecimal representation, 64 characters long.
     #[must_use]
     pub fn to_hex(&self) -> String {
-        // `fold` + `write!` en vez de `map(format!).collect()`: evita una
-        // `String` por byte (clippy::format_collect).
+        // `fold` + `write!` instead of `map(format!).collect()`: it avoids one
+        // `String` per byte (clippy::format_collect).
         self.0.iter().fold(String::with_capacity(64), |mut acc, b| {
             let _ = write!(acc, "{b:02x}");
             acc
         })
     }
 
-    /// Parsea un digest desde su representación hexadecimal.
+    /// Parses a digest from its hexadecimal representation.
     ///
-    /// Trabaja sobre los **bytes** de `s` y no sobre sus caracteres. La
-    /// diferencia importa: la longitud se mide en bytes, así que una cadena de
-    /// 21 signos de euro y una letra ocupa exactamente 64 bytes sin ser hex, y
-    /// trocearla en pares de bytes con `&s[i*2..i*2+2]` caería en mitad de un
-    /// carácter multibyte y entraría en pánico. Este parser lee cadenas que
-    /// vienen de un manifiesto descargado del destino, así que esa entrada es
-    /// perfectamente alcanzable.
+    /// It works on the **bytes** of `s`, not on its characters. The difference
+    /// matters: the length is measured in bytes, so a string of 21 euro signs
+    /// plus one letter occupies exactly 64 bytes without being hex, and slicing
+    /// it into byte pairs with `&s[i*2..i*2+2]` would land in the middle of a
+    /// multibyte character and panic. This parser reads strings that come from
+    /// a manifest downloaded from the target, so that input is perfectly
+    /// reachable.
     ///
     /// # Errors
     ///
-    /// Devuelve [`DigestParseError`] si `s` no ocupa exactamente 64 bytes o si
-    /// alguno de ellos no es un dígito hexadecimal ASCII.
+    /// Returns [`DigestParseError`] if `s` does not occupy exactly 64 bytes, or
+    /// if any of them is not an ASCII hexadecimal digit.
     pub fn from_hex(s: &str) -> Result<Self, DigestParseError> {
         let bytes = s.as_bytes();
         if bytes.len() != 64 {
             return Err(DigestParseError);
         }
         let mut out = [0_u8; 32];
-        for (byte, par) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-            let alto = valor_hex(par[0])?;
-            let bajo = valor_hex(par[1])?;
-            *byte = alto * 16 + bajo;
+        for (byte, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+            let high = hex_value(pair[0])?;
+            let low = hex_value(pair[1])?;
+            *byte = high * 16 + low;
         }
         Ok(Self(out))
     }
 }
 
-/// Valor numérico de un dígito hexadecimal ASCII.
+/// Numeric value of an ASCII hexadecimal digit.
 ///
-/// Deliberadamente sobre `u8` y no sobre `char`: es lo que permite recorrer la
-/// cadena por bytes sin arriesgarse a cortar un carácter multibyte por la
-/// mitad. Cualquier byte que no sea `0-9`, `a-f` o `A-F` —incluido el primer
-/// byte de una secuencia UTF-8 más larga— es un error, no un pánico.
-fn valor_hex(b: u8) -> Result<u8, DigestParseError> {
+/// Deliberately over `u8` and not over `char`: that is what lets us walk the
+/// string byte by byte without risking cutting a multibyte character in half.
+/// Any byte that is not `0-9`, `a-f` or `A-F` — including the leading byte of a
+/// longer UTF-8 sequence — is an error, not a panic.
+fn hex_value(b: u8) -> Result<u8, DigestParseError> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
@@ -69,7 +69,7 @@ fn valor_hex(b: u8) -> Result<u8, DigestParseError> {
     }
 }
 
-/// Adaptador que reenvía los bytes al sumidero y los hashea de paso.
+/// Adapter that forwards bytes to the sink and hashes them on the way through.
 pub struct Sha256Writer<W> {
     inner: W,
     hasher: Sha256,
@@ -85,9 +85,9 @@ impl<W> Sha256Writer<W> {
         }
     }
 
-    /// Consume el adaptador y devuelve el sumidero, el digest y los bytes
-    /// escritos. El contador lo necesita el manifiesto para registrar el
-    /// tamaño del artefacto sin tener que releerlo.
+    /// Consumes the adapter and returns the sink, the digest and the number of
+    /// bytes written. The manifest needs that counter to record the size of the
+    /// artifact without having to read it back.
     #[must_use]
     pub fn into_parts(self) -> (W, Digest, u64) {
         let mut out = [0_u8; 32];
@@ -104,8 +104,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Sha256Writer<W> {
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
-            // Solo se hashea lo que el sumidero aceptó de verdad: hashear `buf`
-            // entero cuando solo se escribieron n bytes corrompería el digest.
+            // Only what the sink actually accepted gets hashed: hashing the
+            // whole `buf` when only n bytes were written would corrupt the
+            // digest.
             Poll::Ready(Ok(n)) => {
                 this.hasher.update(&buf[..n]);
                 this.bytes += u64::try_from(n).unwrap_or(u64::MAX);
@@ -124,7 +125,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Sha256Writer<W> {
     }
 }
 
-/// Adaptador que hashea los bytes según se leen de la fuente.
+/// Adapter that hashes bytes as they are read from the source.
 pub struct Sha256Reader<R> {
     inner: R,
     hasher: Sha256,
@@ -138,12 +139,12 @@ impl<R> Sha256Reader<R> {
         }
     }
 
-    /// Digest de todo lo leído hasta ahora. Solo es el digest completo del
-    /// flujo si ya se llegó al final.
+    /// Digest of everything read so far. It is only the digest of the whole
+    /// stream once the end has been reached.
     #[must_use]
     pub fn digest(&self) -> Digest {
-        // Se clona el hasher en vez de consumirlo para poder consultar el
-        // digest a mitad de la lectura.
+        // The hasher is cloned rather than consumed so the digest can be
+        // queried in the middle of a read.
         let mut out = [0_u8; 32];
         out.copy_from_slice(&self.hasher.clone().finalize());
         Digest(out)
@@ -162,13 +163,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for Sha256Reader<R> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = &mut *self;
-        let antes = buf.filled().len();
+        let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
-                // Solo lo recién llenado en esta llamada, no el buffer entero:
-                // el `ReadBuf` puede llegar con contenido de otra capa del
-                // pipeline y hashearlo entero corrompería el digest.
-                this.hasher.update(&buf.filled()[antes..]);
+                // Only what was just filled in on this call, not the whole
+                // buffer: the `ReadBuf` may arrive carrying content from
+                // another layer of the pipeline, and hashing all of it would
+                // corrupt the digest.
+                this.hasher.update(&buf.filled()[before..]);
                 Poll::Ready(Ok(()))
             }
             other => other,
@@ -181,38 +183,35 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    /// SHA-256 conocido de la cadena vacía.
-    const SHA256_VACIO: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    /// Known SHA-256 of the empty string.
+    const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-    /// SHA-256 conocido de "abc".
+    /// Known SHA-256 of "abc".
     const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     #[tokio::test]
-    async fn hashea_la_cadena_vacia() {
+    async fn hashes_the_empty_string() {
         let mut w = Sha256Writer::new(Vec::new());
         w.shutdown().await.unwrap();
         let (sink, digest, bytes) = w.into_parts();
         assert!(sink.is_empty());
-        assert_eq!(digest.to_hex(), SHA256_VACIO);
+        assert_eq!(digest.to_hex(), SHA256_EMPTY);
         assert_eq!(bytes, 0);
     }
 
     #[tokio::test]
-    async fn hashea_y_reenvia_los_bytes() {
+    async fn hashes_and_forwards_the_bytes() {
         let mut w = Sha256Writer::new(Vec::new());
         w.write_all(b"abc").await.unwrap();
         w.shutdown().await.unwrap();
         let (sink, digest, bytes) = w.into_parts();
         assert_eq!(sink, b"abc");
         assert_eq!(digest.to_hex(), SHA256_ABC);
-        assert_eq!(
-            bytes, 3,
-            "el pipeline necesita este contador para el manifiesto"
-        );
+        assert_eq!(bytes, 3, "the pipeline needs this counter for the manifest");
     }
 
     #[tokio::test]
-    async fn el_hash_no_depende_de_como_se_trocean_las_escrituras() {
+    async fn the_hash_does_not_depend_on_how_the_writes_are_chunked() {
         let mut a = Sha256Writer::new(Vec::new());
         a.write_all(b"abc").await.unwrap();
         a.shutdown().await.unwrap();
@@ -227,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cuenta_los_bytes_que_de_verdad_pasaron() {
+    async fn counts_the_bytes_that_actually_went_through() {
         let mut w = Sha256Writer::new(Vec::new());
         w.write_all(&vec![0_u8; 100_000]).await.unwrap();
         w.shutdown().await.unwrap();
@@ -235,38 +234,38 @@ mod tests {
     }
 
     #[test]
-    fn el_digest_se_parsea_desde_hex() {
+    fn the_digest_parses_from_hex() {
         let d = Digest::from_hex(SHA256_ABC).unwrap();
         assert_eq!(d.to_hex(), SHA256_ABC);
     }
 
     #[test]
-    fn un_hex_invalido_se_rechaza() {
-        assert!(Digest::from_hex("no-es-hex").is_err());
-        assert!(Digest::from_hex("ab").is_err()); // longitud incorrecta
+    fn invalid_hex_is_rejected() {
+        assert!(Digest::from_hex("not-hex").is_err());
+        assert!(Digest::from_hex("ab").is_err()); // wrong length
     }
 
     #[test]
-    fn una_cadena_de_64_bytes_con_caracteres_multibyte_se_rechaza() {
-        // Regresión: la longitud se mide en bytes, así que 21 signos de euro
-        // (3 bytes cada uno) más una letra ocupan exactamente 64 bytes y
-        // pasaban la comprobación de longitud. Trocear eso en pares de bytes
-        // con `&s[i*2..i*2+2]` cortaba un carácter por la mitad y entraba en
-        // pánico. Esta cadena llega dentro del manifiesto que se descarga del
-        // destino: es entrada externa, no un caso teórico.
+    fn a_64_byte_string_with_multibyte_characters_is_rejected() {
+        // Regression: the length is measured in bytes, so 21 euro signs (3
+        // bytes each) plus one letter occupy exactly 64 bytes and used to pass
+        // the length check. Slicing that into byte pairs with
+        // `&s[i*2..i*2+2]` cut a character in half and panicked. This string
+        // arrives inside the manifest downloaded from the target: it is
+        // external input, not a theoretical case.
         let s = format!("{}a", "\u{20ac}".repeat(21));
-        assert_eq!(s.len(), 64, "la trampa es que mide 64 bytes");
+        assert_eq!(s.len(), 64, "the trap is that it measures 64 bytes");
         assert!(Digest::from_hex(&s).is_err());
     }
 
     #[test]
-    fn el_hex_en_mayusculas_tambien_se_acepta() {
+    fn uppercase_hex_is_accepted_too() {
         let d = Digest::from_hex(&SHA256_ABC.to_uppercase()).unwrap();
         assert_eq!(d.to_hex(), SHA256_ABC);
     }
 
     #[tokio::test]
-    async fn el_reader_hashea_lo_que_lee() {
+    async fn the_reader_hashes_what_it_reads() {
         use tokio::io::AsyncReadExt;
         let mut r = Sha256Reader::new(&b"abc"[..]);
         let mut buf = Vec::new();
@@ -276,16 +275,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_y_writer_producen_el_mismo_digest() {
+    async fn reader_and_writer_produce_the_same_digest() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let datos = vec![7_u8; 100_000];
+        let data = vec![7_u8; 100_000];
 
         let mut w = Sha256Writer::new(Vec::new());
-        w.write_all(&datos).await.unwrap();
+        w.write_all(&data).await.unwrap();
         w.shutdown().await.unwrap();
         let (_, d_write, _) = w.into_parts();
 
-        let mut r = Sha256Reader::new(&datos[..]);
+        let mut r = Sha256Reader::new(&data[..]);
         let mut sink = Vec::new();
         r.read_to_end(&mut sink).await.unwrap();
 

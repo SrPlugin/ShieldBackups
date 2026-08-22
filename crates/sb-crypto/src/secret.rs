@@ -1,25 +1,25 @@
 use zeroize::Zeroize;
 
-/// Contenedor de un valor sensible.
+/// Container for a sensitive value.
 ///
-/// No implementa `Debug` ni `Display` a propósito: si algo intenta imprimir un
-/// secreto, el resultado debe ser un error de compilación, no una línea de log.
-/// El contenido se borra de memoria al destruirse el valor.
+/// It deliberately implements neither `Debug` nor `Display`: if something tries
+/// to print a secret, the result must be a compile error, not a log line. The
+/// contents are wiped from memory when the value is dropped.
 ///
-/// # Qué garantiza y qué no
+/// # What it guarantees and what it does not
 ///
-/// Garantiza que una credencial no pueda acabar en un log por accidente, y que
-/// el valor que este contenedor posee se borre al destruirse.
+/// It guarantees that a credential cannot end up in a log by accident, and that
+/// the value this container owns is wiped on drop.
 ///
-/// **No** garantiza que ninguna copia sobreviva en memoria. Un `String` que
-/// realoca al crecer deja atrás su buffer anterior sin borrar, y clonar un
-/// `Secret` crea una asignación nueva e independiente. Construye el valor con
-/// su capacidad final siempre que puedas, y no des por hecho más protección de
-/// la que hay.
+/// It does **not** guarantee that no copy survives in memory. A `String` that
+/// reallocates as it grows leaves its previous buffer behind unwiped, and
+/// cloning a `Secret` creates a new, independent allocation. Build the value at
+/// its final capacity whenever you can, and do not assume more protection than
+/// is actually here.
 ///
-/// La comparación con `PartialEq` es de tiempo constante en el contenido, pero
-/// devuelve antes si las longitudes difieren: filtra la longitud, no el valor.
-/// Es el comportamiento estándar para comparar credenciales.
+/// `PartialEq` comparison is constant-time over the contents, but returns early
+/// when the lengths differ: it leaks the length, not the value. That is the
+/// standard behaviour for comparing credentials.
 #[derive(Clone)]
 pub struct Secret<T: Zeroize>(T);
 
@@ -28,8 +28,8 @@ impl<T: Zeroize> Secret<T> {
         Self(value)
     }
 
-    /// Único acceso al valor. El nombre es deliberadamente incómodo para que
-    /// cada uso sea visible en revisión de código.
+    /// The only way to reach the value. The name is deliberately awkward so
+    /// that every use stands out in code review.
     pub fn expose(&self) -> &T {
         &self.0
     }
@@ -48,7 +48,8 @@ impl<T: Zeroize + AsRef<[u8]>> PartialEq for Secret<T> {
         if a.len() != b.len() {
             return false;
         }
-        // Comparación sin salida temprana: no filtra por tiempo cuánto prefijo coincide.
+        // Comparison without an early exit: it does not leak through timing how
+        // much of the prefix matched.
         a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
     }
 }
@@ -60,23 +61,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expone_el_valor_solo_al_pedirlo_explicitamente() {
+    fn exposes_the_value_only_when_explicitly_asked() {
         let s = Secret::new(String::from("hunter2"));
         assert_eq!(s.expose(), "hunter2");
     }
 
     #[test]
-    fn dos_secretos_con_el_mismo_valor_son_iguales() {
-        let a = Secret::new(String::from("mismo"));
-        let b = Secret::new(String::from("mismo"));
-        // `assert!` en vez de `assert_eq!`: este último exigiría `Debug`, que
-        // `Secret` no implementa a propósito.
+    fn two_secrets_with_the_same_value_are_equal() {
+        let a = Secret::new(String::from("same"));
+        let b = Secret::new(String::from("same"));
+        // `assert!` rather than `assert_eq!`: the latter would require `Debug`,
+        // which `Secret` deliberately does not implement.
         assert!(a == b);
     }
 
     #[test]
-    fn la_comparacion_es_en_tiempo_constante_para_bytes() {
-        // No mide tiempo: verifica que el camino de comparación existe y es correcto.
+    fn comparison_is_constant_time_for_bytes() {
+        // This does not measure time: it checks that the comparison path exists
+        // and is correct.
         let a = Secret::new(vec![1_u8, 2, 3]);
         let b = Secret::new(vec![1_u8, 2, 3]);
         let c = Secret::new(vec![1_u8, 2, 4]);
@@ -85,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn se_puede_clonar() {
+    fn can_be_cloned() {
         let a = Secret::new(String::from("x"));
         let b = a.clone();
         assert_eq!(b.expose(), "x");

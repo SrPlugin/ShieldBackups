@@ -1,8 +1,9 @@
-//! Cifrado age en streaming, encapsulado tras una API estable.
+//! Streaming age encryption, wrapped behind a stable API.
 //!
-//! El resto del proyecto solo ve [`encrypt_to`], [`decrypt_from`], [`Recipient`]
-//! e [`Identity`]: la API de `age` cambia entre versiones menores y este módulo
-//! es el único punto que hay que tocar cuando eso ocurra.
+//! The rest of the project only ever sees [`encrypt_to`], [`decrypt_from`],
+//! [`Recipient`] and [`Identity`]: the `age` API changes between minor
+//! versions, and this module is the single place that has to be touched when
+//! that happens.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::{
@@ -10,43 +11,43 @@ use tokio_util::compat::{
     TokioAsyncWriteCompatExt,
 };
 
-/// Errores del flujo cifrado.
+/// Errors of the encrypted stream.
 #[derive(Debug, thiserror::Error)]
 pub enum AgeError {
-    /// La cadena no es una clave pública age válida.
-    #[error("clave pública age inválida")]
-    RecipientInvalido,
-    /// El artefacto no está dirigido a la identidad proporcionada.
-    #[error("no se pudo descifrar: el artefacto no está dirigido a esta identidad")]
-    IdentidadIncorrecta,
-    /// El texto no contiene una clave privada age.
+    /// The string is not a valid age public key.
+    #[error("invalid age public key")]
+    InvalidRecipient,
+    /// The artifact is not addressed to the identity that was supplied.
+    #[error("could not decrypt: the artifact is not addressed to this identity")]
+    WrongIdentity,
+    /// The text does not contain an age private key.
     ///
-    /// El mensaje no repite nada de lo que se le pasó **a propósito**: lo que
-    /// se estaba leyendo era una clave privada, y un error que la citara la
-    /// dejaría escrita en el log de quien se equivocó de fichero.
+    /// The message repeats nothing of what it was given, **on purpose**: what
+    /// was being read was a private key, and an error quoting it would leave it
+    /// written in the log of whoever picked the wrong file.
     #[error(
-        "no se encontró ninguna clave privada age: se espera una línea `AGE-SECRET-KEY-1…`, \
-         como la que escribe `age-keygen`"
+        "no age private key was found: an `AGE-SECRET-KEY-1…` line is expected, \
+         like the one `age-keygen` writes"
     )]
-    IdentidadInvalida,
-    /// Fallo de E/S sobre el flujo subyacente.
-    #[error("error de E/S en el flujo cifrado: {0}")]
+    InvalidIdentity,
+    /// I/O failure on the underlying stream.
+    #[error("I/O error on the encrypted stream: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Clave pública age (`age1...`) a la que se cifra un artefacto.
+/// An age public key (`age1...`) an artifact is encrypted to.
 #[derive(Clone)]
 pub struct Recipient(age::x25519::Recipient);
 
 impl Recipient {
-    /// Parsea una clave pública age desde su forma textual `age1...`.
+    /// Parses an age public key from its `age1...` textual form.
     ///
     /// # Errors
-    /// Devuelve `RecipientInvalido` si la cadena no es una clave pública age.
+    /// Returns `InvalidRecipient` if the string is not an age public key.
     pub fn parse(s: &str) -> Result<Self, AgeError> {
         s.parse::<age::x25519::Recipient>()
             .map(Self)
-            .map_err(|_| AgeError::RecipientInvalido)
+            .map_err(|_| AgeError::InvalidRecipient)
     }
 }
 
@@ -56,53 +57,52 @@ impl std::fmt::Display for Recipient {
     }
 }
 
-/// Clave privada age.
+/// An age private key.
 ///
-/// No implementa `Debug` ni `Display` a propósito, igual que `Secret<T>`: una
-/// clave privada no puede acabar en un log por accidente.
+/// It deliberately implements neither `Debug` nor `Display`, just like
+/// `Secret<T>`: a private key must not be able to end up in a log by accident.
 pub struct Identity(age::x25519::Identity);
 
 impl Identity {
-    /// Genera una identidad nueva a partir del RNG del sistema.
+    /// Generates a fresh identity from the system RNG.
     #[must_use]
     pub fn generate() -> Self {
         Self(age::x25519::Identity::generate())
     }
 
-    /// Deriva la clave pública correspondiente a esta identidad.
+    /// Derives the public key that corresponds to this identity.
     #[must_use]
     pub fn to_recipient(&self) -> Recipient {
         Recipient(self.0.to_public())
     }
 
-    /// Lee una identidad del contenido de un fichero de clave age.
+    /// Reads an identity from the contents of an age key file.
     ///
-    /// Acepta el fichero entero tal y como lo escribe `age-keygen` —dos líneas
-    /// de comentario y la clave— y no solo la clave suelta: obligar a quien
-    /// restaura a recortar el fichero a mano, con la base de datos caída,
-    /// sería pedirle justo lo que no puede hacer bien en ese momento. Se queda
-    /// con la **primera** clave que encuentre, que es la única que hay en un
-    /// fichero generado así.
+    /// It accepts the whole file exactly as `age-keygen` writes it — two
+    /// comment lines and the key — and not just the bare key: forcing whoever
+    /// is restoring to trim the file by hand, with the database down, would be
+    /// asking them for precisely what they cannot do well at that moment. It
+    /// keeps the **first** key it finds, which is the only one there is in a
+    /// file generated that way.
     ///
     /// # Errors
-    /// Devuelve [`AgeError::IdentidadInvalida`] si no hay ninguna línea que sea
-    /// una clave privada age. El error no cita nada del texto recibido.
-    pub fn parse(texto: &str) -> Result<Self, AgeError> {
-        texto
-            .lines()
+    /// Returns [`AgeError::InvalidIdentity`] if there is no line that is an age
+    /// private key. The error quotes nothing of the text it received.
+    pub fn parse(text: &str) -> Result<Self, AgeError> {
+        text.lines()
             .map(str::trim)
-            .filter(|linea| !linea.is_empty() && !linea.starts_with('#'))
-            .find_map(|linea| linea.parse::<age::x25519::Identity>().ok())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .find_map(|line| line.parse::<age::x25519::Identity>().ok())
             .map(Self)
-            .ok_or(AgeError::IdentidadInvalida)
+            .ok_or(AgeError::InvalidIdentity)
     }
 
-    /// La forma textual de la clave privada, envuelta para que no se pueda
-    /// imprimir por accidente.
+    /// The textual form of the private key, wrapped so that it cannot be
+    /// printed by accident.
     ///
-    /// El envoltorio [`Secret`](crate::Secret) no es decorativo: es lo único
-    /// que separa «escribir un fichero de clave» de «dejar la clave en un log».
-    /// Quien la necesite de verdad tiene que pedir `expose()` explícitamente.
+    /// The [`Secret`](crate::Secret) wrapper is not decorative: it is the only
+    /// thing separating "writing a key file" from "leaving the key in a log".
+    /// Whoever genuinely needs it has to ask for `expose()` explicitly.
     #[must_use]
     pub fn to_secret_string(&self) -> crate::Secret<String> {
         crate::Secret::new(
@@ -111,41 +111,42 @@ impl Identity {
     }
 }
 
-/// Envuelve un sumidero para que lo escrito en él salga cifrado a `rec`.
+/// Wraps a sink so that whatever is written to it comes out encrypted to `rec`.
 ///
-/// **Hay que llamar a `shutdown()`** sobre el valor devuelto: age solo cierra
-/// el último bloque AEAD al finalizar, y sin eso el artefacto no se puede leer.
+/// **You must call `shutdown()`** on the returned value: age only closes the
+/// last AEAD block on finalization, and without that the artifact cannot be
+/// read.
 ///
 /// # Errors
-/// Devuelve error si el recipient es inválido o si falla la escritura de la cabecera.
+/// Returns an error if the recipient is invalid or if writing the header fails.
 pub async fn encrypt_to<W: AsyncWrite + Unpin>(
     sink: W,
     rec: &Recipient,
 ) -> Result<impl AsyncWrite + Unpin, AgeError> {
     let encryptor = age::Encryptor::with_recipients(std::iter::once(&rec.0 as &dyn age::Recipient))
-        .map_err(|_| AgeError::RecipientInvalido)?;
+        .map_err(|_| AgeError::InvalidRecipient)?;
     let writer = encryptor.wrap_async_output(sink.compat_write()).await?;
     Ok(writer.compat_write())
 }
 
-/// Envuelve una fuente cifrada para leerla en claro con `id`.
+/// Wraps an encrypted source so it reads back in the clear using `id`.
 ///
-/// La integridad se comprueba bloque a bloque durante la lectura: un ciphertext
-/// manipulado falla al leer, no al abrir.
+/// Integrity is checked block by block as the stream is read: a tampered
+/// ciphertext fails on read, not on open.
 ///
 /// # Errors
-/// Devuelve `IdentidadIncorrecta` si el artefacto no está dirigido a `id` o si
-/// la cabecera no es un artefacto age legible.
+/// Returns `WrongIdentity` if the artifact is not addressed to `id`, or if the
+/// header is not a readable age artifact.
 pub async fn decrypt_from<R: AsyncRead + Unpin>(
     source: R,
     id: &Identity,
 ) -> Result<impl AsyncRead + Unpin, AgeError> {
     let decryptor = age::Decryptor::new_async(source.compat())
         .await
-        .map_err(|_| AgeError::IdentidadIncorrecta)?;
+        .map_err(|_| AgeError::WrongIdentity)?;
     let reader = decryptor
         .decrypt_async(std::iter::once(&id.0 as &dyn age::Identity))
-        .map_err(|_| AgeError::IdentidadIncorrecta)?;
+        .map_err(|_| AgeError::WrongIdentity)?;
     Ok(reader.compat())
 }
 
@@ -154,166 +155,164 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn par_de_claves() -> (Recipient, Identity) {
+    fn key_pair() -> (Recipient, Identity) {
         let id = Identity::generate();
         let rec = id.to_recipient();
         (rec, id)
     }
 
-    async fn cifrar(datos: &[u8], rec: &Recipient) -> Vec<u8> {
+    async fn encrypt(data: &[u8], rec: &Recipient) -> Vec<u8> {
         let mut sink = Vec::new();
         {
             let mut w = encrypt_to(&mut sink, rec).await.unwrap();
-            w.write_all(datos).await.unwrap();
+            w.write_all(data).await.unwrap();
             w.shutdown().await.unwrap();
         }
         sink
     }
 
-    async fn descifrar(datos: &[u8], id: &Identity) -> Vec<u8> {
-        let mut r = decrypt_from(datos, id).await.unwrap();
+    async fn decrypt(data: &[u8], id: &Identity) -> Vec<u8> {
+        let mut r = decrypt_from(data, id).await.unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).await.unwrap();
         out
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta() {
-        let (rec, id) = par_de_claves();
-        let datos = b"datos sensibles";
-        let cifrado = cifrar(datos, &rec).await;
+    async fn round_trip() {
+        let (rec, id) = key_pair();
+        let data = b"sensitive data";
+        let encrypted = encrypt(data, &rec).await;
         assert_ne!(
-            &cifrado[..],
-            &datos[..],
-            "el ciphertext no puede ser el plaintext"
+            &encrypted[..],
+            &data[..],
+            "the ciphertext must not be the plaintext"
         );
-        assert_eq!(descifrar(&cifrado, &id).await, datos);
+        assert_eq!(decrypt(&encrypted, &id).await, data);
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_con_cero_bytes() {
-        // Mismo peligro que en zstd: sin shutdown() no se cierra el último
-        // bloque AEAD y el descifrado falla con un error confuso.
-        let (rec, id) = par_de_claves();
-        let cifrado = cifrar(b"", &rec).await;
-        assert!(!cifrado.is_empty(), "age siempre emite cabecera");
-        assert_eq!(descifrar(&cifrado, &id).await, b"");
+    async fn round_trip_with_zero_bytes() {
+        // Same hazard as with zstd: without shutdown() the last AEAD block is
+        // never closed and decryption fails with a confusing error.
+        let (rec, id) = key_pair();
+        let encrypted = encrypt(b"", &rec).await;
+        assert!(!encrypted.is_empty(), "age always emits a header");
+        assert_eq!(decrypt(&encrypted, &id).await, b"");
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_con_volumen() {
-        // Fuerza que age emita varios bloques AEAD, no solo uno.
-        let (rec, id) = par_de_claves();
-        let datos: Vec<u8> = (0..300_000_u32).map(|i| (i % 251) as u8).collect();
-        let cifrado = cifrar(&datos, &rec).await;
-        assert_eq!(descifrar(&cifrado, &id).await, datos);
+    async fn round_trip_with_bulk_data() {
+        // Forces age to emit several AEAD blocks, not just one.
+        let (rec, id) = key_pair();
+        let data: Vec<u8> = (0..300_000_u32).map(|i| (i % 251) as u8).collect();
+        let encrypted = encrypt(&data, &rec).await;
+        assert_eq!(decrypt(&encrypted, &id).await, data);
     }
 
     #[tokio::test]
-    async fn una_identidad_ajena_no_puede_descifrar() {
-        let (rec, _id) = par_de_claves();
-        let (_, otra) = par_de_claves();
-        let cifrado = cifrar(b"secreto", &rec).await;
-        assert!(decrypt_from(&cifrado[..], &otra).await.is_err());
+    async fn a_foreign_identity_cannot_decrypt() {
+        let (rec, _id) = key_pair();
+        let (_, other) = key_pair();
+        let encrypted = encrypt(b"secret", &rec).await;
+        assert!(decrypt_from(&encrypted[..], &other).await.is_err());
     }
 
     #[tokio::test]
-    async fn un_ciphertext_manipulado_falla_al_leer() {
-        let (rec, id) = par_de_claves();
-        let mut cifrado = cifrar(&vec![9_u8; 100_000], &rec).await;
-        let ultimo = cifrado.len() - 1;
-        cifrado[ultimo] ^= 0xff;
+    async fn a_tampered_ciphertext_fails_on_read() {
+        let (rec, id) = key_pair();
+        let mut encrypted = encrypt(&vec![9_u8; 100_000], &rec).await;
+        let last = encrypted.len() - 1;
+        encrypted[last] ^= 0xff;
 
-        let mut r = decrypt_from(&cifrado[..], &id).await.unwrap();
+        let mut r = decrypt_from(&encrypted[..], &id).await.unwrap();
         let mut out = Vec::new();
-        // AEAD: la manipulación se detecta al leer, no al abrir.
+        // AEAD: tampering is detected on read, not on open.
         assert!(r.read_to_end(&mut out).await.is_err());
     }
 
     #[tokio::test]
-    async fn un_ciphertext_truncado_falla() {
-        let (rec, id) = par_de_claves();
-        let mut cifrado = cifrar(&vec![4_u8; 200_000], &rec).await;
-        cifrado.truncate(cifrado.len() / 2);
+    async fn a_truncated_ciphertext_fails() {
+        let (rec, id) = key_pair();
+        let mut encrypted = encrypt(&vec![4_u8; 200_000], &rec).await;
+        encrypted.truncate(encrypted.len() / 2);
 
-        let resultado = async {
-            let mut r = decrypt_from(&cifrado[..], &id).await?;
+        let result = async {
+            let mut r = decrypt_from(&encrypted[..], &id).await?;
             let mut out = Vec::new();
             r.read_to_end(&mut out).await?;
             Ok::<_, Box<dyn std::error::Error>>(out)
         }
         .await;
         assert!(
-            resultado.is_err(),
-            "un artefacto truncado nunca debe leerse como válido"
+            result.is_err(),
+            "a truncated artifact must never read as valid"
         );
     }
 
     #[test]
-    fn un_recipient_se_parsea_desde_su_forma_textual() {
-        let (rec, _) = par_de_claves();
-        let texto = rec.to_string();
-        assert!(texto.starts_with("age1"));
-        assert_eq!(Recipient::parse(&texto).unwrap().to_string(), texto);
+    fn a_recipient_parses_from_its_textual_form() {
+        let (rec, _) = key_pair();
+        let text = rec.to_string();
+        assert!(text.starts_with("age1"));
+        assert_eq!(Recipient::parse(&text).unwrap().to_string(), text);
     }
 
     #[test]
-    fn un_recipient_invalido_se_rechaza() {
-        assert!(Recipient::parse("esto-no-es-un-recipient").is_err());
+    fn an_invalid_recipient_is_rejected() {
+        assert!(Recipient::parse("this-is-not-a-recipient").is_err());
         assert!(Recipient::parse("").is_err());
     }
 
     #[test]
-    fn una_identidad_da_la_vuelta_por_su_forma_textual() {
+    fn an_identity_round_trips_through_its_textual_form() {
         let id = Identity::generate();
-        let publica = id.to_recipient().to_string();
-        let texto = id.to_secret_string();
-        assert!(texto.expose().starts_with("AGE-SECRET-KEY-1"));
+        let public = id.to_recipient().to_string();
+        let text = id.to_secret_string();
+        assert!(text.expose().starts_with("AGE-SECRET-KEY-1"));
 
-        let leida = Identity::parse(texto.expose()).unwrap();
+        let read_back = Identity::parse(text.expose()).unwrap();
         assert_eq!(
-            leida.to_recipient().to_string(),
-            publica,
-            "la identidad leída debe ser la misma que se escribió"
+            read_back.to_recipient().to_string(),
+            public,
+            "the identity read back must be the one that was written"
         );
     }
 
     #[test]
-    fn un_fichero_de_clave_con_comentarios_se_lee_igual() {
-        // Es exactamente lo que escribe `age-keygen`: dos líneas de comentario
-        // con la fecha y la clave pública, y luego la clave.
+    fn a_key_file_with_comments_reads_the_same() {
+        // This is exactly what `age-keygen` writes: two comment lines with the
+        // date and the public key, and then the key itself.
         let id = Identity::generate();
-        let fichero = format!(
+        let file = format!(
             "# created: 2026-08-21T10:00:00Z\n# public key: {}\n{}\n",
             id.to_recipient(),
             id.to_secret_string().expose()
         );
         assert_eq!(
-            Identity::parse(&fichero)
-                .unwrap()
-                .to_recipient()
-                .to_string(),
+            Identity::parse(&file).unwrap().to_recipient().to_string(),
             id.to_recipient().to_string()
         );
     }
 
     #[test]
-    fn una_identidad_invalida_se_rechaza_sin_delatar_su_contenido() {
-        for malo in ["", "# solo comentarios\n", "AGE-SECRET-KEY-1NOESVALIDA"] {
-            // `unwrap_err` exigiría `Debug` en `Identity`, que no lo tiene a
-            // propósito. `err()` no exige nada del lado correcto.
-            let error = Identity::parse(malo).err().unwrap();
-            assert!(matches!(error, AgeError::IdentidadInvalida));
+    fn an_invalid_identity_is_rejected_without_leaking_its_contents() {
+        for bad in ["", "# only comments\n", "AGE-SECRET-KEY-1NOTVALID"] {
+            // `unwrap_err` would require `Debug` on `Identity`, which it
+            // deliberately does not have. `err()` requires nothing of the ok
+            // side.
+            let error = Identity::parse(bad).err().unwrap();
+            assert!(matches!(error, AgeError::InvalidIdentity));
             assert!(
-                !error.to_string().contains("AGE-SECRET-KEY-1NOESVALIDA"),
-                "el error no puede repetir lo que se le dio: era una clave privada"
+                !error.to_string().contains("AGE-SECRET-KEY-1NOTVALID"),
+                "the error must not repeat what it was given: it was a private key"
             );
         }
     }
 
     #[test]
-    fn una_clave_publica_no_cuela_como_identidad() {
-        // El error de teclado más probable: pasar el `.pub` en vez de la clave.
+    fn a_public_key_does_not_pass_as_an_identity() {
+        // The likeliest typo: passing the `.pub` instead of the key.
         let id = Identity::generate();
         assert!(Identity::parse(&id.to_recipient().to_string()).is_err());
     }

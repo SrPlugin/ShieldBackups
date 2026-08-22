@@ -1,4 +1,4 @@
-//! Composición de las tres capas: `zstd → age → SHA-256`.
+//! Composition of the three layers: `zstd → age → SHA-256`.
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -9,12 +9,12 @@ use crate::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
-    #[error("error de E/S: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Age(#[from] AgeError),
-    #[error("el digest no coincide: esperado {esperado}, obtenido {obtenido}")]
-    DigestNoCoincide { esperado: String, obtenido: String },
+    #[error("digest mismatch: expected {expected}, got {actual}")]
+    DigestMismatch { expected: String, actual: String },
 }
 
 pub struct BackupOptions {
@@ -22,7 +22,7 @@ pub struct BackupOptions {
     pub level: CompressionLevel,
 }
 
-/// Lo que hay que guardar en el manifiesto para poder verificar y restaurar.
+/// What has to be stored in the manifest in order to verify and restore later.
 #[derive(Debug, Clone, Copy)]
 pub struct BackupSummary {
     pub plaintext_bytes: u64,
@@ -31,22 +31,22 @@ pub struct BackupSummary {
     pub ciphertext_sha256: Digest,
 }
 
-/// Lee de `source`, comprime, cifra, hashea y escribe en `sink`.
+/// Reads from `source`, compresses, encrypts, hashes and writes to `sink`.
 ///
-/// La memoria usada es constante e independiente del tamaño de la entrada.
+/// Memory usage is constant and independent of the size of the input.
 ///
-/// El orden de las capas es `zstd → age → SHA-256`: se hashea el texto
-/// cifrado, de modo que un artefacto se puede verificar en el destino sin
-/// disponer de la clave privada.
+/// The layer order is `zstd → age → SHA-256`: it is the ciphertext that gets
+/// hashed, so an artifact can be verified at the target without having the
+/// private key.
 ///
-/// El orden de **cierre** es igual de importante y es la razón del bloque
-/// anidado: zstd debe emitir su frame final dentro de la capa age, y age debe
-/// cerrar su último bloque AEAD antes de que se cuente el último byte
-/// hasheado. Invertirlo produce un artefacto truncado cuyo fallo no aparece
-/// hasta el restore.
+/// The **shutdown** order matters just as much, and it is the reason for the
+/// nested block: zstd must emit its final frame inside the age layer, and age
+/// must close its last AEAD block before the last hashed byte is counted.
+/// Reversing that produces a truncated artifact whose failure does not surface
+/// until the restore.
 ///
 /// # Errors
-/// Devuelve error si falla la lectura, el cifrado o la escritura.
+/// Returns an error if reading, encrypting or writing fails.
 pub async fn backup<R, W>(
     source: R,
     sink: W,
@@ -56,22 +56,22 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut fuente = Sha256Reader::new(source);
+    let mut hashed_source = Sha256Reader::new(source);
     let mut hasher = Sha256Writer::new(sink);
 
     let plaintext_bytes = {
-        let cifrador = encrypt_to(&mut hasher, &opts.recipient).await?;
-        let mut compresor = compressor(cifrador, opts.level);
+        let encryptor = encrypt_to(&mut hasher, &opts.recipient).await?;
+        let mut encoder = compressor(encryptor, opts.level);
 
-        let copiados = tokio::io::copy(&mut fuente, &mut compresor).await?;
+        let copied = tokio::io::copy(&mut hashed_source, &mut encoder).await?;
 
-        // Cierre en orden: primero zstd (emite su frame final dentro de age),
-        // después age (cierra el bloque AEAD y escribe al hasher).
-        compresor.shutdown().await?;
-        let mut cifrador = compresor.into_inner();
-        cifrador.shutdown().await?;
+        // Shut down in order: zstd first (it emits its final frame inside age),
+        // then age (it closes the AEAD block and writes to the hasher).
+        encoder.shutdown().await?;
+        let mut encryptor = encoder.into_inner();
+        encryptor.shutdown().await?;
 
-        copiados
+        copied
     };
 
     hasher.shutdown().await?;
@@ -80,44 +80,44 @@ where
     Ok(BackupSummary {
         plaintext_bytes,
         ciphertext_bytes,
-        plaintext_sha256: fuente.digest(),
+        plaintext_sha256: hashed_source.digest(),
         ciphertext_sha256,
     })
 }
 
 pub struct RestoreOptions<'a> {
     pub identity: &'a Identity,
-    /// Si se aporta, se comprueba contra el digest del artefacto leído y el
-    /// restore falla si no coincide.
+    /// If supplied, it is checked against the digest of the artifact that was
+    /// read, and the restore fails when they do not match.
     pub expected_ciphertext_sha256: Option<Digest>,
 }
 
-/// Lee un artefacto de `source`, descifra, descomprime y escribe en `sink`.
+/// Reads an artifact from `source`, decrypts, decompresses and writes to `sink`.
 ///
-/// # Integridad, y por qué hacen falta dos comprobaciones
+/// # Integrity, and why two checks are needed
 ///
-/// El AEAD de age verifica cada bloque durante la lectura, así que un
-/// ciphertext manipulado falla al leer. La comprobación adicional del digest
-/// detecta algo distinto: que el destino haya servido un artefacto **diferente**
-/// del que registró el manifiesto.
+/// The age AEAD verifies every block as it is read, so a tampered ciphertext
+/// fails on read. The extra digest check catches something different: that the
+/// target served a **different** artifact from the one the manifest recorded.
 ///
-/// El digest solo se puede comprobar **después** de leer todo el flujo, porque
-/// hasta entonces no está completo. Para entonces `sink` ya ha recibido datos.
+/// The digest can only be checked **after** the whole stream has been read,
+/// because until then it is not complete. By that point `sink` has already
+/// received data.
 ///
-/// # Advertencia para quien consuma esta función
+/// # Warning for callers of this function
 ///
-/// age entrega los bloques AEAD ya verificados de forma incremental. Ante un
-/// artefacto truncado, la lectura falla **después** de haber escrito en `sink`
-/// todo lo que venía antes del corte — plaintext legítimo, pero parcial.
+/// age delivers already-verified AEAD blocks incrementally. Faced with a
+/// truncated artifact, the read fails **after** having written to `sink`
+/// everything that came before the cut — legitimate plaintext, but partial.
 ///
-/// Por tanto: **si esta función devuelve `Err`, hay que descartar todo lo
-/// escrito en `sink`, no solo dejar de escribir.** Quedarse con lo que llegó
-/// antes del fallo significa quedarse con media base de datos sin ninguna
-/// señal de que lo es.
+/// Therefore: **if this function returns `Err`, everything written to `sink`
+/// must be discarded, not merely no longer written to.** Keeping what arrived
+/// before the failure means keeping half a database with no sign that that is
+/// what it is.
 ///
 /// # Errors
-/// Devuelve error si el artefacto no está dirigido a `identity`, si está
-/// corrupto o truncado, o si el digest no coincide con el esperado.
+/// Returns an error if the artifact is not addressed to `identity`, if it is
+/// corrupt or truncated, or if the digest does not match the expected one.
 pub async fn restore<R, W>(
     source: R,
     sink: W,
@@ -127,46 +127,46 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut fuente = Sha256Reader::new(source);
+    let mut hashed_source = Sha256Reader::new(source);
     let mut sink = sink;
 
-    let escritos = {
-        let descifrador = decrypt_from(&mut fuente, opts.identity).await?;
-        let mut descompresor = decompressor(descifrador);
-        tokio::io::copy(&mut descompresor, &mut sink).await?
+    let written = {
+        let decryptor = decrypt_from(&mut hashed_source, opts.identity).await?;
+        let mut decoder = decompressor(decryptor);
+        tokio::io::copy(&mut decoder, &mut sink).await?
     };
     sink.flush().await?;
 
-    if let Some(esperado) = opts.expected_ciphertext_sha256 {
-        let obtenido = fuente.digest();
-        if obtenido != esperado {
-            return Err(PipelineError::DigestNoCoincide {
-                esperado: esperado.to_hex(),
-                obtenido: obtenido.to_hex(),
+    if let Some(expected) = opts.expected_ciphertext_sha256 {
+        let actual = hashed_source.digest();
+        if actual != expected {
+            return Err(PipelineError::DigestMismatch {
+                expected: expected.to_hex(),
+                actual: actual.to_hex(),
             });
         }
     }
 
-    Ok(escritos)
+    Ok(written)
 }
 
 #[cfg(test)]
-// Los `use` locales dentro de los tests son deliberados: acotan el trait de
-// extensión al bloque que lo necesita.
+// The local `use` statements inside the tests are deliberate: they scope the
+// extension trait to the block that needs it.
 #[allow(clippy::items_after_statements)]
 mod tests {
     use super::*;
     use crate::{CompressionLevel, Identity, Sha256Writer};
 
     #[tokio::test]
-    async fn produce_ambos_digests_y_los_tamanos() {
+    async fn produces_both_digests_and_the_sizes() {
         let id = Identity::generate();
-        let datos = b"contenido ".repeat(1000);
-        let mut destino = Vec::new();
+        let data = b"content ".repeat(1000);
+        let mut target = Vec::new();
 
-        let resumen = backup(
-            &datos[..],
-            &mut destino,
+        let summary = backup(
+            &data[..],
+            &mut target,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -175,38 +175,38 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resumen.plaintext_bytes, datos.len() as u64);
-        assert_eq!(resumen.ciphertext_bytes, destino.len() as u64);
-        assert_ne!(resumen.plaintext_sha256, resumen.ciphertext_sha256);
+        assert_eq!(summary.plaintext_bytes, data.len() as u64);
+        assert_eq!(summary.ciphertext_bytes, target.len() as u64);
+        assert_ne!(summary.plaintext_sha256, summary.ciphertext_sha256);
 
-        // El digest del ciphertext debe corresponder a lo que se escribió de verdad.
+        // The ciphertext digest must match what was actually written.
         use tokio::io::AsyncWriteExt;
         let mut w = Sha256Writer::new(Vec::new());
-        w.write_all(&destino).await.unwrap();
+        w.write_all(&target).await.unwrap();
         w.shutdown().await.unwrap();
-        assert_eq!(w.into_parts().1, resumen.ciphertext_sha256);
+        assert_eq!(w.into_parts().1, summary.ciphertext_sha256);
     }
 
     #[tokio::test]
-    async fn el_digest_del_plaintext_es_el_de_la_entrada() {
-        // Sin esto, `plaintext_sha256` podría ser cualquier cosa y nadie se
-        // enteraría: es el único dato del manifiesto que no se puede
-        // recalcular desde el artefacto sin la clave privada.
+    async fn the_plaintext_digest_is_the_digest_of_the_input() {
+        // Without this, `plaintext_sha256` could be anything and nobody would
+        // notice: it is the only value in the manifest that cannot be
+        // recomputed from the artifact without the private key.
         let id = Identity::generate();
-        let datos = b"entrada conocida".repeat(100);
+        let data = b"known input".repeat(100);
 
-        let mut esperado = Sha256Writer::new(Vec::new());
+        let mut expected = Sha256Writer::new(Vec::new());
         {
             use tokio::io::AsyncWriteExt;
-            esperado.write_all(&datos).await.unwrap();
-            esperado.shutdown().await.unwrap();
+            expected.write_all(&data).await.unwrap();
+            expected.shutdown().await.unwrap();
         }
-        let digest_esperado = esperado.into_parts().1;
+        let expected_digest = expected.into_parts().1;
 
-        let mut destino = Vec::new();
-        let resumen = backup(
-            &datos[..],
-            &mut destino,
+        let mut target = Vec::new();
+        let summary = backup(
+            &data[..],
+            &mut target,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -215,18 +215,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resumen.plaintext_sha256, digest_esperado);
+        assert_eq!(summary.plaintext_sha256, expected_digest);
     }
 
     #[tokio::test]
-    async fn el_artefacto_esta_comprimido_y_cifrado() {
+    async fn the_artifact_is_compressed_and_encrypted() {
         let id = Identity::generate();
-        let datos = vec![0_u8; 500_000];
-        let mut destino = Vec::new();
+        let data = vec![0_u8; 500_000];
+        let mut target = Vec::new();
 
         backup(
-            &datos[..],
-            &mut destino,
+            &data[..],
+            &mut target,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -236,23 +236,23 @@ mod tests {
         .unwrap();
 
         assert!(
-            destino.len() < 10_000,
-            "500 KB de ceros deben comprimirse muchísimo"
+            target.len() < 10_000,
+            "500 KB of zeros must compress enormously"
         );
         assert!(
-            !destino.windows(4).any(|w| w == [0, 0, 0, 0]),
-            "un artefacto cifrado no debe tener rachas largas de ceros"
+            !target.windows(4).any(|w| w == [0, 0, 0, 0]),
+            "an encrypted artifact must not contain long runs of zeros"
         );
     }
 
     #[tokio::test]
-    async fn funciona_con_entrada_vacia() {
+    async fn works_with_empty_input() {
         let id = Identity::generate();
-        let mut destino = Vec::new();
+        let mut target = Vec::new();
 
-        let resumen = backup(
+        let summary = backup(
             &b""[..],
-            &mut destino,
+            &mut target,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -261,23 +261,23 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resumen.plaintext_bytes, 0);
+        assert_eq!(summary.plaintext_bytes, 0);
         assert!(
-            !destino.is_empty(),
-            "debe emitirse cabecera age y frame zstd"
+            !target.is_empty(),
+            "an age header and a zstd frame must still be emitted"
         );
     }
 
     #[tokio::test]
-    async fn dos_backups_del_mismo_contenido_dan_el_mismo_digest_de_plaintext() {
-        // El ciphertext difiere entre ejecuciones (age usa una clave de fichero
-        // aleatoria), pero el digest del plano no puede depender de eso.
+    async fn two_backups_of_the_same_content_give_the_same_plaintext_digest() {
+        // The ciphertext differs between runs (age uses a random file key), but
+        // the plaintext digest must not depend on that.
         let id = Identity::generate();
-        let datos = b"contenido estable".repeat(50);
+        let data = b"stable content".repeat(50);
 
         let mut d1 = Vec::new();
         let r1 = backup(
-            &datos[..],
+            &data[..],
             &mut d1,
             &BackupOptions {
                 recipient: id.to_recipient(),
@@ -289,7 +289,7 @@ mod tests {
 
         let mut d2 = Vec::new();
         let r2 = backup(
-            &datos[..],
+            &data[..],
             &mut d2,
             &BackupOptions {
                 recipient: id.to_recipient(),
@@ -304,72 +304,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn el_nivel_de_compresion_llega_a_la_capa_zstd() {
-        // La entrada es deliberadamente grande y sólo parcialmente comprimible.
-        // Una versión anterior de este test usaba 90 KB de texto repetido y era
-        // intermitente: el artefacto quedaba en 300-400 bytes, donde la varianza
-        // del framing de zstd domina sobre la diferencia real entre niveles y la
-        // comparación se convertía en una moneda al aire. Con varios megabytes
-        // de contenido tipo dump, la diferencia entre nivel 1 y 19 es de órdenes
-        // muy superiores a ese ruido.
+    async fn the_compression_level_reaches_the_zstd_layer() {
+        // The input is deliberately large and only partly compressible. An
+        // earlier version of this test used 90 KB of repeated text and was
+        // flaky: the artifact came out at 300-400 bytes, where the variance of
+        // zstd's framing dominates the real difference between levels and the
+        // comparison turned into a coin flip. With several megabytes of
+        // dump-like content, the difference between level 1 and level 19 is
+        // orders of magnitude above that noise.
         let id = Identity::generate();
-        let datos = datos_tipo_dump(4 * 1024 * 1024);
+        let data = dump_like_data(4 * 1024 * 1024);
 
-        let comprimir_con = |nivel: i32| {
-            let datos = &datos;
+        let compress_at = |level: i32| {
+            let data = &data;
             let rec = id.to_recipient();
             async move {
-                let mut salida = Vec::new();
+                let mut out = Vec::new();
                 backup(
-                    &datos[..],
-                    &mut salida,
+                    &data[..],
+                    &mut out,
                     &BackupOptions {
                         recipient: rec,
-                        level: CompressionLevel::new(nivel).unwrap(),
+                        level: CompressionLevel::new(level).unwrap(),
                     },
                 )
                 .await
                 .unwrap();
-                salida.len()
+                out.len()
             }
         };
 
-        let bajo = comprimir_con(1).await;
-        let alto = comprimir_con(19).await;
+        let low = compress_at(1).await;
+        let high = compress_at(19).await;
 
         assert!(
-            alto < bajo,
-            "el nivel no está llegando a zstd: nivel 1 dio {bajo} bytes y nivel 19 dio {alto}"
+            high < low,
+            "the level is not reaching zstd: level 1 gave {low} bytes and level 19 gave {high}"
         );
     }
 
-    /// Contenido parecido a un dump de base de datos: vocabulario acotado y muy
-    /// repetitivo, pero con suficiente variación para que el nivel de
-    /// compresión cambie el resultado de forma medible.
-    fn datos_tipo_dump(bytes: usize) -> Vec<u8> {
-        let mut salida = Vec::with_capacity(bytes + 128);
+    /// Content resembling a database dump: a bounded, highly repetitive
+    /// vocabulary, but with enough variation for the compression level to
+    /// change the result measurably.
+    fn dump_like_data(bytes: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes + 128);
         let mut x: u32 = 0x1234_5678;
-        while salida.len() < bytes {
+        while out.len() < bytes {
             x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let n = x % 10_000;
-            salida.extend_from_slice(
-                format!("INSERT INTO clientes VALUES ({n}, 'cliente-{n}', '2026-08-21');\n")
+            out.extend_from_slice(
+                format!("INSERT INTO customers VALUES ({n}, 'customer-{n}', '2026-08-21');\n")
                     .as_bytes(),
             );
         }
-        salida.truncate(bytes);
-        salida
+        out.truncate(bytes);
+        out
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_completa() {
+    async fn full_round_trip() {
         let id = Identity::generate();
-        let datos = b"cualquier contenido de base de datos ".repeat(2000);
+        let data = b"any database content whatsoever ".repeat(2000);
 
-        let mut artefacto = Vec::new();
-        let resumen = backup(
-            &datos[..],
-            &mut artefacto,
+        let mut artifact = Vec::new();
+        let summary = backup(
+            &data[..],
+            &mut artifact,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -378,30 +378,30 @@ mod tests {
         .await
         .unwrap();
 
-        let mut restaurado = Vec::new();
+        let mut restored = Vec::new();
         restore(
-            &artefacto[..],
-            &mut restaurado,
+            &artifact[..],
+            &mut restored,
             &RestoreOptions {
                 identity: &id,
-                expected_ciphertext_sha256: Some(resumen.ciphertext_sha256),
+                expected_ciphertext_sha256: Some(summary.ciphertext_sha256),
             },
         )
         .await
         .unwrap();
 
-        assert_eq!(restaurado, datos);
+        assert_eq!(restored, data);
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_de_entrada_vacia() {
-        // El caso que revela un cierre de capa omitido: un artefacto truncado
-        // tiene forma correcta pero no restaura.
+    async fn round_trip_of_empty_input() {
+        // The case that exposes a skipped layer shutdown: a truncated artifact
+        // has the right shape but does not restore.
         let id = Identity::generate();
-        let mut artefacto = Vec::new();
-        let resumen = backup(
+        let mut artifact = Vec::new();
+        let summary = backup(
             &b""[..],
-            &mut artefacto,
+            &mut artifact,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -410,64 +410,64 @@ mod tests {
         .await
         .unwrap();
 
-        let mut restaurado = Vec::new();
-        let escritos = restore(
-            &artefacto[..],
-            &mut restaurado,
+        let mut restored = Vec::new();
+        let written = restore(
+            &artifact[..],
+            &mut restored,
             &RestoreOptions {
                 identity: &id,
-                expected_ciphertext_sha256: Some(resumen.ciphertext_sha256),
+                expected_ciphertext_sha256: Some(summary.ciphertext_sha256),
             },
         )
         .await
         .unwrap();
 
-        assert_eq!(escritos, 0);
-        assert!(restaurado.is_empty());
+        assert_eq!(written, 0);
+        assert!(restored.is_empty());
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_con_volumen_y_varios_niveles() {
-        // Fuerza varios bloques AEAD y varios frames zstd.
+    async fn round_trip_with_bulk_data_at_several_levels() {
+        // Forces several AEAD blocks and several zstd frames.
         let id = Identity::generate();
-        let datos: Vec<u8> = (0..400_000_u32).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..400_000_u32).map(|i| (i % 251) as u8).collect();
 
-        for nivel in [1_i32, 3, 19] {
-            let mut artefacto = Vec::new();
-            let resumen = backup(
-                &datos[..],
-                &mut artefacto,
+        for level in [1_i32, 3, 19] {
+            let mut artifact = Vec::new();
+            let summary = backup(
+                &data[..],
+                &mut artifact,
                 &BackupOptions {
                     recipient: id.to_recipient(),
-                    level: CompressionLevel::new(nivel).unwrap(),
+                    level: CompressionLevel::new(level).unwrap(),
                 },
             )
             .await
             .unwrap();
 
-            let mut restaurado = Vec::new();
+            let mut restored = Vec::new();
             restore(
-                &artefacto[..],
-                &mut restaurado,
+                &artifact[..],
+                &mut restored,
                 &RestoreOptions {
                     identity: &id,
-                    expected_ciphertext_sha256: Some(resumen.ciphertext_sha256),
+                    expected_ciphertext_sha256: Some(summary.ciphertext_sha256),
                 },
             )
             .await
             .unwrap();
 
-            assert_eq!(restaurado, datos, "falló con nivel {nivel}");
+            assert_eq!(restored, data, "failed at level {level}");
         }
     }
 
     #[tokio::test]
-    async fn un_digest_que_no_coincide_aborta_el_restore() {
+    async fn a_digest_that_does_not_match_aborts_the_restore() {
         let id = Identity::generate();
-        let mut artefacto = Vec::new();
+        let mut artifact = Vec::new();
         backup(
-            &b"datos"[..],
-            &mut artefacto,
+            &b"data"[..],
+            &mut artifact,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -476,32 +476,32 @@ mod tests {
         .await
         .unwrap();
 
-        let falso =
+        let bogus =
             Digest::from_hex("0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap();
 
-        let mut restaurado = Vec::new();
+        let mut restored = Vec::new();
         let err = restore(
-            &artefacto[..],
-            &mut restaurado,
+            &artifact[..],
+            &mut restored,
             &RestoreOptions {
                 identity: &id,
-                expected_ciphertext_sha256: Some(falso),
+                expected_ciphertext_sha256: Some(bogus),
             },
         )
         .await
         .unwrap_err();
 
-        assert!(matches!(err, PipelineError::DigestNoCoincide { .. }));
+        assert!(matches!(err, PipelineError::DigestMismatch { .. }));
     }
 
     #[tokio::test]
-    async fn un_artefacto_truncado_falla() {
+    async fn a_truncated_artifact_fails() {
         let id = Identity::generate();
-        let mut artefacto = Vec::new();
+        let mut artifact = Vec::new();
         backup(
             &vec![3_u8; 200_000][..],
-            &mut artefacto,
+            &mut artifact,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -510,13 +510,13 @@ mod tests {
         .await
         .unwrap();
 
-        artefacto.truncate(artefacto.len() / 2);
+        artifact.truncate(artifact.len() / 2);
 
-        let mut restaurado = Vec::new();
+        let mut restored = Vec::new();
         assert!(
             restore(
-                &artefacto[..],
-                &mut restaurado,
+                &artifact[..],
+                &mut restored,
                 &RestoreOptions {
                     identity: &id,
                     expected_ciphertext_sha256: None,
@@ -528,13 +528,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn una_identidad_ajena_no_puede_restaurar() {
+    async fn a_foreign_identity_cannot_restore() {
         let id = Identity::generate();
-        let intrusa = Identity::generate();
-        let mut artefacto = Vec::new();
+        let intruder = Identity::generate();
+        let mut artifact = Vec::new();
         backup(
-            &b"secreto"[..],
-            &mut artefacto,
+            &b"secret"[..],
+            &mut artifact,
             &BackupOptions {
                 recipient: id.to_recipient(),
                 level: CompressionLevel::default(),
@@ -543,13 +543,13 @@ mod tests {
         .await
         .unwrap();
 
-        let mut restaurado = Vec::new();
+        let mut restored = Vec::new();
         assert!(
             restore(
-                &artefacto[..],
-                &mut restaurado,
+                &artifact[..],
+                &mut restored,
                 &RestoreOptions {
-                    identity: &intrusa,
+                    identity: &intruder,
                     expected_ciphertext_sha256: None,
                 }
             )

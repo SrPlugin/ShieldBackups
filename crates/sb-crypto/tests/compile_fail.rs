@@ -1,22 +1,22 @@
-//! Garantías que se comprueban por *ausencia* de compilación.
+//! Guarantees checked by the *absence* of compilation.
 //!
-//! `Secret<T>` e `Identity` no implementan `Debug` ni `Display` a propósito:
-//! intentar imprimir una credencial debe ser un error de compilación, no una
-//! línea de log. Un test normal no puede verificar eso — solo puede ejecutar
-//! código que sí compila.
+//! `Secret<T>` and `Identity` deliberately implement neither `Debug` nor
+//! `Display`: trying to print a credential must be a compile error, not a log
+//! line. An ordinary test cannot verify that — it can only run code that does
+//! compile.
 //!
-//! `trybuild` compila cada archivo de `tests/ui/` y exige que falle con
-//! exactamente el error registrado en su `.stderr`. Si alguien añadiera
-//! `#[derive(Debug)]` a cualquiera de los dos tipos, este test se pondría rojo.
+//! `trybuild` compiles every file under `tests/ui/` and requires it to fail
+//! with exactly the error recorded in its `.stderr`. If someone were to add
+//! `#[derive(Debug)]` to either type, this test would go red.
 //!
-//! Para regenerar los `.stderr` tras un cambio legítimo:
+//! To regenerate the `.stderr` files after a legitimate change:
 //!
 //! ```sh
 //! TRYBUILD=overwrite cargo test -p sb-crypto --test compile_fail
 //! ```
 
 #[test]
-fn imprimir_una_credencial_no_compila() {
+fn printing_a_credential_does_not_compile() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/*.rs");
 }

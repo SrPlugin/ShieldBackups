@@ -3,22 +3,22 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use async_compression::tokio::write::ZstdEncoder;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 
-/// Nivel de compresión zstd válido (1..=22).
+/// A valid zstd compression level (1..=22).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressionLevel(i32);
 
 #[derive(Debug, thiserror::Error)]
-#[error("nivel de compresión {0} fuera de rango: debe estar entre 1 y 22")]
+#[error("compression level {0} is out of range: it must be between 1 and 22")]
 pub struct InvalidLevel(i32);
 
 impl CompressionLevel {
     /// # Errors
-    /// Devuelve `InvalidLevel` si el nivel está fuera del rango 1..=22.
-    pub fn new(nivel: i32) -> Result<Self, InvalidLevel> {
-        if (1..=22).contains(&nivel) {
-            Ok(Self(nivel))
+    /// Returns `InvalidLevel` if the level falls outside the range 1..=22.
+    pub fn new(level: i32) -> Result<Self, InvalidLevel> {
+        if (1..=22).contains(&level) {
+            Ok(Self(level))
         } else {
-            Err(InvalidLevel(nivel))
+            Err(InvalidLevel(level))
         }
     }
 
@@ -29,31 +29,31 @@ impl CompressionLevel {
 }
 
 impl Default for CompressionLevel {
-    /// Nivel 3: el punto donde zstd deja de ser gratis pero todavía es rápido.
-    /// Subirlo cuesta CPU en el servidor de base de datos, que suele importar
-    /// más que los megabytes ahorrados.
+    /// Level 3: the point where zstd stops being free but is still fast. Going
+    /// higher costs CPU on the database server, which usually matters more than
+    /// the megabytes saved.
     fn default() -> Self {
         Self(3)
     }
 }
 
-/// Envuelve un sumidero para que lo escrito en él salga comprimido.
+/// Wraps a sink so that whatever is written to it comes out compressed.
 ///
-/// **Hay que llamar a `shutdown()`** sobre el valor devuelto para que se emita
-/// el frame final de zstd. Sin eso el artefacto queda truncado, y el fallo no
-/// aparece hasta que alguien intenta restaurarlo.
+/// **You must call `shutdown()`** on the returned value so that zstd emits its
+/// final frame. Without that the artifact is truncated, and the failure does
+/// not surface until someone tries to restore it.
 #[must_use]
-pub fn compressor<W: AsyncWrite + Unpin>(sink: W, nivel: CompressionLevel) -> ZstdEncoder<W> {
-    ZstdEncoder::with_quality(sink, Level::Precise(nivel.get()))
+pub fn compressor<W: AsyncWrite + Unpin>(sink: W, level: CompressionLevel) -> ZstdEncoder<W> {
+    ZstdEncoder::with_quality(sink, Level::Precise(level.get()))
 }
 
-/// Envuelve una fuente comprimida para leerla descomprimida.
+/// Wraps a compressed source so it reads back decompressed.
 #[must_use]
 pub fn decompressor<R: AsyncRead + Unpin>(source: R) -> ZstdDecoder<BufReader<R>> {
     ZstdDecoder::new(BufReader::new(source))
 }
 
-/// Igual que [`decompressor`] pero para fuentes que ya están bufferizadas.
+/// Same as [`decompressor`] but for sources that are already buffered.
 #[must_use]
 pub fn decompressor_buffered<R: AsyncBufRead + Unpin>(source: R) -> ZstdDecoder<R> {
     ZstdDecoder::new(source)
@@ -64,65 +64,65 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn comprimir(datos: &[u8], nivel: CompressionLevel) -> Vec<u8> {
-        let mut enc = compressor(Vec::new(), nivel);
-        enc.write_all(datos).await.unwrap();
+    async fn compress(data: &[u8], level: CompressionLevel) -> Vec<u8> {
+        let mut enc = compressor(Vec::new(), level);
+        enc.write_all(data).await.unwrap();
         enc.shutdown().await.unwrap();
         enc.into_inner()
     }
 
-    async fn descomprimir(datos: &[u8]) -> Vec<u8> {
-        let mut dec = decompressor(datos);
+    async fn decompress(data: &[u8]) -> Vec<u8> {
+        let mut dec = decompressor(data);
         let mut out = Vec::new();
         dec.read_to_end(&mut out).await.unwrap();
         out
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_con_datos_normales() {
-        let datos = b"contenido de prueba repetido ".repeat(500);
-        let comprimido = comprimir(&datos, CompressionLevel::default()).await;
-        assert_eq!(descomprimir(&comprimido).await, datos);
+    async fn round_trip_with_ordinary_data() {
+        let data = b"repeated test content ".repeat(500);
+        let compressed = compress(&data, CompressionLevel::default()).await;
+        assert_eq!(decompress(&compressed).await, data);
     }
 
     #[tokio::test]
-    async fn ida_y_vuelta_con_cero_bytes() {
-        // Este es el caso que revienta si se olvida el shutdown(): sin frame
-        // final, el descompresor no encuentra nada que leer.
-        let comprimido = comprimir(b"", CompressionLevel::default()).await;
+    async fn round_trip_with_zero_bytes() {
+        // This is the case that blows up if shutdown() is forgotten: with no
+        // final frame, the decompressor finds nothing to read.
+        let compressed = compress(b"", CompressionLevel::default()).await;
         assert!(
-            !comprimido.is_empty(),
-            "zstd debe emitir un frame aunque no haya datos"
+            !compressed.is_empty(),
+            "zstd must emit a frame even when there is no data"
         );
-        assert_eq!(descomprimir(&comprimido).await, b"");
+        assert_eq!(decompress(&compressed).await, b"");
     }
 
     #[tokio::test]
-    async fn datos_repetitivos_se_comprimen_de_verdad() {
-        let datos = vec![0_u8; 1_000_000];
-        let comprimido = comprimir(&datos, CompressionLevel::default()).await;
+    async fn repetitive_data_really_gets_compressed() {
+        let data = vec![0_u8; 1_000_000];
+        let compressed = compress(&data, CompressionLevel::default()).await;
         assert!(
-            comprimido.len() < datos.len() / 100,
-            "1 MB de ceros debe quedar en muy poco"
+            compressed.len() < data.len() / 100,
+            "1 MB of zeros must shrink to almost nothing"
         );
     }
 
     #[tokio::test]
-    async fn un_nivel_alto_comprime_al_menos_tanto_como_uno_bajo() {
-        let datos = b"texto con algo de estructura y repeticion ".repeat(2000);
-        let bajo = comprimir(&datos, CompressionLevel::new(1).unwrap()).await;
-        let alto = comprimir(&datos, CompressionLevel::new(19).unwrap()).await;
+    async fn a_high_level_compresses_at_least_as_well_as_a_low_one() {
+        let data = b"text with some structure and repetition ".repeat(2000);
+        let low = compress(&data, CompressionLevel::new(1).unwrap()).await;
+        let high = compress(&data, CompressionLevel::new(19).unwrap()).await;
         assert!(
-            alto.len() <= bajo.len(),
-            "nivel 19 no debería comprimir peor que nivel 1"
+            high.len() <= low.len(),
+            "level 19 should not compress worse than level 1"
         );
-        // Y ambos deben descomprimirse al mismo original.
-        assert_eq!(descomprimir(&bajo).await, datos);
-        assert_eq!(descomprimir(&alto).await, datos);
+        // And both must decompress back to the same original.
+        assert_eq!(decompress(&low).await, data);
+        assert_eq!(decompress(&high).await, data);
     }
 
     #[test]
-    fn el_nivel_se_valida_al_construirlo() {
+    fn the_level_is_validated_on_construction() {
         assert!(CompressionLevel::new(3).is_ok());
         assert!(CompressionLevel::new(1).is_ok());
         assert!(CompressionLevel::new(22).is_ok());
@@ -132,12 +132,12 @@ mod tests {
     }
 
     #[test]
-    fn el_nivel_por_defecto_es_valido_y_moderado() {
+    fn the_default_level_is_valid_and_moderate() {
         let d = CompressionLevel::default();
         assert!(CompressionLevel::new(d.get()).is_ok());
         assert!(
             (1..=9).contains(&d.get()),
-            "el defecto debe ser rápido, no máximo"
+            "the default must be fast, not maximal"
         );
     }
 }
