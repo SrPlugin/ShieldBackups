@@ -98,7 +98,7 @@ compressed** (what an image pull actually transfers). Where it goes:
 Two thirds of the image is the PostgreSQL client and the Debian base — the
 price of being able to choose the `pg_dump` version. Dropping
 `sb-plugin-mock` from a production image saves 5.4 MB; it is kept here because
-it is what `deploy/verificar-imagen.sh` exercises.
+it is what `deploy/verify-image.sh` exercises.
 
 ## What is inside
 
@@ -709,7 +709,7 @@ docker run --rm --init ... shieldbk:0.1.0 \
 
 ## Verifying the image
 
-`deploy/verificar-imagen.sh` builds the image and runs the complete cycle
+`deploy/verify-image.sh` builds the image and runs the complete cycle
 inside a container against the mock plugin, with the destination on a Docker
 volume:
 
@@ -723,9 +723,9 @@ proves that the `--read-only` + `/tmp` `tmpfs` combination from the examples
 above actually works.
 
 ```bash
-./deploy/verificar-imagen.sh                # build, then verify
-./deploy/verificar-imagen.sh --sin-construir  # verify an existing image
-IMAGEN=shieldbk:0.1.0 ./deploy/verificar-imagen.sh --sin-construir
+./deploy/verify-image.sh                # build, then verify
+./deploy/verify-image.sh --no-build   # verify an existing image
+IMAGE=shieldbk:0.1.0 ./deploy/verify-image.sh --no-build
 ```
 
 Run it in CI after any change to the `Dockerfile`, to the plugin startup path,

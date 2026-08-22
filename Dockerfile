@@ -1,54 +1,54 @@
 # syntax=docker/dockerfile:1.7
 
-# Imagen de contenedor de ShieldBackups.
+# ShieldBackups container image.
 #
-# ── Por qué esta base final: `debian:*-slim` ─────────────────────────────────
+# -- Why this final base: `debian:*-slim` -------------------------------------
 #
-# La imagen tiene que traer `pg_dump`, y su versión mayor tiene que poder
-# elegirse (un `pg_dump` 15 contra un servidor 16 produce un volcado incompleto
-# **sin fallar**). Eso decide la base por sí solo:
+# The image has to ship `pg_dump`, and its major version has to be selectable (a
+# `pg_dump` 15 against a 16 server produces an incomplete dump **without
+# failing**). That settles the base on its own:
 #
-#   • `distroless` no tiene gestor de paquetes. Meter un cliente de PostgreSQL
-#     significa copiar a mano `pg_dump` y su árbol de bibliotecas —libpq, ssl,
-#     ldap, sasl, gssapi, krb5, com_err, keyutils, zlib, lz4, zstd…—, que cambia
-#     con cada versión mayor de PostgreSQL y con cada actualización de Debian.
-#     Se rompe en silencio y en producción. Se descarta.
-#   • `alpine` + musl sí tiene `postgresql*-client`, pero **la versión mayor
-#     disponible la fija la release de Alpine**: elegir PostgreSQL 15 obligaría
-#     a congelar Alpine 3.18. Es justo el grado de libertad que necesitamos.
-#     Además `aws-lc-sys` (rustls, vía el SDK de S3) y `ring` compilan mal o
-#     lento contra musl, y el asignador de musl penaliza cargas con varios hilos
-#     y mucha reserva/liberación, que es exactamente lo que hace el troceador
-#     multipart. Se descarta.
-#   • `debian:bookworm-slim` + el repositorio oficial PGDG da
-#     `postgresql-client-{13..18}` sobre una base estable, con parches de
-#     seguridad y con glibc. `--build-arg PG_MAJOR=` elige la versión.
+#   * `distroless` has no package manager. Putting a PostgreSQL client in it
+#     means copying `pg_dump` and its library tree by hand -- libpq, ssl, ldap,
+#     sasl, gssapi, krb5, com_err, keyutils, zlib, lz4, zstd... -- which changes
+#     with every PostgreSQL major version and with every Debian update. It
+#     breaks silently and in production. Discarded.
+#   * `alpine` + musl does have `postgresql*-client`, but **the available major
+#     version is fixed by the Alpine release**: choosing PostgreSQL 15 would
+#     force freezing Alpine 3.18. That is exactly the degree of freedom we need.
+#     Besides, `aws-lc-sys` (rustls, via the S3 SDK) and `ring` compile badly or
+#     slowly against musl, and musl's allocator penalises workloads with several
+#     threads and a lot of allocation/deallocation, which is exactly what the
+#     multipart chunker does. Discarded.
+#   * `debian:bookworm-slim` + the official PGDG repository gives
+#     `postgresql-client-{13..18}` on a stable base, with security patches and
+#     with glibc. `--build-arg PG_MAJOR=` picks the version.
 #
-# Por lo mismo **no se compila estático**: el binario estático no ahorra nada
-# aquí, porque la imagen necesita un gestor de paquetes y un `pg_dump` enlazado
-# dinámicamente de todas formas.
+# For the same reason it is **not compiled statically**: a static binary saves
+# nothing here, because the image needs a package manager and a dynamically
+# linked `pg_dump` anyway.
 
 ARG RUST_VERSION=1.92
 ARG DEBIAN_SUITE=bookworm
-# Versión mayor de PostgreSQL cuyo cliente se instala. **Debe ser >= la del
-# servidor que se respalda.** Ver `deploy/README.md`.
+# PostgreSQL major version whose client gets installed. **Must be >= that of the
+# server being backed up.** See `deploy/README.md`.
 ARG PG_MAJOR=17
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 0: base de compilación con `cargo-chef`.
+# -----------------------------------------------------------------------------
+# Stage 0: build base with `cargo-chef`.
 #
-# El orden de capas es el asunto de esta etapa. Sin `cargo-chef`, un `COPY . .`
-# seguido de `cargo build` invalida la capa entera con cada cambio de una línea
-# de código y recompila las ~500 dependencias del árbol (el SDK de AWS y
-# `aws-lc-sys` solos son varios minutos). `cargo-chef` separa el problema: la
-# «receta» es un resumen de los manifiestos y del `Cargo.lock`, y solo cambia
-# cuando cambian las dependencias.
-# ─────────────────────────────────────────────────────────────────────────────
+# Layer ordering is what this stage is about. Without `cargo-chef`, a `COPY . .`
+# followed by `cargo build` invalidates the whole layer on every one-line code
+# change and recompiles the ~500 dependencies of the tree (the AWS SDK and
+# `aws-lc-sys` alone take several minutes). `cargo-chef` splits the problem: the
+# "recipe" is a summary of the manifests and of `Cargo.lock`, and only changes
+# when the dependencies change.
+# -----------------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-${DEBIAN_SUITE} AS chef
 
-# `cmake` lo exige `aws-lc-sys`, que entra por rustls a través del SDK de S3.
-# `protoc` NO hace falta: `sb-proto/build.rs` usa el que trae
+# `cmake` is required by `aws-lc-sys`, which comes in through rustls via the S3
+# SDK. `protoc` is NOT needed: `sb-proto/build.rs` uses the one shipped by
 # `protoc-bin-vendored`.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -59,60 +59,60 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo install cargo-chef --locked --version ^0.1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 1: la receta. Depende del código, pero su *salida* solo cambia si
-# cambian las dependencias, así que la etapa siguiente sí cachea.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Stage 1: the recipe. It depends on the code, but its *output* only changes if
+# the dependencies change, so the next stage does get cached.
+# -----------------------------------------------------------------------------
 FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path receta.json
+RUN cargo chef prepare --recipe-path recipe.json
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 2: compilación.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Stage 2: compilation.
+# -----------------------------------------------------------------------------
 FROM chef AS builder
 
-# Solo la receta. Mientras el `Cargo.lock` y los manifiestos no cambien, esta
-# capa y el `cook` que le sigue salen de la caché aunque se haya reescrito medio
-# proyecto.
-COPY --from=planner /app/receta.json receta.json
+# Only the recipe. As long as `Cargo.lock` and the manifests do not change, this
+# layer and the `cook` that follows it come from the cache even if half the
+# project has been rewritten.
+COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    cargo chef cook --release --workspace --recipe-path receta.json
+    cargo chef cook --release --workspace --recipe-path recipe.json
 
-# Ahora sí el código. Un cambio aquí recompila los nueve crates del workspace y
-# nada más.
+# Now the code itself. A change here recompiles the workspace's nine crates and
+# nothing else.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release --workspace \
       --bin shieldbk --bin sb-plugin-r2 --bin sb-plugin-mock
 
-# `strip` a mano en vez de tocar el `[profile.release]` del workspace: los
-# símbolos siguen estando en `target/` para depurar en local, y solo se van los
-# de la copia que viaja en la imagen.
+# `strip` by hand rather than touching the workspace's `[profile.release]`: the
+# symbols are still in `target/` for local debugging, and only those of the copy
+# that travels in the image go away.
 RUN strip /app/target/release/shieldbk \
           /app/target/release/sb-plugin-r2 \
           /app/target/release/sb-plugin-mock
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Etapa 3: la imagen final.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Stage 3: the final image.
+# -----------------------------------------------------------------------------
 FROM debian:${DEBIAN_SUITE}-slim AS runtime
 
 ARG DEBIAN_SUITE
 ARG PG_MAJOR
 
 LABEL org.opencontainers.image.title="shieldbk" \
-      org.opencontainers.image.description="Backups de bases de datos cifrados de extremo a extremo" \
+      org.opencontainers.image.description="End-to-end encrypted database backups" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/sebastianrcheikh/ShieldBackups"
 
-# `ca-certificates` no es opcional: sin él el plugin de R2 no valida el
-# certificado de Cloudflare y toda subida falla.
+# `ca-certificates` is not optional: without it the R2 plugin does not validate
+# Cloudflare's certificate and every upload fails.
 #
-# `gnupg` y `curl` solo sirven para dar de alta el repositorio PGDG y se van en
-# el mismo `RUN`, para que no queden en la capa.
+# `gnupg` and `curl` only serve to register the PGDG repository and go away in
+# the same `RUN`, so that they do not remain in the layer.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
@@ -126,15 +126,15 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     pg_dump --version
 
-# Usuario sin privilegios. UID fijo y alto para que un `runAsUser` de Kubernetes
-# pueda repetirlo y para que no choque con ningún usuario del sistema.
+# Unprivileged user. A fixed, high UID so that a Kubernetes `runAsUser` can
+# repeat it and so that it does not clash with any system user.
 RUN groupadd --system --gid 10001 shieldbk \
  && useradd --system --uid 10001 --gid 10001 \
             --home-dir /home/shieldbk --create-home --shell /usr/sbin/nologin shieldbk
 
-# Los plugins van en un directorio del sistema, propiedad de root y sin permiso
-# de escritura para nadie más. Esa es la mitad de la garantía de integridad; la
-# otra mitad es el lockfile que se genera más abajo.
+# The plugins go in a system directory, owned by root and with no write
+# permission for anybody else. That is half of the integrity guarantee; the
+# other half is the lockfile generated further down.
 COPY --from=builder --chown=root:root --chmod=0555 \
      /app/target/release/shieldbk /usr/local/bin/shieldbk
 COPY --from=builder --chown=root:root --chmod=0555 \
@@ -142,23 +142,23 @@ COPY --from=builder --chown=root:root --chmod=0555 \
 COPY --from=builder --chown=root:root --chmod=0555 \
      /app/target/release/sb-plugin-mock /usr/lib/shieldbk/plugins/sb-plugin-mock
 
-# ── `plugin lock` durante el build ───────────────────────────────────────────
+# -- `plugin lock` during the build -------------------------------------------
 #
-# Antes de arrancar un plugin, `shieldbk` comprueba su SHA-256 contra el
-# lockfile. Fuera del contenedor eso es un paso de instalación que alguien tiene
-# que ejecutar y repetir cada vez que actualiza un binario.
+# Before starting a plugin, `shieldbk` checks its SHA-256 against the lockfile.
+# Outside a container that is an installation step somebody has to run and
+# repeat every time they update a binary.
 #
-# Dentro del contenedor la relación se invierte y **el contenedor refuerza la
-# garantía en vez de estorbarla**: la imagen es inmutable, los tres binarios se
-# acaban de compilar en esta misma construcción, y el lockfile se sella aquí,
-# sobre exactamente esos bytes. A partir de este punto el hash y el binario
-# viajan juntos, firmados por el digest de la imagen. Cualquier arranque —el
-# primero incluido— verifica de verdad, sin que nadie tenga que acordarse de
-# nada, y un plugin sustituido en caliente (un volumen montado encima, un
-# `docker cp`) se detecta y se rechaza en el primer `backup`.
+# Inside the container the relationship is inverted and **the container
+# reinforces the guarantee instead of getting in its way**: the image is
+# immutable, the three binaries have just been compiled in this very build, and
+# the lockfile is sealed here, over exactly those bytes. From this point on the
+# hash and the binary travel together, signed by the image's digest. Any start
+# -- the first one included -- really verifies, without anybody having to
+# remember anything, and a plugin swapped at runtime (a volume mounted on top, a
+# `docker cp`) is detected and rejected on the first `backup`.
 #
-# La configuración de aquí es de usar y tirar y solo dice dónde están los
-# plugins: los comandos de `plugin` no necesitan ningún `[[target]]`.
+# The configuration here is throwaway and only says where the plugins are: the
+# `plugin` commands need no `[[target]]`.
 RUN set -eux; \
     printf '%s\n' \
       '[plugins]' \
@@ -171,11 +171,12 @@ RUN set -eux; \
     chmod 0444 /usr/lib/shieldbk/plugins.lock; \
     chown root:root /usr/lib/shieldbk/plugins.lock
 
-# `shieldbk` busca por defecto `~/.shieldbk/{config.toml,plugins,plugins.lock}`.
-# Estos enlaces hacen que los valores por defecto apunten a lo que la imagen
-# instala, de modo que un despliegue solo tenga que montar su configuración en
-# `/etc/shieldbk/config.toml` y no repetir la sección `[plugins]`. El directorio
-# es de root: el usuario `shieldbk` no puede cambiar a dónde apuntan.
+# `shieldbk` looks by default for
+# `~/.shieldbk/{config.toml,plugins,plugins.lock}`. These links make the
+# defaults point at what the image installs, so that a deployment only has to
+# mount its configuration at `/etc/shieldbk/config.toml` and not repeat the
+# `[plugins]` section. The directory belongs to root: the `shieldbk` user cannot
+# change where they point.
 RUN set -eux; \
     mkdir -p /etc/shieldbk /home/shieldbk/.shieldbk; \
     ln -s /usr/lib/shieldbk/plugins      /home/shieldbk/.shieldbk/plugins; \
@@ -184,17 +185,17 @@ RUN set -eux; \
     chown -R root:root /home/shieldbk/.shieldbk; \
     chmod 0755 /home/shieldbk/.shieldbk
 
-# Directorio de datos del usuario sin privilegios. Existe en la imagen —y no
-# solo en el volumen— para que un volumen con nombre montado aquí herede su
-# propietario: Docker copia dueño y permisos del directorio de la imagen, y sin
-# esto el volumen nacería de root y el proceso no podría escribir en él.
+# Data directory of the unprivileged user. It exists in the image -- and not
+# only in the volume -- so that a named volume mounted here inherits its owner:
+# Docker copies the owner and permissions of the image's directory, and without
+# this the volume would be born as root and the process could not write to it.
 RUN install -d -o 10001 -g 10001 -m 0750 /var/lib/shieldbk
 
-# El núcleo crea los sockets de control en `XDG_RUNTIME_DIR` si existe y, si no,
-# en el temporal del sistema. En un contenedor no hay `XDG_RUNTIME_DIR`, así que
-# **`/tmp` tiene que poder escribirse**: con `readOnlyRootFilesystem: true` hay
-# que montar ahí un `emptyDir`. Se declara explícito para que no sea una
-# sorpresa.
+# The core creates the control sockets in `XDG_RUNTIME_DIR` if it exists and, if
+# not, in the system's temporary directory. In a container there is no
+# `XDG_RUNTIME_DIR`, so **`/tmp` has to be writable**: with
+# `readOnlyRootFilesystem: true` an `emptyDir` has to be mounted there. It is
+# declared explicitly so that it is not a surprise.
 ENV XDG_RUNTIME_DIR=/tmp \
     HOME=/home/shieldbk \
     PATH=/usr/local/bin:/usr/bin:/bin
