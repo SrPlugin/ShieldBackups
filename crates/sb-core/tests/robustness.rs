@@ -50,14 +50,14 @@ fn safe_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A context with every field arbitrary: the name of the target, the engine and
+/// A context with every field arbitrary: the name of the target, the source and
 /// the storage come from the user's configuration, so they are external input
 /// just as much as the template.
 fn arbitrary_context() -> impl Strategy<Value = NamingContext> {
     (".*", ".*", ".*", ".*", ".*", ".*", ".*").prop_map(
-        |(target, engine, storage, timestamp, year, month, day)| NamingContext {
+        |(target, source, storage, timestamp, year, month, day)| NamingContext {
             target,
-            engine,
+            source,
             storage,
             timestamp,
             year,
@@ -132,10 +132,10 @@ proptest! {
         let json = serde_json::json!({
             "version": version,
             "target": string,
-            "engine": {
+            "source": {
                 "plugin": free_text,
                 "plugin_version": string,
-                "server_version": string,
+                "source_version": string,
             },
             "created_at": free_text,
             "artifact_key": string,
@@ -215,7 +215,7 @@ proptest! {
         template in prop::collection::vec(
             prop_oneof![
                 Just("{target}".to_owned()),
-                Just("{engine}".to_owned()),
+                Just("{source}".to_owned()),
                 Just("{storage}".to_owned()),
                 Just("{timestamp}".to_owned()),
                 Just("{yyyy}".to_owned()),

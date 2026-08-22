@@ -1,16 +1,29 @@
 //! Model of `shieldbk`'s TOML configuration.
 //!
-//! Two decisions govern this module:
+//! Three decisions govern this module:
 //!
-//! 1. **`engine_config` and `storage_config` are opaque to the core.** The core
+//! 1. **`source_config` and `storage_config` are opaque to the core.** The core
 //!    does not know what a database port or a bucket is: it keeps those tables as
 //!    generic key/value pairs ([`ConfigTable`]) and validates them later against
 //!    the schema each plugin declares over gRPC. Encoding the fields of a
-//!    specific engine here would mean recompiling the core to support a new
+//!    specific plugin here would mean recompiling the core to support a new
 //!    plugin, which is exactly what the plugin architecture avoids.
 //! 2. **A secret is never a literal.** A secret field is written as a reference
 //!    to its origin ([`SecretRef`]), so the configuration file —which is kept
 //!    under version control, copied and shared— contains no passwords.
+//! 3. **The role is called `source`, with no alias for the old `engine`.** The
+//!    keys were `engine` and `engine_config` up to 0.1.0. They were renamed
+//!    outright rather than accepted under `#[serde(alias = "engine")]`, and the
+//!    reason is that [`Target`] carries `deny_unknown_fields`: this model has
+//!    already decided that a name it does not recognize is an error, never
+//!    something to swallow. An alias would be the one exception to that rule,
+//!    and it would be permanent — an alias is a promise you keep, test and
+//!    document forever, and documenting two spellings teaches every new reader
+//!    that both exist. Renaming outright costs an old configuration one loud,
+//!    precise error naming the offending key; keeping the alias would cost
+//!    every future reader an ambiguity. The same argument applies to the
+//!    `{source}` placeholder in [`Defaults::artifact_template`], whose error
+//!    already lists the valid placeholders.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -115,27 +128,32 @@ impl Default for Defaults {
         Self {
             compression_level: DEFAULT_LEVEL,
             artifact_template:
-                "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age".to_owned(),
+                "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age".to_owned(),
         }
     }
 }
 
-/// A database to back up, with its engine and its storage.
+/// Something to back up, with the source that produces it and the storage that
+/// keeps it.
+///
+/// The source is not necessarily a database: it is whatever plugin can turn the
+/// thing into a byte stream and rebuild it from one.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     /// Name of the target. It is used as part of the artifact's key.
     pub name: String,
-    /// Name of the engine plugin (`postgres`, `mysql`, …). The core does not
-    /// interpret this value: it only uses it to locate the plugin.
-    pub engine: String,
-    /// Name of the storage plugin. Just as opaque as `engine`.
+    /// Name of the source plugin (`postgres`, `mysql`, `directory`, `docker-volume`,
+    /// …). The core does not interpret this value: it only uses it to locate the
+    /// plugin.
+    pub source: String,
+    /// Name of the storage plugin. Just as opaque as `source`.
     pub storage: String,
     /// age public key the backup is encrypted to.
     pub recipient: String,
-    /// Configuration of the engine plugin. Opaque here.
+    /// Configuration of the source plugin. Opaque here.
     #[serde(default)]
-    pub engine_config: ConfigTable,
+    pub source_config: ConfigTable,
     /// Configuration of the storage plugin. Opaque here.
     #[serde(default)]
     pub storage_config: ConfigTable,
@@ -203,7 +221,7 @@ pub enum ConfigError {
     /// There is no target to back up.
     #[error(
         "the configuration declares no target: add at least one `[[target]]` block with `name`, \
-         `engine`, `storage` and `recipient`"
+         `source`, `storage` and `recipient`"
     )]
     NoTargets,
 
@@ -241,7 +259,7 @@ impl Config {
     ///
     /// The validation done here is the one the core can do on its own: usable
     /// target names, uniqueness, compression ranges. Whatever is inside
-    /// `engine_config` and `storage_config` is left untouched: that is validated
+    /// `source_config` and `storage_config` is left untouched: that is validated
     /// against the schema each plugin declares.
     ///
     /// # Errors
@@ -353,15 +371,15 @@ lockfile = "~/.shieldbk/plugins.lock"
 
 [defaults]
 compression_level = 6
-artifact_template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age"
+artifact_template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age"
 
 [[target]]
 name = "production"
-engine = "postgres"
+source = "postgres"
 storage = "r2"
 recipient = "age1qqqqqqqqqq"
 
-[target.engine_config]
+[target.source_config]
 host = "db.internal"
 port = 5432
 ssl = true
@@ -377,7 +395,7 @@ secret_access_key = { keyring = "shieldbk/r2" }
         let c = Config::parse(EXAMPLE).unwrap();
         assert_eq!(c.targets.len(), 1);
         assert_eq!(c.targets[0].name, "production");
-        assert_eq!(c.targets[0].engine, "postgres");
+        assert_eq!(c.targets[0].source, "postgres");
         assert_eq!(c.targets[0].storage, "r2");
         assert_eq!(c.defaults.compression_level, 6);
     }
@@ -385,7 +403,7 @@ secret_access_key = { keyring = "shieldbk/r2" }
     #[test]
     fn literal_values_and_references_live_side_by_side() {
         let c = Config::parse(EXAMPLE).unwrap();
-        let ec = &c.targets[0].engine_config;
+        let ec = &c.targets[0].source_config;
         assert!(matches!(ec.get("host"), Some(ConfigValue::String(s)) if s == "db.internal"));
         assert!(matches!(ec.get("port"), Some(ConfigValue::Int(5432))));
         assert!(matches!(ec.get("ssl"), Some(ConfigValue::Bool(true))));
@@ -399,10 +417,10 @@ secret_access_key = { keyring = "shieldbk/r2" }
         let toml = r#"
 [[target]]
 name = "t"
-engine = "e"
+source = "e"
 storage = "s"
 recipient = "age1x"
-[target.engine_config]
+[target.source_config]
 a = { env = "A" }
 b = { file = "/path/b" }
 c = { keyring = "service/c" }
@@ -410,7 +428,7 @@ d = { command = ["vault", "read", "x"] }
 e = { file_insecure = "/run/secrets/e" }
 "#;
         let c = Config::parse(toml).unwrap();
-        let ec = &c.targets[0].engine_config;
+        let ec = &c.targets[0].source_config;
         assert!(matches!(
             ec.get("a"),
             Some(ConfigValue::Secret(SecretRef::Env(_)))
@@ -440,15 +458,15 @@ e = { file_insecure = "/run/secrets/e" }
         let toml = r#"
 [[target]]
 name = "t"
-engine = "e"
+source = "e"
 storage = "s"
 recipient = "age1x"
-[target.engine_config]
+[target.source_config]
 exclusions = ["table_a", "table_b"]
 "#;
         let c = Config::parse(toml).unwrap();
         assert!(matches!(
-            c.targets[0].engine_config.get("exclusions"),
+            c.targets[0].source_config.get("exclusions"),
             Some(ConfigValue::List(v)) if v.len() == 2
         ));
     }
@@ -458,12 +476,12 @@ exclusions = ["table_a", "table_b"]
         let toml = r#"
 [[target]]
 name = "dup"
-engine = "e"
+source = "e"
 storage = "s"
 recipient = "age1x"
 [[target]]
 name = "dup"
-engine = "e"
+source = "e"
 storage = "s"
 recipient = "age1x"
 "#;
@@ -498,7 +516,7 @@ recipient = "age1x"
         // target is still rejected the same.
         for bad in [
             "[defaults]\ncompression_level = 99\n",
-            "[[target]]\nname = \"with/slash\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n",
+            "[[target]]\nname = \"with/slash\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n",
             "this is not toml [[[",
         ] {
             assert!(
@@ -512,7 +530,7 @@ recipient = "age1x"
     fn a_target_without_a_recipient_is_rejected() {
         // Without a public key nothing can be encrypted, and an unencrypted
         // backup is not what this tool promises.
-        let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\n";
+        let toml = "[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\n";
         assert!(Config::parse(toml).is_err());
     }
 
@@ -527,7 +545,7 @@ recipient = "age1x"
 
     #[test]
     fn the_per_target_compression_level_is_validated() {
-        let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompression_level = 0\n";
+        let toml = "[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompression_level = 0\n";
         let err = Config::parse(toml).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
         assert!(err.to_string().contains('t'), "it must say in which target");
@@ -536,7 +554,7 @@ recipient = "age1x"
     const EXAMPLE_TARGET: &str = r#"
 [[target]]
 name = "t"
-engine = "e"
+source = "e"
 storage = "s"
 recipient = "age1x"
 "#;
@@ -550,7 +568,7 @@ recipient = "age1x"
 
     #[test]
     fn the_target_level_beats_the_global_one() {
-        let toml = "[defaults]\ncompression_level = 3\n[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompression_level = 19\n";
+        let toml = "[defaults]\ncompression_level = 3\n[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompression_level = 19\n";
         let c = Config::parse(toml).unwrap();
         assert_eq!(c.targets[0].effective_level(&c.defaults), 19);
     }
@@ -563,7 +581,7 @@ recipient = "age1x"
 
     #[test]
     fn the_target_template_beats_the_global_one() {
-        let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\nartifact_template = \"own\"\n";
+        let toml = "[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\nartifact_template = \"own\"\n";
         let c = Config::parse(toml).unwrap();
         assert_eq!(c.targets[0].effective_template(&c.defaults), "own");
     }
@@ -591,7 +609,7 @@ recipient = "age1x"
     fn an_unknown_field_in_a_target_is_rejected() {
         // A typo in a field name cannot be ignored in silence: the user would
         // believe they had configured something that is not in effect.
-        let toml = "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompresion_level = 5\n";
+        let toml = "[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\ncompresion_level = 5\n";
         assert!(
             Config::parse(toml).is_err(),
             "an unknown field must be rejected"
@@ -604,7 +622,7 @@ recipient = "age1x"
         // name would produce absurd or unsafe paths in the destination.
         for bad in ["", "with/slash", "..", "with space/and slash"] {
             let toml = format!(
-                "[[target]]\nname = \"{bad}\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n"
+                "[[target]]\nname = \"{bad}\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n"
             );
             assert!(
                 Config::parse(&toml).is_err(),

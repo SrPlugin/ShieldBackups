@@ -16,7 +16,7 @@ impl Plugin for Minimal {
             name: "minimal".into(),
             version: "0.1.0".into(),
             protocol_version: sb_plugin_sdk::sb_proto::PROTOCOL_VERSION,
-            capabilities: vec![Capability::Engine as i32],
+            capabilities: vec![Capability::Source as i32],
         }))
     }
     async fn schema(&self, _: Request<SchemaRequest>) -> Result<Response<SchemaResponse>, Status> {

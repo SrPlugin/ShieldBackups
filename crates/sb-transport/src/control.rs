@@ -155,7 +155,7 @@ fn incoming_connections(
 ///
 /// It serves **a single** service. This is the convenient route for tests and
 /// for code that only needs to expose `Plugin`; a real plugin also exposes
-/// `Engine` and/or `Storage`, and that is what [`serve_control_routes`] is for.
+/// `Source` and/or `Storage`, and that is what [`serve_control_routes`] is for.
 /// This function delegates to it with a single-service set of routes, so the
 /// behaviour of the socket, of TLS and of rejected handshakes is exactly the
 /// same.
@@ -188,7 +188,7 @@ where
 /// same channel.
 ///
 /// This is the function real plugins use: the protocol requires every one of
-/// them to implement `Plugin`, and on top of that each exposes `Engine`,
+/// them to implement `Plugin`, and on top of that each exposes `Source`,
 /// `Storage` or both depending on its capabilities. With a single service per
 /// channel — which is all [`serve_control`] offers — no real plugin could work.
 ///
@@ -334,7 +334,7 @@ mod tests {
                 name: "test".into(),
                 version: "0.0.1".into(),
                 protocol_version: PROTOCOL_VERSION,
-                capabilities: vec![Capability::Engine as i32],
+                capabilities: vec![Capability::Source as i32],
             }))
         }
         async fn schema(
@@ -356,7 +356,7 @@ mod tests {
             Ok(Response::new(PreflightResponse {
                 ok: true,
                 checks: vec![],
-                server_version: String::new(),
+                source_version: String::new(),
             }))
         }
         async fn shutdown(
@@ -527,12 +527,12 @@ mod tests {
         server.abort();
     }
 
-    /// Trivial implementation of the Engine service, to check that it can be
+    /// Trivial implementation of the Source service, to check that it can be
     /// served alongside Plugin over the same channel.
-    struct TestEngine;
+    struct TestSource;
 
     #[tonic::async_trait]
-    impl sb_proto::engine_server::Engine for TestEngine {
+    impl sb_proto::source_server::Source for TestSource {
         type DumpStream = std::pin::Pin<
             Box<dyn tokio_stream::Stream<Item = Result<sb_proto::Progress, Status>> + Send>,
         >;
@@ -563,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_plugin_can_serve_several_services_over_the_same_channel() {
-        // A real plugin exposes Plugin + Engine, or Plugin + Storage, or all
+        // A real plugin exposes Plugin + Source, or Plugin + Storage, or all
         // three. If it could only expose one, the architecture would not work.
         use tokio_stream::StreamExt as _;
 
@@ -573,7 +573,7 @@ mod tests {
 
         let routes = routes_for(
             PluginServer::new(TestPlugin),
-            Some(sb_proto::engine_server::EngineServer::new(TestEngine)),
+            Some(sb_proto::source_server::SourceServer::new(TestSource)),
         );
 
         let path = socket.clone();
@@ -599,8 +599,8 @@ mod tests {
             "test"
         );
 
-        // And so does the Engine service, over the SAME channel.
-        let mut c2 = sb_proto::engine_client::EngineClient::new(channel);
+        // And so does the Source service, over the SAME channel.
+        let mut c2 = sb_proto::source_client::SourceClient::new(channel);
         let mut stream = c2
             .dump(sb_proto::DumpRequest {
                 data_socket: "/tmp/x.sock".into(),
@@ -616,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unregistered_service_returns_unimplemented() {
-        // A plugin that is only an engine does not expose Storage. Asking it
+        // A plugin that is only a source does not expose Storage. Asking it
         // for a Put must give a clear protocol error, not a hang nor a
         // transport error nobody can interpret.
         let dir = tempfile::tempdir().unwrap();
@@ -747,13 +747,13 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 
-    /// Test helper: assembles the routes with Plugin and, optionally, Engine.
+    /// Test helper: assembles the routes with Plugin and, optionally, Source.
     fn routes_for(
         plugin: PluginServer<TestPlugin>,
-        engine: Option<sb_proto::engine_server::EngineServer<TestEngine>>,
+        source: Option<sb_proto::source_server::SourceServer<TestSource>>,
     ) -> tonic::service::Routes {
         let mut r = tonic::service::Routes::new(plugin);
-        if let Some(e) = engine {
+        if let Some(e) = source {
             r = r.add_service(e);
         }
         r

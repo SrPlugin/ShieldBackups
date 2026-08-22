@@ -120,6 +120,19 @@ Because `/home/shieldbk/.shieldbk/config.toml` is a symlink to
 below pass `--config` anyway, because being explicit in a scheduled job that
 runs unattended at 3 a.m. is worth four extra words.
 
+Every `[[target]]` names two plugins, one per axis:
+
+* `source` — what produces the byte stream and is rebuilt from it. A database is
+  the obvious case (`postgres`, `mysql`), but the contract is only "serialize to
+  a stream, restore from a stream", so a directory in tar, a Docker volume, a VM
+  disk or a bucket copied from another provider are equally valid sources.
+* `storage` — where that stream is kept (`r2`, and any other object store or
+  filesystem a plugin speaks to).
+
+Their configuration goes in `[target.source_config]` and
+`[target.storage_config]`; the core never interprets either table, it forwards
+it to the plugin that declared the schema.
+
 A minimal configuration:
 
 ```toml
@@ -132,11 +145,11 @@ A minimal configuration:
 
 [[target]]
 name = "produccion"
-engine = "postgres"
+source = "postgres"
 storage = "r2"
 recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
 
-[target.engine_config]
+[target.source_config]
 host = "db.internal"
 port = 5432
 database = "app"
@@ -278,11 +291,11 @@ data:
   config.toml: |
     [[target]]
     name = "produccion"
-    engine = "postgres"
+    source = "postgres"
     storage = "r2"
     recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
 
-    [target.engine_config]
+    [target.source_config]
     host = "postgres.default.svc.cluster.local"
     port = 5432
     database = "app"
@@ -544,8 +557,8 @@ Then **encode the answer in the tag** and in the manifest, so an image bump
 cannot silently downgrade the client.
 
 On the `doctor` side, be aware of what exists today: `doctor` reports the
-server version as an informational check named `versión de la fuente`, taken
-from the engine plugin's preflight response. The automatic comparison against
+database server's version as an informational check named `source version`,
+taken from the source plugin's preflight response. The automatic comparison against
 the local `pg_dump` — a failing check with a remedy — is part of the PostgreSQL
 plugin, which is not in this repository yet. Until it lands, the table above
 and the tag are your check. Run `doctor` before you schedule anything, and read
@@ -587,7 +600,7 @@ Measured numbers, not guesses:
 
 | Component | Memory |
 |---|---|
-| Core + one engine plugin + one storage plugin | **≈ 30 MiB RSS**, flat in database size (2 GiB dump: 30 MiB; 8x the data: 1.02x the memory) |
+| Core + one source plugin + one storage plugin | **≈ 30 MiB RSS**, flat in database size (2 GiB dump: 30 MiB; 8x the data: 1.02x the memory) |
 | Each additional concurrent target (`--jobs N`) | **+ ≈ 20 MiB** |
 | R2 multipart uploader, per upload in flight | **`part_size_mb` x `concurrency` = 64 MiB x 4 = 256 MiB by default** |
 
@@ -717,7 +730,7 @@ volume:
 plugin lock -> doctor -> backup -> verify -> restore
 ```
 
-It checks that the restored bytes match the ones the engine produced, and it
+It checks that the restored bytes match the ones the source produced, and it
 runs as the unprivileged user with a read-only root filesystem, so it also
 proves that the `--read-only` + `/tmp` `tmpfs` combination from the examples
 above actually works.

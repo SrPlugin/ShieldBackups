@@ -857,7 +857,7 @@ async fn the_preflight_passes_with_a_valid_bucket() {
     assert!(pf.ok, "{:?}", pf.checks);
     let names: Vec<&str> = pf.checks.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["bucket", "write", "list"]);
-    assert!(pf.server_version.contains(&server.endpoint));
+    assert!(pf.source_version.contains(&server.endpoint));
 
     // The probe object is deleted: the preflight must leave no leftovers.
     assert!(

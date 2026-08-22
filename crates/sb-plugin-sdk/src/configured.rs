@@ -1,6 +1,6 @@
 //! The configuration that `Configure` leaves behind and the data services read.
 //!
-//! A plugin is not a single object: `Plugin`, `Engine` and `Storage` are
+//! A plugin is not a single object: `Plugin`, `Source` and `Storage` are
 //! registered separately, but `Configure` only reaches the first one. Without
 //! something shared, every plugin ends up writing the same
 //! `Arc<Mutex<Option<Config>>>` and the same "if there is no configuration yet,
@@ -25,7 +25,7 @@ use tonic::Status;
 /// ```ignore
 /// let config = Configured::<MyConfig>::new("postgres");
 /// PluginRuntime::new(MyPlugin::new(config.clone()))
-///     .with_engine(MyEngine::new(config))
+///     .with_source(MySource::new(config))
 ///     .serve()
 ///     .await?;
 /// ```
@@ -185,17 +185,17 @@ mod tests {
     #[test]
     fn the_clones_see_the_configuration_another_one_wrote() {
         // The type's reason to exist: `Configure` reaches the Plugin service and
-        // Engine and Storage read it, and those are different values.
+        // Source and Storage read it, and those are different values.
         let plugin = Configured::new("mock");
-        let engine = plugin.clone();
+        let source = plugin.clone();
         let storage = plugin.clone();
 
-        assert!(engine.resolved().is_err());
+        assert!(source.resolved().is_err());
         plugin.store(Config {
             dir: "/data".into(),
         });
 
-        assert_eq!(engine.resolved().unwrap().dir, "/data");
+        assert_eq!(source.resolved().unwrap().dir, "/data");
         assert_eq!(storage.resolved().unwrap().dir, "/data");
     }
 

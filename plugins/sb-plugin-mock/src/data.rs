@@ -30,7 +30,7 @@ mod tests {
     #[test]
     fn the_same_seed_produces_the_same_bytes() {
         // Without this, a core test could not compare what was restored with
-        // what the engine produced.
+        // what the source produced.
         let a: Vec<u8> = deterministic_data(42, 1000).collect();
         let b: Vec<u8> = deterministic_data(42, 1000).collect();
         assert_eq!(a, b);

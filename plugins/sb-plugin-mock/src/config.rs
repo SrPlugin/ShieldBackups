@@ -14,7 +14,7 @@ pub const FIELD_DIR: &str = "dir";
 pub const FIELD_SEED: &str = "seed";
 pub const FIELD_SIZE: &str = "size";
 
-/// Default seed for the engine's generator.
+/// Default seed for the source's generator.
 pub const DEFAULT_SEED: u64 = 42;
 /// Default dump size: one mebibyte.
 pub const DEFAULT_SIZE: usize = 1_048_576;
@@ -32,7 +32,7 @@ pub fn fields() -> Vec<Field> {
             required: true,
             secret: false,
             description:
-                "Directory where the storage target keeps artifacts and the engine writes restored data"
+                "Directory where the storage target keeps artifacts and the source writes restored data"
                     .into(),
             default_value: String::new(),
         },
@@ -41,7 +41,7 @@ pub fn fields() -> Vec<Field> {
             r#type: FieldType::Int as i32,
             required: false,
             secret: false,
-            description: "Seed for the engine's deterministic generator".into(),
+            description: "Seed for the source's deterministic generator".into(),
             default_value: DEFAULT_SEED.to_string(),
         },
         Field {
@@ -49,7 +49,7 @@ pub fn fields() -> Vec<Field> {
             r#type: FieldType::Int as i32,
             required: false,
             secret: false,
-            description: "Bytes the engine emits on each dump".into(),
+            description: "Bytes the source emits on each dump".into(),
             default_value: DEFAULT_SIZE.to_string(),
         },
     ]
@@ -118,7 +118,7 @@ fn int_field(map: &HashMap<String, Value>, name: &str) -> Result<Option<i64>, St
 
 /// The configuration shared between the plugin's three services.
 ///
-/// `Configure` writes it and the engine and the storage target read it. The SDK
+/// `Configure` writes it and the source and the storage target read it. The SDK
 /// provides the store and the rule that "before `Configure` there are no silent
 /// defaults": reading it unconfigured yields `failed_precondition`, because a
 /// dump written into a directory nobody asked for is worse than a clear error.

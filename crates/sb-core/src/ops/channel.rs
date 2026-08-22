@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sb_crypto::PipelineError;
-use sb_proto::engine_client::EngineClient;
+use sb_proto::source_client::SourceClient;
 use sb_proto::storage_client::StorageClient;
 use sb_proto::{DumpRequest, GetRequest, Progress, PutRequest, RestoreRequest};
 use sb_transport::DataChannel;
@@ -199,32 +199,32 @@ pub(crate) async fn start_get(
     Ok(track_progress(storage.name().to_string(), OP_GET, stream))
 }
 
-/// Asks the engine to start **writing** into the channel.
+/// Asks the source to start **writing** into the channel.
 pub(crate) async fn start_dump(
-    engine: &PluginClient,
+    source: &PluginClient,
     channel: &DataChannel,
 ) -> Result<JoinHandle<Result<u64, BackupError>>, BackupError> {
-    let mut grpc = EngineClient::new(engine.channel());
+    let mut grpc = SourceClient::new(source.channel());
     let request = DumpRequest {
         data_socket: path_of(channel),
     };
-    let stream = open(engine.name(), OP_DUMP, grpc.dump(request)).await?;
-    Ok(track_progress(engine.name().to_string(), OP_DUMP, stream))
+    let stream = open(source.name(), OP_DUMP, grpc.dump(request)).await?;
+    Ok(track_progress(source.name().to_string(), OP_DUMP, stream))
 }
 
-/// Asks the engine to start **reading** from the channel and to swallow whatever
+/// Asks the source to start **reading** from the channel and to swallow whatever
 /// comes out.
 pub(crate) async fn start_restore(
-    engine: &PluginClient,
+    source: &PluginClient,
     channel: &DataChannel,
 ) -> Result<JoinHandle<Result<u64, BackupError>>, BackupError> {
-    let mut grpc = EngineClient::new(engine.channel());
+    let mut grpc = SourceClient::new(source.channel());
     let request = RestoreRequest {
         data_socket: path_of(channel),
     };
-    let stream = open(engine.name(), OP_RESTORE, grpc.restore(request)).await?;
+    let stream = open(source.name(), OP_RESTORE, grpc.restore(request)).await?;
     Ok(track_progress(
-        engine.name().to_string(),
+        source.name().to_string(),
         OP_RESTORE,
         stream,
     ))
@@ -374,11 +374,11 @@ pub(crate) async fn download_blob(
 ) -> Result<Vec<u8>, BackupError> {
     let channel = create_channel(storage)?;
     let download = start_get(storage, key, &channel).await?;
-    let source = accept(&channel, storage.name(), OP_GET).await?;
+    let stream = accept(&channel, storage.name(), OP_GET).await?;
 
     // `take` of one byte more than the cap: if it fills up, there was more.
     let mut contents = Vec::new();
-    let read = source
+    let read = stream
         .take(BLOB_LIMIT + 1)
         .read_to_end(&mut contents)
         .await
@@ -441,11 +441,11 @@ mod tests {
         // would only add noise in front.
         let error = BackupError::from(PluginError::MissingCapability {
             plugin: "storage-only".into(),
-            capability: "engine".into(),
+            capability: "source".into(),
         });
         assert_eq!(
             error.to_string(),
-            "the plugin \"storage-only\" does not know how to act as \"engine\""
+            "the plugin \"storage-only\" does not know how to act as \"source\""
         );
     }
 

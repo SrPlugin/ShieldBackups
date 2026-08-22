@@ -1,4 +1,4 @@
-//! The engine: it produces deterministic bytes and receives them back.
+//! The source: it produces deterministic bytes and receives them back.
 //!
 //! There is no database behind it. `Dump` generates the stream from a seed and
 //! `Restore` writes it to disk so that a test can compare it with what the
@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use sb_plugin_mock::deterministic_data;
-use sb_plugin_sdk::sb_proto::engine_server::Engine;
+use sb_plugin_sdk::sb_proto::source_server::Source;
 use sb_plugin_sdk::sb_proto::{DumpRequest, RestoreRequest};
 use sb_plugin_sdk::tonic::{Request, Response, Status};
 use sb_plugin_sdk::{ProgressEmitter, ProgressStream, progress_stream};
@@ -18,11 +18,11 @@ use crate::stream;
 /// Name of the file where `Restore` leaves what it receives.
 pub const RESTORE_FILE: &str = "restore.bin";
 
-pub struct MockEngine {
+pub struct MockSource {
     state: State,
 }
 
-impl MockEngine {
+impl MockSource {
     #[must_use]
     pub fn new(state: State) -> Self {
         Self { state }
@@ -30,7 +30,7 @@ impl MockEngine {
 }
 
 #[sb_plugin_sdk::tonic::async_trait]
-impl Engine for MockEngine {
+impl Source for MockSource {
     type DumpStream = ProgressStream;
     type RestoreStream = ProgressStream;
 

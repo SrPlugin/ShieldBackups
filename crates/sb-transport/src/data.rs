@@ -96,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_plugin_writes_and_the_core_reads() {
-        // The direction of a backup: the engine produces, the core consumes.
+        // The direction of a backup: the source produces, the core consumes.
         let dir = tempfile::tempdir().unwrap();
         let channel = DataChannel::create(dir.path(), "dump").unwrap();
         let path = channel.path().to_path_buf();
@@ -204,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_channels_in_the_same_directory_do_not_collide() {
-        // A backup uses two at once: one from the engine and one to the target.
+        // A backup uses two at once: one from the source and one to the target.
         let dir = tempfile::tempdir().unwrap();
         let a = DataChannel::create(dir.path(), "dump").unwrap();
         let b = DataChannel::create(dir.path(), "put").unwrap();

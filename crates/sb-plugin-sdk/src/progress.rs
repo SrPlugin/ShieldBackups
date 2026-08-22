@@ -3,7 +3,7 @@
 //! `Dump`, `Restore`, `Put` and `Get` all have the same shape: spawn a task
 //! that pumps bytes through the data channel and hand the core back a stream of
 //! `Progress` through which the error also travels if something fails. That
-//! shape lives here once, so an engine or a storage only has to write its own
+//! shape lives here once, so a source or a storage only has to write its own
 //! byte-moving logic.
 
 use std::future::Future;

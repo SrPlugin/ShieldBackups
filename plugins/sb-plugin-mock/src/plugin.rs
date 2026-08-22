@@ -31,7 +31,7 @@ impl Plugin for MockPlugin {
             name: NAME.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: PROTOCOL_VERSION,
-            capabilities: vec![Capability::Engine as i32, Capability::Storage as i32],
+            capabilities: vec![Capability::Source as i32, Capability::Storage as i32],
         }))
     }
 
@@ -78,7 +78,7 @@ impl Plugin for MockPlugin {
         Ok(Response::new(PreflightResponse {
             ok: check.ok,
             checks: vec![check],
-            server_version: NAME.into(),
+            source_version: NAME.into(),
         }))
     }
 

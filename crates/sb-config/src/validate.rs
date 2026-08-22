@@ -1,9 +1,9 @@
 //! Validation of a configuration table against the plugin's schema.
 //!
 //! This is where the plugin architecture closes its circle: the core does not
-//! know which fields a database engine or a cloud destination needs, so it takes
-//! the schema the plugin declared over gRPC and checks against it what the user
-//! wrote in the TOML. What comes out are the protocol's [`Value`]s, ready to
+//! know which fields a source —a database, a directory, a volume— or a cloud
+//! destination needs, so it takes the schema the plugin declared over gRPC and
+//! checks against it what the user wrote in the TOML. What comes out are the protocol's [`Value`]s, ready to
 //! travel in `Configure`.
 //!
 //! Two symmetric rules govern secrets:
@@ -47,7 +47,7 @@ pub enum ValidationError {
     /// The schema declares the field as mandatory and it is not in the table.
     #[error("the mandatory field \"{field}\" is missing in the \"{section}\" section")]
     MissingRequiredField {
-        /// Section of the file: `engine` or `storage`.
+        /// Section of the file: `source` or `storage`.
         section: String,
         /// Field the plugin requires.
         field: String,
@@ -60,7 +60,7 @@ pub enum ValidationError {
     /// believing they configured something that is not in effect.
     #[error("the field \"{field}\" does not exist in the \"{section}\" section; {suggestion}")]
     UnknownField {
-        /// Section of the file: `engine` or `storage`.
+        /// Section of the file: `source` or `storage`.
         section: String,
         /// Unknown field, exactly as the user wrote it.
         field: String,
@@ -71,7 +71,7 @@ pub enum ValidationError {
     /// The written value does not match the type the schema declares.
     #[error("the field \"{field}\" of the \"{section}\" section must be {expected}")]
     WrongType {
-        /// Section of the file: `engine` or `storage`.
+        /// Section of the file: `source` or `storage`.
         section: String,
         /// Field with the badly typed value.
         field: String,
@@ -91,7 +91,7 @@ pub enum ValidationError {
          {{ keyring = \"service/user\" }} or {{ command = [\"program\", \"argument\"] }}"
     )]
     LiteralSecret {
-        /// Section of the file: `engine` or `storage`.
+        /// Section of the file: `source` or `storage`.
         section: String,
         /// Secret field that carried the literal.
         field: String,
@@ -103,7 +103,7 @@ pub enum ValidationError {
          directly, without a reference to env, file, keyring or command"
     )]
     SecretRefInPublicField {
-        /// Section of the file: `engine` or `storage`.
+        /// Section of the file: `source` or `storage`.
         section: String,
         /// Public field that carried the reference.
         field: String,
@@ -127,7 +127,7 @@ pub enum ValidationError {
 /// Checks the configuration against the plugin's schema and converts it into the
 /// protocol's [`Value`]s, resolving the secrets along the way.
 ///
-/// `section` is `"engine"` or `"storage"`, and it only feeds the error messages:
+/// `section` is `"source"` or `"storage"`, and it only feeds the error messages:
 /// in a backup there are two configured plugins, and "the field host is missing"
 /// without saying whose it is forces you to guess.
 ///
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn accepts_a_correct_configuration() {
-        let r = validate_and_convert(&minimal(), &schema(), "engine").unwrap();
+        let r = validate_and_convert(&minimal(), &schema(), "source").unwrap();
         assert!(r.contains_key("host"));
         assert!(r.contains_key("password"));
     }
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn the_secret_arrives_resolved_not_as_a_reference() {
         // The plugin receives the value, never the path nor the variable name.
-        let r = validate_and_convert(&minimal(), &schema(), "engine").unwrap();
+        let r = validate_and_convert(&minimal(), &schema(), "source").unwrap();
         let v = r.get("password").unwrap();
         match &v.kind {
             Some(sb_proto::value::Kind::StringValue(s)) => {
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn a_required_field_is_missing() {
         let cfg = table(vec![("host", ConfigValue::String("db".into()))]);
-        let err = validate_and_convert(&cfg, &schema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "source")
             .err()
             .unwrap();
         assert!(
@@ -403,7 +403,7 @@ mod tests {
     fn an_unknown_field_is_rejected_and_the_similar_one_is_suggested() {
         let mut cfg = minimal();
         cfg.insert("hosst".into(), ConfigValue::String("db".into()));
-        let err = validate_and_convert(&cfg, &schema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "source")
             .err()
             .unwrap();
         let text = err.to_string();
@@ -420,7 +420,7 @@ mod tests {
         // noise; better to show which fields exist.
         let mut cfg = minimal();
         cfg.insert("zzzzzzzz".into(), ConfigValue::String("x".into()));
-        let text = validate_and_convert(&cfg, &schema(), "engine")
+        let text = validate_and_convert(&cfg, &schema(), "source")
             .err()
             .unwrap()
             .to_string();
@@ -435,7 +435,7 @@ mod tests {
         let mut cfg = minimal();
         cfg.insert("port".into(), ConfigValue::String("not-a-number".into()));
         assert!(matches!(
-            validate_and_convert(&cfg, &schema(), "engine")
+            validate_and_convert(&cfg, &schema(), "source")
                 .err()
                 .unwrap(),
             ValidationError::WrongType { .. }
@@ -449,7 +449,7 @@ mod tests {
             ("host", ConfigValue::String("db".into())),
             ("password", ConfigValue::String("hunter2".into())),
         ]);
-        let err = validate_and_convert(&cfg, &schema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "source")
             .err()
             .unwrap();
         assert!(matches!(err, ValidationError::LiteralSecret { .. }));
@@ -465,7 +465,7 @@ mod tests {
             ("host", ConfigValue::String("db".into())),
             ("password", ConfigValue::String("x".into())),
         ]);
-        let text = validate_and_convert(&cfg, &schema(), "engine")
+        let text = validate_and_convert(&cfg, &schema(), "source")
             .err()
             .unwrap()
             .to_string();
@@ -481,7 +481,7 @@ mod tests {
             ConfigValue::Secret(SecretRef::Env("PATH".into())),
         );
         assert!(matches!(
-            validate_and_convert(&cfg, &schema(), "engine")
+            validate_and_convert(&cfg, &schema(), "source")
                 .err()
                 .unwrap(),
             ValidationError::SecretRefInPublicField { .. }
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn absent_optional_fields_do_not_get_in_the_way() {
-        let r = validate_and_convert(&minimal(), &schema(), "engine").unwrap();
+        let r = validate_and_convert(&minimal(), &schema(), "source").unwrap();
         assert!(!r.contains_key("port"));
         assert!(!r.contains_key("ssl"));
     }
@@ -500,7 +500,7 @@ mod tests {
         // Their semantics are interpreted by the plugin, not by the core.
         let mut cfg = minimal();
         cfg.insert("path".into(), ConfigValue::String("/var/lib/x".into()));
-        let r = validate_and_convert(&cfg, &schema(), "engine").unwrap();
+        let r = validate_and_convert(&cfg, &schema(), "source").unwrap();
         assert!(matches!(
             r.get("path").unwrap().kind,
             Some(sb_proto::value::Kind::StringValue(_))
@@ -514,7 +514,7 @@ mod tests {
             "exclude".into(),
             ConfigValue::List(vec!["a".into(), "b".into()]),
         );
-        let r = validate_and_convert(&cfg, &schema(), "engine").unwrap();
+        let r = validate_and_convert(&cfg, &schema(), "source").unwrap();
         match &r.get("exclude").unwrap().kind {
             Some(sb_proto::value::Kind::ListValue(l)) => assert_eq!(l.values.len(), 2),
             other => panic!("a list was expected, {other:?} arrived"),
@@ -525,7 +525,7 @@ mod tests {
     fn a_boolean_travels_as_a_boolean() {
         let mut cfg = minimal();
         cfg.insert("ssl".into(), ConfigValue::Bool(true));
-        let r = validate_and_convert(&cfg, &schema(), "engine").unwrap();
+        let r = validate_and_convert(&cfg, &schema(), "source").unwrap();
         assert!(matches!(
             r.get("ssl").unwrap().kind,
             Some(sb_proto::value::Kind::BoolValue(true))
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn the_error_names_the_section() {
         // In a backup there are two configured plugins. "the field host is
-        // missing" without saying whether it is the engine's or the storage's
+        // missing" without saying whether it is the source's or the storage's
         // forces you to guess.
         let cfg = ConfigTable::new();
         let text = validate_and_convert(&cfg, &schema(), "storage")
@@ -554,7 +554,7 @@ mod tests {
                 ConfigValue::Secret(SecretRef::Env("SB_DOES_NOT_EXIST_ABC_999".into())),
             ),
         ]);
-        let err = validate_and_convert(&cfg, &schema(), "engine")
+        let err = validate_and_convert(&cfg, &schema(), "source")
             .err()
             .unwrap();
         let text = err.to_string();
@@ -564,13 +564,13 @@ mod tests {
     #[test]
     fn an_empty_schema_rejects_any_field() {
         let cfg = table(vec![("whatever", ConfigValue::String("x".into()))]);
-        assert!(validate_and_convert(&cfg, &[], "engine").is_err());
+        assert!(validate_and_convert(&cfg, &[], "source").is_err());
     }
 
     #[test]
     fn an_empty_schema_accepts_an_empty_configuration() {
         assert!(
-            validate_and_convert(&ConfigTable::new(), &[], "engine")
+            validate_and_convert(&ConfigTable::new(), &[], "source")
                 .unwrap()
                 .is_empty()
         );

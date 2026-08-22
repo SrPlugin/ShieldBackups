@@ -11,7 +11,7 @@
 //!   control RPCs are all fast, so any long wait is a failure dressed up as
 //!   slowness.
 //! * **Errors that say who and in what.** A backup has two live plugins at once,
-//!   the engine and the storage; "configure failed" forces you to guess which of
+//!   the source and the storage; "configure failed" forces you to guess which of
 //!   the two it was.
 //! * **Version and capabilities checked before being used.** Asking a plugin
 //!   that only knows how to store for a dump must fail when it is chosen, not
@@ -43,8 +43,10 @@ const RPC_DEADLINE: Duration = Duration::from_secs(60);
 /// What a plugin knows how to do, as it declares at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
-    /// It can produce and restore a dump: it is an engine.
-    Engine,
+    /// It can produce a byte stream and be rebuilt from one: it is a source. A
+    /// database is the obvious case, but so is a directory, a volume or a disk
+    /// image.
+    Source,
     /// It can store and retrieve artifacts: it is a storage.
     Storage,
 }
@@ -55,7 +57,7 @@ impl Capability {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Engine => "engine",
+            Self::Source => "source",
             Self::Storage => "storage",
         }
     }
@@ -171,7 +173,7 @@ impl PluginClient {
         &self.process
     }
 
-    /// The control channel, ready to build an `EngineClient` or a
+    /// The control channel, ready to build a `SourceClient` or a
     /// `StorageClient` on top of it.
     ///
     /// Cloning it does not open another connection: a tonic `Channel` is a
@@ -419,9 +421,9 @@ mod tests {
     #[tokio::test]
     async fn declares_its_capabilities_correctly() {
         let c = PluginClient::start("mock", &mock_path()).await.unwrap();
-        assert!(c.has_capability(Capability::Engine));
+        assert!(c.has_capability(Capability::Source));
         assert!(c.has_capability(Capability::Storage));
-        assert!(c.require_capability(Capability::Engine).is_ok());
+        assert!(c.require_capability(Capability::Source).is_ok());
         c.shutdown().await.unwrap();
     }
 
@@ -479,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_simultaneous_clients_work() {
-        // A backup starts an engine and a storage at once.
+        // A backup starts a source and a storage at once.
         let a = PluginClient::start("mock", &mock_path()).await.unwrap();
         let b = PluginClient::start("mock", &mock_path()).await.unwrap();
         assert_eq!(a.info().await.unwrap().name, "mock");

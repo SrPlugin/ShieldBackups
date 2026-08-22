@@ -1,7 +1,7 @@
 //! Templates for the key under which an artifact is stored in the destination.
 //!
 //! A key is written with placeholders in braces, for example
-//! `{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age`, and
+//! `{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age`, and
 //! [`render`] replaces them with the values of a [`NamingContext`].
 //!
 //! The destination may be a file system (the local disk plugin), so the
@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 /// whoever gets a template wrong needs to see the list, not just a "no".
 const PLACEHOLDERS: [&str; 7] = [
     "target",
-    "engine",
+    "source",
     "storage",
     "timestamp",
     "yyyy",
@@ -55,7 +55,7 @@ pub enum NamingError {
 #[derive(Debug, Clone)]
 pub struct NamingContext {
     pub target: String,
-    pub engine: String,
+    pub source: String,
     pub storage: String,
     pub timestamp: String,
     pub year: String,
@@ -76,7 +76,7 @@ impl NamingContext {
     /// tens of thousands of years— it falls back to the epoch: a visibly absurd
     /// key is preferable to a panic in the middle of a backup.
     #[must_use]
-    pub fn new(target: &str, engine: &str, storage: &str, epoch_secs: i64) -> Self {
+    pub fn new(target: &str, source: &str, storage: &str, epoch_secs: i64) -> Self {
         let date =
             OffsetDateTime::from_unix_timestamp(epoch_secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let year = format!("{:04}", date.year());
@@ -90,7 +90,7 @@ impl NamingContext {
         );
         Self {
             target: target.to_owned(),
-            engine: engine.to_owned(),
+            source: source.to_owned(),
             storage: storage.to_owned(),
             timestamp,
             year,
@@ -104,7 +104,7 @@ impl NamingContext {
     fn value(&self, placeholder: &str) -> Option<&str> {
         Some(match placeholder {
             "target" => &self.target,
-            "engine" => &self.engine,
+            "source" => &self.source,
             "storage" => &self.storage,
             "timestamp" => &self.timestamp,
             "yyyy" => &self.year,
@@ -252,7 +252,7 @@ mod tests {
     fn context() -> NamingContext {
         NamingContext {
             target: "production".into(),
-            engine: "postgres".into(),
+            source: "postgres".into(),
             storage: "r2".into(),
             timestamp: "20260821T100000Z".into(),
             year: "2026".into(),
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn fills_in_every_placeholder() {
-        let template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age";
+        let template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age";
         assert_eq!(
             render(template, &context()).unwrap(),
             "production/2026/08/21/production-20260821T100000Z-postgres.dump.zst.age"

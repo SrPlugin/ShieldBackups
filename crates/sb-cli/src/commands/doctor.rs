@@ -55,15 +55,15 @@ async fn diagnose(ctx: &Context, target: &Target) -> DoctorReport {
 
     // The plugins are started one at a time and their failures are recorded:
     // here, a plugin that is not there is a finding, not an exception.
-    let engine = start(ctx, target, Role::Engine, &mut checks).await;
+    let source = start(ctx, target, Role::Source, &mut checks).await;
     let storage = start(ctx, target, Role::Storage, &mut checks).await;
 
-    if let (Some(engine), Some(storage)) = (&engine, &storage) {
-        checks.extend(run_doctor(&target.name, engine, storage).await.checks);
+    if let (Some(source), Some(storage)) = (&source, &storage) {
+        checks.extend(run_doctor(&target.name, source, storage).await.checks);
     }
 
-    if let Some(engine) = engine {
-        plugins::close(engine).await;
+    if let Some(source) = source {
+        plugins::close(source).await;
     }
     if let Some(storage) = storage {
         plugins::close(storage).await;
@@ -151,7 +151,7 @@ fn compose(reports: &[DoctorReport], failed: usize) -> Report {
         json.push(serde_json::json!({
             "target": report.target,
             "ok": report.ok(),
-            "server_version": report.server_version(),
+            "source_version": report.source_version(),
             "checks": report.checks.iter().map(|c| serde_json::json!({
                 "origin": c.origin,
                 "name": c.name,
@@ -193,10 +193,10 @@ mod tests {
     fn target_with(recipient: &str) -> Target {
         Target {
             name: "prod".into(),
-            engine: "postgres".into(),
+            source: "postgres".into(),
             storage: "r2".into(),
             recipient: recipient.into(),
-            engine_config: sb_config::ConfigTable::new(),
+            source_config: sb_config::ConfigTable::new(),
             storage_config: sb_config::ConfigTable::new(),
             compression_level: None,
             artifact_template: None,

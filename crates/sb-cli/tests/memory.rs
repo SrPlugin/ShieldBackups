@@ -9,7 +9,7 @@
 //!
 //! The whole design of `ShieldBackups` rests on one promise: backing up a
 //! 400 GB database uses the same RAM as backing up a 2 GB one, because nothing
-//! accumulates -- the dump goes from the engine to the storage target crossing
+//! accumulates -- the dump goes from the source to the storage target crossing
 //! zstd and age in streaming. It is the promise that allows promising a
 //! container with a low limit. This file measures it instead of believing it.
 //!
@@ -124,7 +124,7 @@ use sb_crypto::Identity;
 /// useless.
 const INTERVAL: Duration = Duration::from_millis(25);
 
-/// A MiB in bytes: the unit the mock engine is asked for a size in.
+/// A MiB in bytes: the unit the mock source is asked for a size in.
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
@@ -384,7 +384,7 @@ struct Scenario {
 }
 
 impl Scenario {
-    /// `targets` are pairs `(name, bytes the engine emits)`.
+    /// `targets` are pairs `(name, bytes the source emits)`.
     fn new(targets: &[(&str, u64)]) -> Self {
         let bench = Bench::new();
         bench.install_mock();
@@ -414,9 +414,9 @@ impl Scenario {
             std::fs::create_dir_all(&data).unwrap();
             write!(
                 toml,
-                "\n[[target]]\nname = \"{name}\"\nengine = \"mock\"\nstorage = \"mock\"\n\
+                "\n[[target]]\nname = \"{name}\"\nsource = \"mock\"\nstorage = \"mock\"\n\
                  recipient = \"{recipient}\"\n\
-                 \n[target.engine_config]\ndir = {data:?}\nseed = 7\nsize = {size}\n\
+                 \n[target.source_config]\ndir = {data:?}\nseed = 7\nsize = {size}\n\
                  \n[target.storage_config]\ndir = {data:?}\n",
                 recipient = identity.to_recipient(),
                 data = data.to_string_lossy(),

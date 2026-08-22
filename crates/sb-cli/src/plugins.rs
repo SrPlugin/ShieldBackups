@@ -21,7 +21,7 @@ use crate::error::CliError;
 /// they go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    Engine,
+    Source,
     Storage,
 }
 
@@ -30,28 +30,28 @@ impl Role {
     /// in the validation messages.
     pub const fn section(self) -> &'static str {
         match self {
-            Self::Engine => "engine",
+            Self::Source => "source",
             Self::Storage => "storage",
         }
     }
 
     const fn capability(self) -> Capability {
         match self {
-            Self::Engine => Capability::Engine,
+            Self::Source => Capability::Source,
             Self::Storage => Capability::Storage,
         }
     }
 
     fn name_in(self, target: &Target) -> &str {
         match self {
-            Self::Engine => &target.engine,
+            Self::Source => &target.source,
             Self::Storage => &target.storage,
         }
     }
 
     fn config_in(self, target: &Target) -> &ConfigTable {
         match self {
-            Self::Engine => &target.engine_config,
+            Self::Source => &target.source_config,
             Self::Storage => &target.storage_config,
         }
     }
@@ -141,7 +141,7 @@ pub async fn start(ctx: &Context, name: &str) -> Result<PluginClient, CliError> 
 /// start it, **ask it for its schema**, validate what the configuration says
 /// against it -- resolving the secrets along the way -- and only then hand it
 /// over. Validating against the plugin's schema rather than against a list in
-/// the core is what lets adding a new engine not require recompiling
+/// the core is what lets adding a new source not require recompiling
 /// `shieldbk`.
 ///
 /// # Errors
@@ -231,9 +231,9 @@ mod tests {
 
     #[test]
     fn each_role_knows_which_section_and_capability_it_talks_about() {
-        assert_eq!(Role::Engine.section(), "engine");
+        assert_eq!(Role::Source.section(), "source");
         assert_eq!(Role::Storage.section(), "storage");
-        assert_eq!(Role::Engine.capability(), Capability::Engine);
+        assert_eq!(Role::Source.capability(), Capability::Source);
         assert_eq!(Role::Storage.capability(), Capability::Storage);
     }
 

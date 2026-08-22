@@ -65,11 +65,11 @@ lockfile = {lock:?}
 
 [[target]]
 name = "production"
-engine = "mock"
+source = "mock"
 storage = "mock"
 recipient = "{recipient}"
 
-[target.engine_config]
+[target.source_config]
 dir = {data:?}
 seed = 7
 size = 65536

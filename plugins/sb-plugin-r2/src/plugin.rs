@@ -85,7 +85,7 @@ impl Plugin for R2Plugin {
             return Ok(Response::new(PreflightResponse {
                 ok: false,
                 checks: vec![check],
-                server_version: String::new(),
+                source_version: String::new(),
             }));
         };
 
@@ -100,7 +100,7 @@ impl Plugin for R2Plugin {
         Ok(Response::new(PreflightResponse {
             ok: checks.iter().all(|c| c.ok),
             checks,
-            server_version: format!("cloudflare-r2 ({})", context.config.endpoint()),
+            source_version: format!("cloudflare-r2 ({})", context.config.endpoint()),
         }))
     }
 

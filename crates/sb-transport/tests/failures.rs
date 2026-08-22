@@ -27,8 +27,8 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use sb_proto::engine_client::EngineClient;
 use sb_proto::plugin_client::PluginClient;
+use sb_proto::source_client::SourceClient;
 use sb_proto::value::Kind;
 use sb_proto::{ConfigureRequest, DumpRequest, InfoRequest, Value};
 use sb_transport::{
@@ -456,7 +456,7 @@ async fn a_plugin_that_dies_mid_dump_does_not_leave_the_core_waiting() {
 
     let mut progress = tokio::time::timeout(
         DEADLINE,
-        EngineClient::new(channel.clone()).dump(DumpRequest { data_socket: path }),
+        SourceClient::new(channel.clone()).dump(DumpRequest { data_socket: path }),
     )
     .await
     .expect("asking a live plugin for the dump must not hang")

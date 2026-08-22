@@ -28,14 +28,14 @@ pub fn prefix_for(target: &Target, defaults: &Defaults) -> String {
     prefix_from_template(
         target.effective_template(defaults),
         &target.name,
-        &target.engine,
+        &target.source,
         &target.storage,
     )
 }
 
 /// The fixed part of a template, with the placeholders that are already known
 /// substituted.
-fn prefix_from_template(template: &str, target: &str, engine: &str, storage: &str) -> String {
+fn prefix_from_template(template: &str, target: &str, source: &str, storage: &str) -> String {
     let mut prefix = String::new();
     let mut rest = template;
 
@@ -61,7 +61,7 @@ fn prefix_from_template(template: &str, target: &str, engine: &str, storage: &st
         let placeholder = &from_brace[1..close];
         match placeholder {
             "target" => prefix.push_str(target),
-            "engine" => prefix.push_str(engine),
+            "source" => prefix.push_str(source),
             "storage" => prefix.push_str(storage),
             // A placeholder that depends on when the backup was made cannot be
             // known while listing, and an unknown one cannot be substituted: in
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn the_default_template_gives_the_targets_folder() {
         let prefix = prefix_from_template(
-            "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{engine}.dump.zst.age",
+            "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age",
             "production",
             "postgres",
             "r2",
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn every_fixed_placeholder_is_substituted_before_cutting() {
         let prefix = prefix_from_template(
-            "{storage}/{engine}/{target}/{timestamp}.age",
+            "{storage}/{source}/{target}/{timestamp}.age",
             "prod",
             "postgres",
             "r2",

@@ -180,7 +180,7 @@ fn if_the_binary_changes_after_the_lock_the_backup_refuses_and_explains_it() {
 }
 
 #[test]
-fn restore_reproduces_the_data_the_engine_had_dumped() {
+fn restore_reproduces_the_data_the_source_had_dumped() {
     // It is the only thing that justifies the project: a backup that does not
     // restore is not a backup.
     let (bench, config, _id, key) = prepared();
@@ -215,7 +215,7 @@ fn restore_reproduces_the_data_the_engine_had_dumped() {
         String::from_utf8_lossy(&restore.stderr)
     );
 
-    // The mock engine leaves what it receives in `restore.bin`, and its dump is
+    // The mock source leaves what it receives in `restore.bin`, and its dump is
     // deterministic: it can be regenerated here and compared byte for byte.
     let restored = std::fs::read(bench.data_dir().join("restore.bin")).unwrap();
     let expected: Vec<u8> = sb_plugin_mock::deterministic_data(7, 65536).collect();

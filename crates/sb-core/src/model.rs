@@ -12,11 +12,24 @@ pub enum ManifestError {
     UnsupportedVersion { found: u32, supported: u32 },
 }
 
+/// Which source produced the artifact, and at which versions.
+///
+/// The field names are the ones written into every artifact's manifest. They
+/// were `engine` / `server_version` until 0.1.0 and were renamed **without a
+/// `serde(alias)` fallback**: no artifact of the old shape exists anywhere, so
+/// accepting a name that was never written durably would be permanent dead
+/// weight, and [`MANIFEST_VERSION`] stays at 1 for the same reason — bumping it
+/// would advertise a migration nobody has to make.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineInfo {
+pub struct SourceInfo {
+    /// Name of the source plugin that produced the dump.
     pub plugin: String,
+    /// Version of that plugin binary.
     pub plugin_version: String,
-    pub server_version: String,
+    /// Version of whatever the plugin sits in front of —the database server, the
+    /// container runtime— as reported in its preflight. Empty when the source
+    /// has no such notion.
+    pub source_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,7 +54,7 @@ pub struct EncryptionInfo {
 pub struct Manifest {
     pub version: u32,
     pub target: String,
-    pub engine: EngineInfo,
+    pub source: SourceInfo,
     pub created_at: String,
     pub artifact_key: String,
     pub plaintext_bytes: u64,
@@ -100,10 +113,10 @@ mod tests {
         Manifest {
             version: MANIFEST_VERSION,
             target: "production".into(),
-            engine: EngineInfo {
+            source: SourceInfo {
                 plugin: "postgres".into(),
                 plugin_version: "0.1.0".into(),
-                server_version: "16.2".into(),
+                source_version: "16.2".into(),
             },
             created_at: "2026-08-21T10:00:00Z".into(),
             artifact_key: "production/2026/08/21/production-20260821T100000Z-postgres.dump.zst.age"

@@ -11,7 +11,7 @@ name = "sb-plugin-mock"
 path = "src/main.rs"
 
 # The data generator is also exposed as a library so that the core's tests can
-# regenerate exactly what the engine produced and compare against it.
+# regenerate exactly what the source produced and compare against it.
 [lib]
 name = "sb_plugin_mock"
 path = "src/lib.rs"

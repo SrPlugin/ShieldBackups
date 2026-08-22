@@ -106,30 +106,30 @@ async fn attempt(ctx: &Context, target: &Target) -> Result<Outcome, CliError> {
     let now = OffsetDateTime::now_utc();
     let naming = NamingContext::new(
         &target.name,
-        &target.engine,
+        &target.source,
         &target.storage,
         now.unix_timestamp(),
     );
     let key = render(target.effective_template(&ctx.config.defaults), &naming)?;
 
-    let engine = plugins::start_for(ctx, target, Role::Engine).await?;
+    let source = plugins::start_for(ctx, target, Role::Source).await?;
     let storage = match plugins::start_for(ctx, target, Role::Storage).await {
         Ok(storage) => storage,
         Err(error) => {
-            plugins::close(engine).await;
+            plugins::close(source).await;
             return Err(error);
         }
     };
 
-    let outcome = run_with(&engine, &storage, target, key, recipient, level, now).await;
+    let outcome = run_with(&source, &storage, target, key, recipient, level, now).await;
 
-    plugins::close(engine).await;
+    plugins::close(source).await;
     plugins::close(storage).await;
     outcome
 }
 
 async fn run_with(
-    engine: &sb_core::plugin::PluginClient,
+    source: &sb_core::plugin::PluginClient,
     storage: &sb_core::plugin::PluginClient,
     target: &Target,
     key: String,
@@ -138,20 +138,20 @@ async fn run_with(
     now: OffsetDateTime,
 ) -> Result<Outcome, CliError> {
     // The plugin's version and the server's go into the manifest. The second is
-    // reported by the engine in its preflight, which is also the cheap check
+    // reported by the source in its preflight, which is also the cheap check
     // that rules out an expired credential before moving a byte.
-    let plugin_version = engine.info().await?.version;
-    let server_version = engine.preflight().await?.server_version;
+    let plugin_version = source.info().await?.version;
+    let source_version = source.preflight().await?.source_version;
 
     let out = run_backup(BackupRequest {
         target: target.name.clone(),
-        engine,
+        source,
         storage,
         artifact_key: key,
         recipient,
         level,
-        engine_version: plugin_version,
-        server_version,
+        plugin_version,
+        source_version,
         created_at: iso8601_utc(now),
     })
     .await?;

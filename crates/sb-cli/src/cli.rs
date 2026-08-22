@@ -57,7 +57,7 @@ pub enum Command {
         target: Option<String>,
     },
 
-    /// Restore an artifact onto the target's engine.
+    /// Restore an artifact onto the target's source.
     Restore {
         /// Target the restore is performed on.
         target: String,

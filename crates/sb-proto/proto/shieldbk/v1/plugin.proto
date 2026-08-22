@@ -3,7 +3,7 @@ syntax = "proto3";
 package shieldbk.v1;
 
 // Every plugin implements this service. On top of it, a plugin implements
-// Engine, Storage or both, and declares which in Info.
+// Source, Storage or both, and declares which in Info.
 service Plugin {
   // First RPC over the already-authenticated channel. Confirms identity and
   // capabilities.
@@ -18,7 +18,18 @@ service Plugin {
   rpc Shutdown  (ShutdownRequest)  returns (ShutdownResponse);
 }
 
-service Engine {
+// Something that produces a stream of bytes and can be rebuilt from one.
+//
+// That contract is deliberately wider than a database: a source is anything
+// that can be serialized into a byte stream and restored from it. A `pg_dump`
+// is one, but so are a directory piped through tar, a Docker volume, a virtual
+// machine's disk or a bucket being copied to another provider. Nothing in this
+// service knows what is on the other end of the stream.
+//
+// The RPCs keep the names `Dump` and `Restore` because they describe the
+// operation -- serialize out, rebuild in -- and not the kind of thing being
+// serialized.
+service Source {
   rpc Dump    (DumpRequest)    returns (stream Progress);
   rpc Restore (RestoreRequest) returns (stream Progress);
 }
@@ -35,7 +46,7 @@ service Storage {
 
 enum Capability {
   CAPABILITY_UNSPECIFIED = 0;
-  CAPABILITY_ENGINE      = 1;
+  CAPABILITY_SOURCE      = 1;
   CAPABILITY_STORAGE     = 2;
 }
 
@@ -98,8 +109,10 @@ message PreflightRequest {}
 message PreflightResponse {
   bool           ok             = 1;
   repeated Check checks         = 2;
-  // Detected server version, for the manifest.
-  string         server_version = 3;
+  // Version of whatever the source sits in front of, for the manifest: the
+  // database server, the container runtime, the hypervisor. Empty when the
+  // source has no such notion -- a plain directory does not have a version.
+  string         source_version = 3;
 }
 
 message ShutdownRequest {}

@@ -18,8 +18,8 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use sb_plugin_mock::deterministic_data;
-use sb_plugin_sdk::sb_proto::engine_client::EngineClient;
 use sb_plugin_sdk::sb_proto::plugin_client::PluginClient;
+use sb_plugin_sdk::sb_proto::source_client::SourceClient;
 use sb_plugin_sdk::sb_proto::storage_client::StorageClient;
 use sb_plugin_sdk::sb_proto::value::Kind;
 use sb_plugin_sdk::sb_proto::{
@@ -84,8 +84,8 @@ impl LivePlugin {
     fn plugin(&self) -> PluginClient<Channel> {
         PluginClient::new(self.channel.clone())
     }
-    fn engine(&self) -> EngineClient<Channel> {
-        EngineClient::new(self.channel.clone())
+    fn source(&self) -> SourceClient<Channel> {
+        SourceClient::new(self.channel.clone())
     }
     fn storage(&self) -> StorageClient<Channel> {
         StorageClient::new(self.channel.clone())
@@ -187,7 +187,7 @@ async fn get(live: &LivePlugin, sockets: &Path, name: &str, key: &str) -> Result
 async fn it_starts_announces_itself_and_declares_both_capabilities() {
     let live = LivePlugin::start().await;
     assert_eq!(live.ready.protocol_version, 1);
-    assert_eq!(live.ready.capabilities, vec!["engine", "storage"]);
+    assert_eq!(live.ready.capabilities, vec!["source", "storage"]);
     assert!(live.ready.pid > 0);
 }
 
@@ -203,7 +203,7 @@ async fn info_identifies_itself_as_mock_over_the_mtls_channel() {
     assert_eq!(info.name, "mock");
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.protocol_version, 1);
-    // 1 = engine, 2 = storage.
+    // 1 = source, 2 = storage.
     assert_eq!(info.capabilities, vec![1, 2]);
 }
 
@@ -226,7 +226,7 @@ async fn a_data_rpc_before_configure_fails_with_failed_precondition() {
     let live = LivePlugin::start().await;
 
     let e = live
-        .engine()
+        .source()
         .dump(DumpRequest {
             data_socket: "/tmp/does-not-matter.sock".into(),
         })
@@ -273,7 +273,7 @@ async fn configured_preflight_creates_the_directory() {
         .unwrap()
         .into_inner();
     assert!(pf.ok, "{:?}", pf.checks);
-    assert_eq!(pf.server_version, "mock");
+    assert_eq!(pf.source_version, "mock");
     assert!(dir.is_dir());
 }
 
@@ -297,7 +297,7 @@ async fn the_dump_delivers_exactly_the_bytes_the_library_regenerates() {
 
     let (channel, path) = data_channel(sockets.path(), "dump");
     let mut stream = live
-        .engine()
+        .source()
         .dump(DumpRequest { data_socket: path })
         .await
         .unwrap()
@@ -341,7 +341,7 @@ async fn the_restore_writes_what_it_receives_into_the_directory() {
 
     let (channel, path) = data_channel(sockets.path(), "restore");
     let mut stream = live
-        .engine()
+        .source()
         .restore(RestoreRequest { data_socket: path })
         .await
         .unwrap()

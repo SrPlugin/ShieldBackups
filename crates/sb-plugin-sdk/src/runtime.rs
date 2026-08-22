@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sb_proto::PROTOCOL_VERSION;
-use sb_proto::engine_server::{Engine, EngineServer};
 use sb_proto::plugin_server::{Plugin, PluginServer};
+use sb_proto::source_server::{Source, SourceServer};
 use sb_proto::storage_server::{Storage, StorageServer};
 use sb_transport::{
     Bootstrap, MAGIC, Ready, serve_control_routes_with_shutdown, server_config_from_bundle,
@@ -62,10 +62,10 @@ pub enum SdkError {
 }
 
 /// Capabilities that are announced, derived from the registered services.
-fn capabilities(engine: bool, storage: bool) -> Vec<String> {
+fn capabilities(source: bool, storage: bool) -> Vec<String> {
     let mut v = Vec::new();
-    if engine {
-        v.push("engine".to_string());
+    if source {
+        v.push("source".to_string());
     }
     if storage {
         v.push("storage".to_string());
@@ -73,11 +73,11 @@ fn capabilities(engine: bool, storage: bool) -> Vec<String> {
     v
 }
 
-fn build_ready(protocol_version: u32, engine: bool, storage: bool, pid: u32) -> Ready {
+fn build_ready(protocol_version: u32, source: bool, storage: bool, pid: u32) -> Ready {
     Ready {
         magic: MAGIC.into(),
         protocol_version,
-        capabilities: capabilities(engine, storage),
+        capabilities: capabilities(source, storage),
         pid,
     }
 }
@@ -95,18 +95,18 @@ type Registration = Box<dyn FnOnce(Routes) -> Routes + Send>;
 ///
 /// Register the services the plugin implements and call
 /// [`PluginRuntime::serve`]. The capabilities announced to the core **are
-/// derived from what was registered**: a plugin cannot declare an engine it does
+/// derived from what was registered**: a plugin cannot declare a source it does
 /// not implement, because there is no way to declare it separately.
 ///
 /// ```ignore
 /// PluginRuntime::new(MyPlugin::default())
-///     .with_engine(MyEngine::default())
+///     .with_source(MySource::default())
 ///     .serve()
 ///     .await?;
 /// ```
 pub struct PluginRuntime<P> {
     plugin: P,
-    engine: Option<Registration>,
+    source: Option<Registration>,
     storage: Option<Registration>,
 }
 
@@ -117,20 +117,20 @@ impl<P: Plugin> PluginRuntime<P> {
     pub fn new(plugin: P) -> Self {
         Self {
             plugin,
-            engine: None,
+            source: None,
             storage: None,
         }
     }
 
-    /// Registers the dump/restore engine. Announces the `engine` capability.
+    /// Registers the dump/restore source. Announces the `source` capability.
     ///
-    /// Registering twice keeps the last one: two engines on the same channel
+    /// Registering twice keeps the last one: two sources on the same channel
     /// would stomp on each other's routes, and an `Option` makes that
     /// impossible.
     #[must_use]
-    pub fn with_engine<E: Engine>(mut self, engine: E) -> Self {
-        self.engine = Some(Box::new(move |r: Routes| {
-            r.add_service(EngineServer::new(engine))
+    pub fn with_source<T: Source>(mut self, source: T) -> Self {
+        self.source = Some(Box::new(move |r: Routes| {
+            r.add_service(SourceServer::new(source))
         }));
         self
     }
@@ -168,7 +168,7 @@ impl<P: Plugin> PluginRuntime<P> {
         let version = bootstrap.negotiate(&[PROTOCOL_VERSION])?;
         let tls = server_config_from_bundle(&bootstrap.tls)?;
 
-        let engine = self.engine.is_some();
+        let source = self.source.is_some();
         let storage = self.storage.is_some();
 
         // The Plugin service goes wrapped: `Shutdown` is first served by the
@@ -179,7 +179,7 @@ impl<P: Plugin> PluginRuntime<P> {
             self.plugin,
             stop.clone(),
         )));
-        if let Some(register) = self.engine {
+        if let Some(register) = self.source {
             routes = register(routes);
         }
         if let Some(register) = self.storage {
@@ -205,11 +205,11 @@ impl<P: Plugin> PluginRuntime<P> {
         tracing::debug!(
             protocol = version,
             socket = %socket.display(),
-            engine,
+            source,
             storage,
             "control channel listening; announcing ready"
         );
-        announce(&build_ready(version, engine, storage, std::process::id()))?;
+        announce(&build_ready(version, source, storage, std::process::id()))?;
 
         // We live until one of two things happens: the channel goes down by
         // itself —and then its error is the plugin's result— or the core asks
@@ -336,8 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_announces_engine() {
-        assert_eq!(capabilities(true, false), vec!["engine"]);
+    fn a_source_announces_source() {
+        assert_eq!(capabilities(true, false), vec!["source"]);
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn a_plugin_that_does_both_announces_both() {
-        assert_eq!(capabilities(true, true), vec!["engine", "storage"]);
+        assert_eq!(capabilities(true, true), vec!["source", "storage"]);
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod tests {
         let r = build_ready(1, true, false, 4242);
         assert_eq!(r.magic, sb_transport::MAGIC);
         assert_eq!(r.protocol_version, 1);
-        assert_eq!(r.capabilities, vec!["engine"]);
+        assert_eq!(r.capabilities, vec!["source"]);
         assert_eq!(r.pid, 4242);
     }
 
@@ -371,10 +371,10 @@ mod tests {
     #[test]
     fn the_declared_capabilities_match_the_registered_services() {
         // The reason for deriving them instead of passing them by hand: a plugin
-        // cannot announce an engine it does not implement.
-        for (engine, storage) in [(false, false), (true, false), (false, true), (true, true)] {
-            let r = build_ready(1, engine, storage, 1);
-            assert_eq!(r.capabilities.contains(&"engine".to_string()), engine);
+        // cannot announce a source it does not implement.
+        for (source, storage) in [(false, false), (true, false), (false, true), (true, true)] {
+            let r = build_ready(1, source, storage, 1);
+            assert_eq!(r.capabilities.contains(&"source".to_string()), source);
             assert_eq!(r.capabilities.contains(&"storage".to_string()), storage);
         }
     }

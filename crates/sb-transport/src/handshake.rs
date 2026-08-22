@@ -196,7 +196,7 @@ mod tests {
         Ready {
             magic: MAGIC.into(),
             protocol_version: 1,
-            capabilities: vec!["engine".into()],
+            capabilities: vec!["source".into()],
             pid: 4242,
         }
     }
@@ -248,7 +248,7 @@ mod tests {
         assert!(!line.contains('\n'));
         let round_tripped = Ready::from_line(&line).unwrap();
         assert_eq!(round_tripped.pid, 4242);
-        assert_eq!(round_tripped.capabilities, vec!["engine".to_string()]);
+        assert_eq!(round_tripped.capabilities, vec!["source".to_string()]);
     }
 
     #[test]

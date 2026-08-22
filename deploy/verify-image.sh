@@ -7,7 +7,7 @@
 #
 #     plugin lock  ->  doctor  ->  backup  ->  verify  ->  restore
 #
-# and checks, byte for byte, that what was restored is what the engine dumped.
+# and checks, byte for byte, that what was restored is what the source dumped.
 #
 # Each step is a separate `docker run`, as it would be in production: separate
 # processes, with no shared state beyond the volume. And they all run with the
@@ -73,19 +73,19 @@ else
 fi
 
 # -- Configuration and keys --------------------------------------------------
-# The data directory is the same for the engine and for the storage target: the
-# mock engine writes what it restores there and the mock storage target keeps
+# The data directory is the same for the source and for the storage target: the
+# mock source writes what it restores there and the mock storage target keeps
 # the artifacts there. The [plugins] section is deliberately omitted: it checks
 # that the image's defaults (the ~/.shieldbk links) resolve to what is
 # installed.
 cat > "$WORKDIR/config.toml" <<TOML
 [[target]]
 name = "production"
-engine = "mock"
+source = "mock"
 storage = "mock"
 recipient = "$RECIPIENT"
 
-[target.engine_config]
+[target.source_config]
 dir = "/var/lib/shieldbk"
 seed = $SEED
 size = $SIZE
@@ -187,7 +187,7 @@ out="$(sb restore production "$ARTIFACT" --identity /etc/shieldbk/key.age)" \
   || bad "restore failed: $out"
 ok "restore finished without error"
 
-# The mock engine leaves what it receives in `restore.bin`, and its dump is
+# The mock source leaves what it receives in `restore.bin`, and its dump is
 # deterministic: comparing its SHA-256 with that of a fresh backup closes the
 # cycle.
 restored_sha="$(inspect "sha256sum /data/restore.bin | cut -d' ' -f1")"
@@ -197,7 +197,7 @@ restored_size="$(inspect "stat -c %s /data/restore.bin")"
   || bad "what was restored is $restored_size bytes and the dump was $SIZE"
 ok "restore.bin: $restored_size bytes, sha256 ${restored_sha:0:16}..."
 
-# Second round: another backup from the same deterministic engine and another
+# Second round: another backup from the same deterministic source and another
 # restore. If the two `restore.bin` match, the cycle reproduces the data.
 inspect "rm -f /data/restore.bin"
 out="$(sb --format json backup)" || bad "the second backup failed: $out"

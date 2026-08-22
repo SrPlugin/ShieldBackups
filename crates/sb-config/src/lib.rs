@@ -1,7 +1,7 @@
 //! `shieldbk` configuration: the model of the TOML file.
 //!
-//! The core knows no specific engine and no specific storage. Whatever the user
-//! writes inside `engine_config` and `storage_config` travels up to here as an
+//! The core knows no specific source and no specific storage. Whatever the user
+//! writes inside `source_config` and `storage_config` travels up to here as an
 //! opaque table and is validated later against the schema the corresponding
 //! plugin declares over gRPC.
 

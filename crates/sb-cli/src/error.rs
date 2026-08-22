@@ -233,7 +233,7 @@ mod tests {
         // A live plugin is needed to discover it, but what has to be fixed is
         // the file: retrying will not change it.
         let error = CliError::from(ValidationError::MissingRequiredField {
-            section: "engine".into(),
+            section: "source".into(),
             field: "host".into(),
         });
         assert_eq!(error.code(), EXIT_CONFIG);

@@ -56,7 +56,7 @@ const PRIVATE_MODE: u32 = 0o700;
 
 /// Distinguishes directories of plugins started by the same core.
 ///
-/// A backup uses an engine and a storage at once: two live plugins that cannot
+/// A backup uses a source and a storage at once: two live plugins that cannot
 /// share a socket. The core's pid separates different runs and this counter
 /// separates the plugins of a single run.
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -231,7 +231,7 @@ impl PluginProcess {
         self.protocol_version
     }
 
-    /// What the plugin says it knows how to do: `engine`, `storage` or both.
+    /// What the plugin says it knows how to do: `source`, `storage` or both.
     #[must_use]
     pub fn capabilities(&self) -> &[String] {
         &self.capabilities
@@ -501,7 +501,7 @@ mod tests {
     async fn starts_a_plugin_and_completes_the_handshake() {
         let p = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
         assert_eq!(p.protocol_version(), sb_proto::PROTOCOL_VERSION);
-        assert!(p.capabilities().contains(&"engine".to_string()));
+        assert!(p.capabilities().contains(&"source".to_string()));
         assert!(p.capabilities().contains(&"storage".to_string()));
         p.shutdown().await.unwrap();
     }
@@ -606,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_simultaneous_plugins_do_not_share_a_directory() {
-        // A backup uses an engine and a storage at once.
+        // A backup uses a source and a storage at once.
         let a = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
         let b = PluginProcess::spawn("mock", &mock_path()).await.unwrap();
         assert_ne!(a.runtime_dir(), b.runtime_dir());

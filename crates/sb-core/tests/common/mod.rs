@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 //! What the core's integration tests share: locating the mock plugin's binary
-//! and leaving an engine and a storage configured over the same directory.
+//! and leaving a source and a storage configured over the same directory.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -82,20 +82,20 @@ pub async fn configure(client: &PluginClient, dir: &Path) {
     client.configure(cfg).await.unwrap();
 }
 
-/// Starts an engine and a storage already configured over the same directory.
+/// Starts a source and a storage already configured over the same directory.
 pub async fn prepare(dir: &Path, seed: i64, size: i64) -> (PluginClient, PluginClient) {
-    let engine = start("mock-engine").await;
+    let source = start("mock-source").await;
     let storage = start("mock-storage").await;
 
-    let mut engine_cfg = HashMap::new();
-    engine_cfg.insert("dir".into(), v_str(dir.to_string_lossy()));
-    engine_cfg.insert("seed".into(), v_int(seed));
-    engine_cfg.insert("size".into(), v_int(size));
-    engine.configure(engine_cfg).await.unwrap();
+    let mut source_cfg = HashMap::new();
+    source_cfg.insert("dir".into(), v_str(dir.to_string_lossy()));
+    source_cfg.insert("seed".into(), v_int(seed));
+    source_cfg.insert("size".into(), v_int(size));
+    source.configure(source_cfg).await.unwrap();
 
     configure(&storage, dir).await;
 
-    (engine, storage)
+    (source, storage)
 }
 
 /// Kills the plugin outright and **waits until it really is dead**.
@@ -128,33 +128,33 @@ pub async fn kill(client: &PluginClient) {
 }
 
 pub fn request<'a>(
-    engine: &'a PluginClient,
+    source: &'a PluginClient,
     storage: &'a PluginClient,
     key: &str,
     id: &Identity,
 ) -> BackupRequest<'a> {
     BackupRequest {
         target: "test".into(),
-        engine,
+        source,
         storage,
         artifact_key: key.into(),
         recipient: id.to_recipient(),
         level: CompressionLevel::default(),
-        engine_version: "0.1.0".into(),
-        server_version: "mock".into(),
+        plugin_version: "0.1.0".into(),
+        source_version: "mock".into(),
         created_at: "2026-08-21T10:00:00Z".into(),
     }
 }
 
-/// Name of the file where the mock engine leaves what it receives via `Restore`.
+/// Name of the file where the mock source leaves what it receives via `Restore`.
 ///
 /// The constant lives in the plugin's binary, which a test cannot import.
 pub const RESTORED_FILE: &str = "restore.bin";
 
-/// What the mock engine produces for a given seed and size.
+/// What the mock source produces for a given seed and size.
 ///
 /// It is the reference against which the restored data is compared: if the full
 /// cycle does not reproduce this byte for byte, the project is useless.
-pub fn engine_data(seed: u64, size: usize) -> Vec<u8> {
+pub fn source_data(seed: u64, size: usize) -> Vec<u8> {
     sb_plugin_mock::deterministic_data(seed, size).collect()
 }

@@ -17,7 +17,7 @@ use crate::plugin::{Capability, PluginClient};
 
 /// Name of the check that carries the source's version.
 ///
-/// The engine reports it in its `Preflight` and a backup's manifest needs it, so
+/// The source reports it in its `Preflight` and a backup's manifest needs it, so
 /// it travels as one more check instead of as a separate field: it is diagnostic
 /// information —"which version of `PostgreSQL` am I talking to"— and the user
 /// wants to see it in the report, not just the program.
@@ -26,7 +26,7 @@ const CHECK_SOURCE_VERSION: &str = "source version";
 /// A check already performed, with its verdict and with **whose it is**.
 #[derive(Debug, Clone)]
 pub struct CheckResult {
-    /// "engine" or "storage": which plugin the check comes from.
+    /// "source" or "storage": which plugin the check comes from.
     ///
     /// A backup has two live plugins at once; "missing permission" without
     /// saying which of the two forces you to guess.
@@ -66,12 +66,14 @@ impl DoctorReport {
         self.checks.iter().filter(|c| !c.ok).collect()
     }
 
-    /// Version of the source detected by the engine, if it reported one.
+    /// Version the source reported for whatever it sits in front of —the
+    /// database server, the container runtime— if it reported one at all. A
+    /// source with no such notion, such as a plain directory, reports nothing.
     #[must_use]
-    pub fn server_version(&self) -> Option<&str> {
+    pub fn source_version(&self) -> Option<&str> {
         self.checks
             .iter()
-            .find(|c| c.origin == Capability::Engine.as_str() && c.name == CHECK_SOURCE_VERSION)
+            .find(|c| c.origin == Capability::Source.as_str() && c.name == CHECK_SOURCE_VERSION)
             .map(|c| c.detail.as_str())
     }
 }
@@ -85,14 +87,14 @@ impl DoctorReport {
 /// The two are asked in series and not in parallel on purpose: they are two short
 /// RPCs, gaining a few milliseconds does not make up for one plugin's messages
 /// getting mixed with the other's in the log, and the report comes out with the
-/// engine first, which is how it reads.
+/// source first, which is how it reads.
 pub async fn run_doctor(
     target: &str,
-    engine: &PluginClient,
+    source: &PluginClient,
     storage: &PluginClient,
 ) -> DoctorReport {
     let mut checks = Vec::new();
-    interrogate(&mut checks, Capability::Engine, engine).await;
+    interrogate(&mut checks, Capability::Source, source).await;
     interrogate(&mut checks, Capability::Storage, storage).await;
 
     DoctorReport {
@@ -125,12 +127,12 @@ async fn interrogate(checks: &mut Vec<CheckResult>, role: Capability, plugin: &P
         }
     };
 
-    if role == Capability::Engine && !response.server_version.is_empty() {
+    if role == Capability::Source && !response.source_version.is_empty() {
         checks.push(CheckResult {
             origin: origin.to_string(),
             name: CHECK_SOURCE_VERSION.to_string(),
             ok: true,
-            detail: response.server_version,
+            detail: response.source_version,
             remedy: String::new(),
         });
     }
@@ -183,7 +185,7 @@ mod tests {
         let report = DoctorReport {
             target: "t".into(),
             checks: vec![
-                check("engine", "binary", true, ""),
+                check("source", "binary", true, ""),
                 check("storage", "bucket", true, ""),
             ],
         };
@@ -196,7 +198,7 @@ mod tests {
         let report = DoctorReport {
             target: "t".into(),
             checks: vec![
-                check("engine", "a", true, ""),
+                check("source", "a", true, ""),
                 check("storage", "b", false, "grant s3:PutObject"),
             ],
         };
@@ -224,8 +226,8 @@ mod tests {
         let report = DoctorReport {
             target: "t".into(),
             checks: vec![
-                check("engine", "a", false, "fix a"),
-                check("engine", "b", false, "fix b"),
+                check("source", "a", false, "fix a"),
+                check("source", "b", false, "fix b"),
                 check("storage", "c", false, "fix c"),
             ],
         };

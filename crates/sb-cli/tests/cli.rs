@@ -277,7 +277,7 @@ lockfile = "~/plugins.lock"
 
 [[target]]
 name = "production"
-engine = "mock"
+source = "mock"
 storage = "mock"
 recipient = "age1qqqqqqqqqq"
 "#,

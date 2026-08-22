@@ -35,18 +35,18 @@ pub async fn run(
     let target = ctx.target(target)?;
     let identity = read_identity(identity)?;
 
-    let engine = plugins::start_for(ctx, target, Role::Engine).await?;
+    let source = plugins::start_for(ctx, target, Role::Source).await?;
     let storage = match plugins::start_for(ctx, target, Role::Storage).await {
         Ok(storage) => storage,
         Err(error) => {
-            plugins::close(engine).await;
+            plugins::close(source).await;
             return Err(error);
         }
     };
 
-    let outcome = restore(&engine, &storage, artifact, &identity).await;
+    let outcome = restore(&source, &storage, artifact, &identity).await;
 
-    plugins::close(engine).await;
+    plugins::close(source).await;
     plugins::close(storage).await;
 
     let written = outcome?;
@@ -62,7 +62,7 @@ pub async fn run(
 }
 
 async fn restore(
-    engine: &sb_core::plugin::PluginClient,
+    source: &sb_core::plugin::PluginClient,
     storage: &sb_core::plugin::PluginClient,
     artifact: &str,
     identity: &Identity,
@@ -85,7 +85,7 @@ async fn restore(
     };
 
     Ok(run_restore(RestoreRequest {
-        engine,
+        source,
         storage,
         artifact_key: artifact.to_owned(),
         identity,

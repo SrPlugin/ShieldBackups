@@ -32,7 +32,7 @@ proptest! {
         template in ".*",
     ) {
         let text = format!(
-            "[defaults]\ncompression_level = {level}\n\n[[target]]\nname = {}\nengine = \"e\"\n\
+            "[defaults]\ncompression_level = {level}\n\n[[target]]\nname = {}\nsource = \"e\"\n\
              storage = \"s\"\nrecipient = \"age1x\"\nartifact_template = {}\n",
             toml_str(&name),
             toml_str(&template),
@@ -51,7 +51,7 @@ proptest! {
         for n in &names {
             let _ = write!(
                 text,
-                "[[target]]\nname = {}\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n\n",
+                "[[target]]\nname = {}\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n\n",
                 toml_str(n)
             );
         }
@@ -66,8 +66,8 @@ proptest! {
         value in ".*",
     ) {
         let text = format!(
-            "[[target]]\nname = \"t\"\nengine = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n\
-             [target.engine_config]\n{key} = {}\n",
+            "[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n\
+             [target.source_config]\n{key} = {}\n",
             toml_str(&value)
         );
         let _ = Config::parse(&text);

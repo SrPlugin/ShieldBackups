@@ -1,8 +1,8 @@
-//! The backup operation: engine → core → storage, in a single pass and without
+//! The backup operation: source → core → storage, in a single pass and without
 //! touching the local disk.
 //!
 //! ```text
-//! engine-plugin ──[data socket]──▶ core ──[data socket]──▶ storage-plugin
+//! source-plugin ──[data socket]──▶ core ──[data socket]──▶ storage-plugin
 //!                             zstd → age → SHA-256
 //! ```
 //!
@@ -12,14 +12,14 @@
 //!
 //! # The order of the calls
 //!
-//! `Storage.Put` is called first and `Engine.Dump` **afterwards**, which is
+//! `Storage.Put` is called first and `Source.Dump` **afterwards**, which is
 //! exactly the opposite of how the diagram reads. The reason is in [`run_backup`]
 //! and it is not a stylistic preference: it is the difference between a backup
 //! that finishes and one that hangs.
 
 use sb_crypto::{BackupOptions, BackupSummary, CompressionLevel, Recipient};
 
-use crate::model::{CompressionInfo, EncryptionInfo, EngineInfo, MANIFEST_VERSION, Manifest};
+use crate::model::{CompressionInfo, EncryptionInfo, MANIFEST_VERSION, Manifest, SourceInfo};
 use crate::ops::channel::{
     OP_DUMP, OP_PUT, accept, create_channel, start_dump, start_put, upload_blob, wait_for_progress,
 };
@@ -42,13 +42,13 @@ const ENCRYPTION_ALGORITHM: &str = "age";
 /// which plugin to use nor how to configure it, it only makes them talk.
 pub struct BackupRequest<'a> {
     pub target: String,
-    pub engine: &'a PluginClient,
+    pub source: &'a PluginClient,
     pub storage: &'a PluginClient,
     pub artifact_key: String,
     pub recipient: Recipient,
     pub level: CompressionLevel,
-    pub engine_version: String,
-    pub server_version: String,
+    pub plugin_version: String,
+    pub source_version: String,
     /// ISO-8601 timestamp in UTC. The caller computes it, so that the operation
     /// is deterministic and testable.
     pub created_at: String,
@@ -66,14 +66,14 @@ pub struct BackupOutcome {
 ///
 /// # The order of `Put` and `Dump`, deliberately counter-intuitive
 ///
-/// `Storage.Put` is called **before** `Engine.Dump`. Reading the diagram above
+/// `Storage.Put` is called **before** `Source.Dump`. Reading the diagram above
 /// you would say the producer goes first, and that is exactly the change
 /// somebody will try to make some day.
 ///
 /// Do not do it, and here is the reason with the measurements behind it.
 ///
 /// The dump socket has a kernel buffer of about 208 KiB
-/// (`net.core.wmem_default`). If the engine starts before the storage is in
+/// (`net.core.wmem_default`). If the source starts before the storage is in
 /// place, it writes into a socket nobody is going to drain yet and blocks on its
 /// `write` as soon as that buffer fills up. **What happens next depends on
 /// something this code does not control: on how the plugin is written.**
@@ -81,7 +81,7 @@ pub struct BackupOutcome {
 /// Reversing the order was tried and the tests in `tests/backup_mock.rs` still
 /// pass, even inserting three seconds of delay between the two calls: with
 /// plugins like the mock —whose `Dump` returns the RPC headers immediately and
-/// does the work in a separate task— the engine does not hang, it just stalls on
+/// does the work in a separate task— the source does not hang, it just stalls on
 /// its `write` until the core reaches the `accept` and the pipeline starts
 /// draining. That it does not show up here does not mean it does not matter:
 ///
@@ -90,7 +90,7 @@ pub struct BackupOutcome {
 ///   mean `Put` never gets called at all. That really is the hang, and only the
 ///   open deadline in `ops::channel` cuts it short.
 /// * With `Dump` first, a `Put` that fails —invalid key, storage down— leaves
-///   behind an engine already launched, writing into a socket that is about to
+///   behind a source already launched, writing into a socket that is about to
 ///   be closed under it. Putting `Put` first makes that failure happen before a
 ///   single byte has been moved.
 ///
@@ -107,28 +107,28 @@ pub async fn run_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, BackupE
     // 1. First of all: that each plugin can play the role it is assigned.
     //    Finding out here costs a string comparison; finding out halfway through
     //    the dump costs the dump.
-    req.engine.require_capability(Capability::Engine)?;
+    req.source.require_capability(Capability::Source)?;
     req.storage.require_capability(Capability::Storage)?;
 
     // 2. One channel per plugin, each inside the runtime directory of its owner:
     //    it is the only place that process is guaranteed to have access to.
-    let dump_channel = create_channel(req.engine)?;
+    let dump_channel = create_channel(req.source)?;
     let upload_channel = create_channel(req.storage)?;
 
     // 3 and 4. THE CONSUMER FIRST. See the note above before touching this.
     let upload = start_put(req.storage, &req.artifact_key, &upload_channel).await?;
-    let dump = start_dump(req.engine, &dump_channel).await?;
+    let dump = start_dump(req.source, &dump_channel).await?;
 
     // 6. Both plugins now have their orders; now they must show up on the
     //    socket.
-    let source = accept(&dump_channel, req.engine.name(), OP_DUMP).await?;
+    let dump_stream = accept(&dump_channel, req.source.name(), OP_DUMP).await?;
     let sink = accept(&upload_channel, req.storage.name(), OP_PUT).await?;
 
     // 7. The core is nothing more than the stretch of pipe between the two
     //    sockets.
     let recipient = req.recipient.to_string();
     let summary = sb_crypto::backup(
-        source,
+        dump_stream,
         sink,
         &BackupOptions {
             recipient: req.recipient,
@@ -140,7 +140,7 @@ pub async fn run_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, BackupE
     // 8. The pipeline has finished, but the plugins have not necessarily: the
     //    storage may still be closing its file. Without waiting here, the
     //    manifest could describe an artifact that is not complete yet.
-    wait_for_progress(dump, req.engine.name(), OP_DUMP).await?;
+    wait_for_progress(dump, req.source.name(), OP_DUMP).await?;
     wait_for_progress(upload, req.storage.name(), OP_PUT).await?;
 
     // 9. The manifest goes up the same way as the artifact —another channel,
@@ -151,10 +151,10 @@ pub async fn run_backup(req: BackupRequest<'_>) -> Result<BackupOutcome, BackupE
     let manifest = Manifest {
         version: MANIFEST_VERSION,
         target: req.target,
-        engine: EngineInfo {
-            plugin: req.engine.name().to_string(),
-            plugin_version: req.engine_version,
-            server_version: req.server_version,
+        source: SourceInfo {
+            plugin: req.source.name().to_string(),
+            plugin_version: req.plugin_version,
+            source_version: req.source_version,
         },
         created_at: req.created_at,
         artifact_key: req.artifact_key.clone(),

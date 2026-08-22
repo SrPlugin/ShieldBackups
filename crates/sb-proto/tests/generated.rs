@@ -12,10 +12,10 @@ fn the_generated_types_exist_and_can_be_built() {
         name: "mock".into(),
         version: "0.1.0".into(),
         protocol_version: PROTOCOL_VERSION,
-        capabilities: vec![Capability::Engine as i32],
+        capabilities: vec![Capability::Source as i32],
     };
     assert_eq!(info.protocol_version, 1);
-    assert_eq!(info.capabilities, vec![Capability::Engine as i32]);
+    assert_eq!(info.capabilities, vec![Capability::Source as i32]);
 }
 
 #[test]
@@ -24,7 +24,7 @@ fn a_plugin_can_declare_both_capabilities() {
         name: "mock".into(),
         version: "0.1.0".into(),
         protocol_version: PROTOCOL_VERSION,
-        capabilities: vec![Capability::Engine as i32, Capability::Storage as i32],
+        capabilities: vec![Capability::Source as i32, Capability::Storage as i32],
     };
     assert_eq!(info.capabilities.len(), 2);
 }
@@ -107,7 +107,7 @@ fn a_new_field_does_not_break_an_older_reader() {
     let mut bytes = PreflightResponse {
         ok: true,
         checks: vec![],
-        server_version: "16.2".into(),
+        source_version: "16.2".into(),
     }
     .encode_to_vec();
 
@@ -117,7 +117,7 @@ fn a_new_field_does_not_break_an_older_reader() {
     let round_tripped = PreflightResponse::decode(&bytes[..])
         .expect("an unknown field must be ignored, not break decoding");
     assert!(round_tripped.ok);
-    assert_eq!(round_tripped.server_version, "16.2");
+    assert_eq!(round_tripped.source_version, "16.2");
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn the_generated_clients_and_servers_exist() {
     // only mentions the types: if they did not exist, this would not compile.
     fn _accepts_types() {
         let _: Option<sb_proto::plugin_client::PluginClient<tonic::transport::Channel>> = None;
-        let _: Option<sb_proto::engine_client::EngineClient<tonic::transport::Channel>> = None;
+        let _: Option<sb_proto::source_client::SourceClient<tonic::transport::Channel>> = None;
         let _: Option<sb_proto::storage_client::StorageClient<tonic::transport::Channel>> = None;
     }
 }

@@ -40,7 +40,7 @@ tonic = "0.14.6"
 tracing.workspace = true
 
 [dev-dependencies]
-# The mock's deterministic generator, so the test can regenerate what the engine
+# The mock's deterministic generator, so the test can regenerate what the source
 # claimed to produce and compare digests instead of taking its word for it.
 sb-plugin-mock = { version = "0.1.0", path = "../../plugins/sb-plugin-mock" }
 tempfile = "3.27.0"
