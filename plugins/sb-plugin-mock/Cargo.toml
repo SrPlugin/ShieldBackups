@@ -10,8 +10,8 @@ publish = false
 name = "sb-plugin-mock"
 path = "src/main.rs"
 
-# El generador de datos se expone también como librería para que los tests del
-# núcleo puedan regenerar exactamente lo que el motor produjo y compararlo.
+# The data generator is also exposed as a library so that the core's tests can
+# regenerate exactly what the engine produced and compare against it.
 [lib]
 name = "sb_plugin_mock"
 path = "src/lib.rs"
@@ -20,20 +20,21 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-# El SDK es la única dependencia del plugin: reexporta sb-proto, tonic y
-# `connect_data`, que es todo lo que hace falta para hablar con el núcleo.
+# The SDK is the plugin's only dependency: it re-exports sb-proto, tonic and
+# `connect_data`, which is everything needed to talk to the core.
 sb-plugin-sdk = { version = "0.1.0", path = "../../crates/sb-plugin-sdk" }
 tokio = { workspace = true }
-# `ArtifactMeta.modified_at` es RFC-3339 UTC por contrato, y convertir segundos
-# desde el epoch a fecha civil tiene reglas —bisiestos, la excepción de los
-# múltiplos de 400— que no merece la pena reimplementar. Como en `sb-core`,
-# solo se usan los accesores y la cadena se compone con `format!`: no hacen
-# falta las features `formatting`/`parsing`/`macros`.
+# `ArtifactMeta.modified_at` is RFC-3339 UTC by contract, and converting seconds
+# since the epoch into a civil date has rules -- leap years, the multiple-of-400
+# exception -- that are not worth reimplementing. As in `sb-core`, only the
+# accessors are used and the string is composed with `format!`: the
+# `formatting`/`parsing`/`macros` features are not needed.
 time = "0.3.55"
 tracing = { workspace = true }
 
 [dev-dependencies]
-# Solo los tests necesitan el transporte: ahí se hace de núcleo —montar el
-# sobre, la PKI efímera y los canales de datos—, no de plugin.
+# Only the tests need the transport: there they play the role of the core --
+# setting up the envelope, the ephemeral PKI and the data channels -- not of a
+# plugin.
 sb-transport = { version = "0.1.0", path = "../../crates/sb-transport" }
 tempfile = "3"

@@ -1,96 +1,88 @@
-//! El motor: produce bytes deterministas y los vuelve a recibir.
+//! The engine: it produces deterministic bytes and receives them back.
 //!
-//! No hay base de datos detrás. `Dump` genera el flujo desde una semilla y
-//! `Restore` lo escribe en disco para que un test pueda compararlo con lo que
-//! el generador produce, sin más dependencias que la aritmética.
+//! There is no database behind it. `Dump` generates the stream from a seed and
+//! `Restore` writes it to disk so that a test can compare it with what the
+//! generator produces, with no dependency beyond arithmetic.
 
 use std::path::Path;
 
-use sb_plugin_mock::datos_deterministas;
+use sb_plugin_mock::deterministic_data;
 use sb_plugin_sdk::sb_proto::engine_server::Engine;
 use sb_plugin_sdk::sb_proto::{DumpRequest, RestoreRequest};
 use sb_plugin_sdk::tonic::{Request, Response, Status};
 use sb_plugin_sdk::{ProgressEmitter, ProgressStream, progress_stream};
 
-use crate::config::{Config, Estado};
-use crate::flujo;
+use crate::config::{Config, State};
+use crate::stream;
 
-/// Nombre del fichero donde `Restore` deja lo que recibe.
-pub const FICHERO_RESTAURADO: &str = "restore.bin";
+/// Name of the file where `Restore` leaves what it receives.
+pub const RESTORE_FILE: &str = "restore.bin";
 
-pub struct MotorMock {
-    estado: Estado,
+pub struct MockEngine {
+    state: State,
 }
 
-impl MotorMock {
+impl MockEngine {
     #[must_use]
-    pub fn new(estado: Estado) -> Self {
-        Self { estado }
+    pub fn new(state: State) -> Self {
+        Self { state }
     }
 }
 
 #[sb_plugin_sdk::tonic::async_trait]
-impl Engine for MotorMock {
+impl Engine for MockEngine {
     type DumpStream = ProgressStream;
     type RestoreStream = ProgressStream;
 
     async fn dump(
         &self,
-        peticion: Request<DumpRequest>,
+        request: Request<DumpRequest>,
     ) -> Result<Response<Self::DumpStream>, Status> {
-        // La configuración se exige aquí, antes de tocar el canal: si falta,
-        // el núcleo recibe un `failed_precondition` inmediato en vez de un
-        // volcado silencioso con valores que nadie pidió.
-        let config = self.estado.resolved()?;
-        let socket = peticion.into_inner().data_socket;
-        Ok(progress_stream(move |mut progreso| async move {
-            volcar(&socket, &config, &mut progreso).await
+        // The configuration is required here, before touching the channel: if
+        // it is missing, the core gets an immediate `failed_precondition`
+        // instead of a silent dump with values nobody asked for.
+        let config = self.state.resolved()?;
+        let socket = request.into_inner().data_socket;
+        Ok(progress_stream(move |mut progress| async move {
+            dump(&socket, &config, &mut progress).await
         }))
     }
 
     async fn restore(
         &self,
-        peticion: Request<RestoreRequest>,
+        request: Request<RestoreRequest>,
     ) -> Result<Response<Self::RestoreStream>, Status> {
-        let config = self.estado.resolved()?;
-        let socket = peticion.into_inner().data_socket;
-        let destino = config.dir.join(FICHERO_RESTAURADO);
-        Ok(progress_stream(move |mut progreso| async move {
-            restaurar(&socket, &destino, &mut progreso).await
+        let config = self.state.resolved()?;
+        let socket = request.into_inner().data_socket;
+        let dest = config.dir.join(RESTORE_FILE);
+        Ok(progress_stream(move |mut progress| async move {
+            restore(&socket, &dest, &mut progress).await
         }))
     }
 }
 
-/// Escribe `size` bytes de la semilla en el canal y lo cierra.
-async fn volcar(
-    socket: &str,
-    config: &Config,
-    progreso: &mut ProgressEmitter,
-) -> Result<(), Status> {
-    let mut canal = flujo::conectar(socket).await?;
-    let mut generador = datos_deterministas(config.seed, config.size);
+/// Writes `size` bytes from the seed into the channel and closes it.
+async fn dump(socket: &str, config: &Config, progress: &mut ProgressEmitter) -> Result<(), Status> {
+    let mut channel = stream::connect(socket).await?;
+    let mut generator = deterministic_data(config.seed, config.size);
     loop {
-        let trozo: Vec<u8> = generador.by_ref().take(flujo::TROZO).collect();
-        if trozo.is_empty() {
+        let chunk: Vec<u8> = generator.by_ref().take(stream::CHUNK).collect();
+        if chunk.is_empty() {
             break;
         }
-        flujo::escribir(&mut canal, &trozo).await?;
-        progreso.advance(trozo.len()).await;
+        stream::write(&mut channel, &chunk).await?;
+        progress.advance(chunk.len()).await;
     }
-    // El cierre es la señal de fin de flujo para el núcleo.
-    flujo::cerrar(&mut canal).await?;
-    progreso.finish("volcado completado").await;
-    tracing::info!(seed = config.seed, size = config.size, "volcado emitido");
+    // Closing is the end-of-stream signal for the core.
+    stream::close(&mut channel).await?;
+    progress.finish("dump complete").await;
+    tracing::info!(seed = config.seed, size = config.size, "dump emitted");
     Ok(())
 }
 
-async fn restaurar(
-    socket: &str,
-    destino: &Path,
-    progreso: &mut ProgressEmitter,
-) -> Result<(), Status> {
-    flujo::del_canal_al_fichero(socket, destino, progreso).await?;
-    progreso.finish("restauración completada").await;
-    tracing::info!(destino = %destino.display(), "restauración escrita");
+async fn restore(socket: &str, dest: &Path, progress: &mut ProgressEmitter) -> Result<(), Status> {
+    stream::channel_to_file(socket, dest, progress).await?;
+    progress.finish("restore complete").await;
+    tracing::info!(dest = %dest.display(), "restore written");
     Ok(())
 }

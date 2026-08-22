@@ -1,8 +1,8 @@
-//! El destino: un directorio del disco haciendo de bucket.
+//! The storage target: a directory on disk playing the part of a bucket.
 //!
-//! Cada clave es un fichero bajo `dir`. Lo interesante no es guardar bytes sino
-//! reproducir el contrato que el núcleo espera de un destino real: claves con
-//! jerarquía, borrado idempotente y rechazo de claves que se salen.
+//! Each key is a file under `dir`. The interesting part is not storing bytes
+//! but reproducing the contract the core expects from a real storage target:
+//! hierarchical keys, idempotent deletion and rejection of escaping keys.
 
 use sb_plugin_sdk::sb_proto::storage_server::Storage;
 use sb_plugin_sdk::sb_proto::{
@@ -12,79 +12,73 @@ use sb_plugin_sdk::sb_proto::{
 use sb_plugin_sdk::tonic::{Request, Response, Status};
 use sb_plugin_sdk::{ProgressStream, progress_stream};
 
-use crate::claves;
-use crate::config::Estado;
-use crate::flujo;
+use crate::config::State;
+use crate::keys;
+use crate::stream;
 
-pub struct DestinoMock {
-    estado: Estado,
+pub struct MockStorage {
+    state: State,
 }
 
-impl DestinoMock {
+impl MockStorage {
     #[must_use]
-    pub fn new(estado: Estado) -> Self {
-        Self { estado }
+    pub fn new(state: State) -> Self {
+        Self { state }
     }
 }
 
 #[sb_plugin_sdk::tonic::async_trait]
-impl Storage for DestinoMock {
+impl Storage for MockStorage {
     type PutStream = ProgressStream;
     type GetStream = ProgressStream;
 
-    async fn put(
-        &self,
-        peticion: Request<PutRequest>,
-    ) -> Result<Response<Self::PutStream>, Status> {
-        let config = self.estado.resolved()?;
-        let PutRequest { key, data_socket } = peticion.into_inner();
-        // La clave se valida **antes** de abrir nada: un `..` debe fallar como
-        // error inmediato del RPC, no como un error a mitad del flujo cuando
-        // ya se escribió algo fuera del directorio.
-        let destino = claves::ruta_de(&config.dir, &key)?;
-        Ok(progress_stream(move |mut progreso| async move {
-            flujo::del_canal_al_fichero(&data_socket, &destino, &mut progreso).await?;
-            progreso.finish("artefacto almacenado").await;
-            tracing::info!(clave = %key, "artefacto almacenado");
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<Self::PutStream>, Status> {
+        let config = self.state.resolved()?;
+        let PutRequest { key, data_socket } = request.into_inner();
+        // The key is validated **before** anything is opened: a `..` must fail
+        // as an immediate RPC error, not as a mid-stream error once something
+        // has already been written outside the directory.
+        let dest = keys::path_for(&config.dir, &key)?;
+        Ok(progress_stream(move |mut progress| async move {
+            stream::channel_to_file(&data_socket, &dest, &mut progress).await?;
+            progress.finish("artifact stored").await;
+            tracing::info!(key = %key, "artifact stored");
             Ok(())
         }))
     }
 
-    async fn get(
-        &self,
-        peticion: Request<GetRequest>,
-    ) -> Result<Response<Self::GetStream>, Status> {
-        let config = self.estado.resolved()?;
-        let GetRequest { key, data_socket } = peticion.into_inner();
-        let origen = claves::ruta_de(&config.dir, &key)?;
-        // La ausencia también se comprueba antes: el núcleo debe poder
-        // distinguir «no está» de «se cortó a mitad».
-        if !origen.is_file() {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<Self::GetStream>, Status> {
+        let config = self.state.resolved()?;
+        let GetRequest { key, data_socket } = request.into_inner();
+        let source = keys::path_for(&config.dir, &key)?;
+        // Absence is also checked beforehand: the core must be able to tell
+        // "it is not there" from "it was cut off halfway".
+        if !source.is_file() {
             return Err(Status::not_found(format!(
-                "el artefacto `{key}` no existe en {}",
+                "the artifact `{key}` does not exist in {}",
                 config.dir.display()
             )));
         }
-        Ok(progress_stream(move |mut progreso| async move {
-            flujo::del_fichero_al_canal(&data_socket, &origen, &mut progreso).await?;
-            progreso.finish("artefacto entregado").await;
+        Ok(progress_stream(move |mut progress| async move {
+            stream::file_to_channel(&data_socket, &source, &mut progress).await?;
+            progress.finish("artifact delivered").await;
             Ok(())
         }))
     }
 
-    async fn list(&self, peticion: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let config = self.estado.resolved()?;
-        let prefijo = peticion.into_inner().prefix;
-        let encontrados = claves::listar(&config.dir, &prefijo).map_err(|e| {
-            Status::internal(format!("no se pudo recorrer {}: {e}", config.dir.display()))
+    async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        let config = self.state.resolved()?;
+        let prefix = request.into_inner().prefix;
+        let found = keys::list(&config.dir, &prefix).map_err(|e| {
+            Status::internal(format!("could not walk {}: {e}", config.dir.display()))
         })?;
         Ok(Response::new(ListResponse {
-            artifacts: encontrados
+            artifacts: found
                 .into_iter()
                 .map(|a| ArtifactMeta {
-                    key: a.clave,
-                    size: a.tamano,
-                    modified_at: a.modificado,
+                    key: a.key,
+                    size: a.size,
+                    modified_at: a.modified_at,
                 })
                 .collect(),
         }))
@@ -92,22 +86,20 @@ impl Storage for DestinoMock {
 
     async fn delete(
         &self,
-        peticion: Request<DeleteRequest>,
+        request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        let config = self.estado.resolved()?;
-        let clave = peticion.into_inner().key;
-        let ruta = claves::ruta_de(&config.dir, &clave)?;
-        match tokio::fs::remove_file(&ruta).await {
+        let config = self.state.resolved()?;
+        let key = request.into_inner().key;
+        let path = keys::path_for(&config.dir, &key)?;
+        match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
-            // Borrar lo que ya no está es el resultado que se pedía. Una
-            // retención que se reintenta no puede fallar por haber acertado.
+            // Deleting what is already gone is the result that was asked for. A
+            // retention pass that retries cannot fail for having succeeded.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::debug!(clave = %clave, "borrado de un artefacto que ya no estaba");
+                tracing::debug!(key = %key, "deletion of an artifact that was already gone");
             }
             Err(e) => {
-                return Err(Status::internal(format!(
-                    "no se pudo borrar `{clave}`: {e}"
-                )));
+                return Err(Status::internal(format!("could not delete `{key}`: {e}")));
             }
         }
         Ok(Response::new(DeleteResponse {}))
@@ -117,12 +109,12 @@ impl Storage for DestinoMock {
         &self,
         _: Request<AbortIncompleteRequest>,
     ) -> Result<Response<AbortIncompleteResponse>, Status> {
-        // Se exige configuración igual que en el resto del destino, aunque la
-        // respuesta no dependa de ella: un núcleo que se saltó `Configure`
-        // debe enterarse por el primer RPC que haga, no por el segundo.
-        let _ = self.estado.resolved()?;
-        // Este destino escribe cada artefacto de una vez: no hay multipart que
-        // abortar, y por eso siempre son cero.
+        // Configuration is required just as in the rest of the storage target,
+        // even though the answer does not depend on it: a core that skipped
+        // `Configure` must find out on the first RPC it makes, not the second.
+        let _ = self.state.resolved()?;
+        // This storage target writes each artifact in one go: there is no
+        // multipart to abort, which is why it is always zero.
         Ok(Response::new(AbortIncompleteResponse { aborted: 0 }))
     }
 }

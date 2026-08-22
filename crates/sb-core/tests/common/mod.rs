@@ -156,5 +156,5 @@ pub const RESTORED_FILE: &str = "restore.bin";
 /// It is the reference against which the restored data is compared: if the full
 /// cycle does not reproduce this byte for byte, the project is useless.
 pub fn engine_data(seed: u64, size: usize) -> Vec<u8> {
-    sb_plugin_mock::datos_deterministas(seed, size).collect()
+    sb_plugin_mock::deterministic_data(seed, size).collect()
 }

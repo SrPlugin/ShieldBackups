@@ -218,7 +218,7 @@ fn restore_reproduce_los_datos_que_el_motor_habia_volcado() {
     // El motor mock deja en `restore.bin` lo que recibe, y su volcado es
     // determinista: se puede regenerar aquí y comparar byte a byte.
     let restaurado = std::fs::read(banco.dir_datos().join("restore.bin")).unwrap();
-    let esperado: Vec<u8> = sb_plugin_mock::datos_deterministas(7, 65536).collect();
+    let esperado: Vec<u8> = sb_plugin_mock::deterministic_data(7, 65536).collect();
     assert_eq!(
         restaurado, esperado,
         "el ciclo completo por la CLI no reprodujo los datos originales"

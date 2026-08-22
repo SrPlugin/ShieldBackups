@@ -108,7 +108,7 @@ async fn the_hashed_plaintext_is_the_one_the_engine_said_it_produced() {
         .await
         .unwrap();
 
-    let expected: Vec<u8> = sb_plugin_mock::datos_deterministas(23, 1024 * 1024 + 3).collect();
+    let expected: Vec<u8> = sb_plugin_mock::deterministic_data(23, 1024 * 1024 + 3).collect();
     let mut w = sb_crypto::Sha256Writer::new(Vec::new());
     w.write_all(&expected).await.unwrap();
     w.shutdown().await.unwrap();

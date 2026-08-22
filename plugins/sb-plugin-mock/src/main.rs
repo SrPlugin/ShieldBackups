@@ -1,29 +1,30 @@
-//! `sb-plugin-mock`: un plugin que es motor y destino a la vez.
+//! `sb-plugin-mock`: a plugin that is both an engine and a storage target.
 //!
-//! Existe para que el núcleo —pipeline, orquestación y CLI— se pueda probar
-//! entero sin base de datos, sin red y sin credenciales. El motor genera bytes
-//! deterministas desde una semilla y el destino los guarda en un directorio,
-//! así que un test puede regenerar exactamente lo que el motor produjo
-//! —`sb_plugin_mock::datos_deterministas`— y compararlo byte a byte.
+//! It exists so that the core -- pipeline, orchestration and CLI -- can be
+//! tested end to end without a database, without the network and without
+//! credentials. The engine generates deterministic bytes from a seed and the
+//! storage target saves them in a directory, so a test can regenerate exactly
+//! what the engine produced -- `sb_plugin_mock::deterministic_data` -- and
+//! compare it byte for byte.
 
-mod claves;
 mod config;
 mod engine;
-mod flujo;
+mod keys;
 mod plugin;
 mod storage;
+mod stream;
 
 use sb_plugin_sdk::PluginRuntime;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Un único estado compartido: `Configure` llega por el servicio Plugin y
-    // lo leen el motor y el destino. Sin él, cada servicio tendría su propia
-    // idea de dónde está `dir`.
-    let estado = config::Estado::new(plugin::NOMBRE);
-    PluginRuntime::new(plugin::PluginMock::new(estado.clone()))
-        .with_engine(engine::MotorMock::new(estado.clone()))
-        .with_storage(storage::DestinoMock::new(estado))
+    // A single shared state: `Configure` arrives through the Plugin service and
+    // both the engine and the storage target read it. Without it, each service
+    // would have its own idea of where `dir` is.
+    let state = config::State::new(plugin::NAME);
+    PluginRuntime::new(plugin::MockPlugin::new(state.clone()))
+        .with_engine(engine::MockEngine::new(state.clone()))
+        .with_storage(storage::MockStorage::new(state))
         .serve()
         .await?;
     Ok(())

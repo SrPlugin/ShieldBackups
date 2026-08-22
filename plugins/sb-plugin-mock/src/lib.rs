@@ -1,5 +1,5 @@
-//! Generador determinista compartido entre el plugin y los tests del núcleo.
+//! Deterministic generator shared between the plugin and the core's tests.
 
-pub mod datos;
+pub mod data;
 
-pub use datos::datos_deterministas;
+pub use data::deterministic_data;
