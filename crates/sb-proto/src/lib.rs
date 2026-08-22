@@ -1,17 +1,18 @@
-//! Contrato entre el núcleo y los plugins.
+//! The contract between the core and the plugins.
 //!
-//! Este crate no contiene lógica: solo el código generado desde
-//! `proto/shieldbk/v1/plugin.proto`, que es la fuente de verdad del protocolo.
+//! This crate holds no logic: only the code generated from
+//! `proto/shieldbk/v1/plugin.proto`, which is the source of truth for the
+//! protocol.
 
-/// Versión del protocolo que implementa esta compilación.
+/// Protocol version implemented by this build.
 ///
-/// Se incrementa solo ante cambios que un plugin antiguo no pueda manejar.
-/// Añadir campos a un mensaje **no** requiere subirla: protobuf lo tolera por
-/// diseño, y ese es el motivo de haber elegido protobuf.
+/// It is bumped only for changes an older plugin could not cope with. Adding
+/// fields to a message does **not** require bumping it: protobuf tolerates that
+/// by design, and that is exactly why protobuf was chosen.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub mod v1 {
-    // El código generado no sigue nuestras convenciones de estilo.
+    // The generated code does not follow our style conventions.
     #![allow(clippy::pedantic, clippy::all)]
 
     tonic::include_proto!("shieldbk.v1");

@@ -1,5 +1,5 @@
-//! Comprueba que el código generado existe y tiene la forma esperada.
-//! Si el `.proto` cambia de manera incompatible, esto se rompe.
+//! Checks that the generated code exists and has the expected shape.
+//! If the `.proto` changes incompatibly, this breaks.
 
 use sb_proto::{
     Capability, Check, Field, FieldType, InfoResponse, PROTOCOL_VERSION, PreflightResponse,
@@ -7,7 +7,7 @@ use sb_proto::{
 };
 
 #[test]
-fn los_tipos_generados_existen_y_se_construyen() {
+fn the_generated_types_exist_and_can_be_built() {
     let info = InfoResponse {
         name: "mock".into(),
         version: "0.1.0".into(),
@@ -19,7 +19,7 @@ fn los_tipos_generados_existen_y_se_construyen() {
 }
 
 #[test]
-fn un_plugin_puede_declarar_ambas_capacidades() {
+fn a_plugin_can_declare_both_capabilities() {
     let info = InfoResponse {
         name: "mock".into(),
         version: "0.1.0".into(),
@@ -30,13 +30,13 @@ fn un_plugin_puede_declarar_ambas_capacidades() {
 }
 
 #[test]
-fn un_field_secreto_se_representa_correctamente() {
+fn a_secret_field_is_represented_correctly() {
     let f = Field {
         name: "password".into(),
         r#type: FieldType::String as i32,
         required: true,
         secret: true,
-        description: "contraseña de la base de datos".into(),
+        description: "database password".into(),
         default_value: String::new(),
     };
     assert!(f.secret);
@@ -44,63 +44,64 @@ fn un_field_secreto_se_representa_correctamente() {
 }
 
 #[test]
-fn los_valores_de_configuracion_cubren_los_cuatro_tipos() {
+fn the_configuration_values_cover_all_four_types() {
     use sb_proto::{StringList, Value, value::Kind};
 
-    let textos = Value {
+    let text = Value {
         kind: Some(Kind::StringValue("x".into())),
     };
-    let entero = Value {
+    let integer = Value {
         kind: Some(Kind::IntValue(5432)),
     };
-    let booleano = Value {
+    let boolean = Value {
         kind: Some(Kind::BoolValue(true)),
     };
-    let lista = Value {
+    let list = Value {
         kind: Some(Kind::ListValue(StringList {
             values: vec!["a".into(), "b".into()],
         })),
     };
 
-    assert!(matches!(textos.kind, Some(Kind::StringValue(_))));
-    assert!(matches!(entero.kind, Some(Kind::IntValue(5432))));
-    assert!(matches!(booleano.kind, Some(Kind::BoolValue(true))));
-    assert!(matches!(lista.kind, Some(Kind::ListValue(_))));
+    assert!(matches!(text.kind, Some(Kind::StringValue(_))));
+    assert!(matches!(integer.kind, Some(Kind::IntValue(5432))));
+    assert!(matches!(boolean.kind, Some(Kind::BoolValue(true))));
+    assert!(matches!(list.kind, Some(Kind::ListValue(_))));
 }
 
 #[test]
-fn un_check_fallido_puede_llevar_su_remedio() {
-    // Un preflight que dice "falló" sin decir cómo arreglarlo no sirve de nada.
+fn a_failed_check_can_carry_its_remedy() {
+    // A preflight that says "it failed" without saying how to fix it is worth
+    // nothing.
     let c = Check {
-        name: "versiones".into(),
+        name: "versions".into(),
         ok: false,
-        detail: "pg_dump 14 contra servidor 16".into(),
-        remediation: "instala postgresql-client-16".into(),
+        detail: "pg_dump 14 against server 16".into(),
+        remediation: "install postgresql-client-16".into(),
     };
     assert!(!c.ok);
     assert!(!c.remediation.is_empty());
 }
 
 #[test]
-fn los_mensajes_se_serializan_y_deserializan() {
+fn the_messages_serialize_and_deserialize() {
     use prost::Message;
 
     let original = Progress {
         bytes: 1_048_576,
-        message: "subiendo".into(),
+        message: "uploading".into(),
     };
     let bytes = original.encode_to_vec();
-    let vuelta = Progress::decode(&bytes[..]).unwrap();
+    let round_tripped = Progress::decode(&bytes[..]).unwrap();
 
-    assert_eq!(vuelta.bytes, 1_048_576);
-    assert_eq!(vuelta.message, "subiendo");
+    assert_eq!(round_tripped.bytes, 1_048_576);
+    assert_eq!(round_tripped.message, "uploading");
 }
 
 #[test]
-fn un_campo_nuevo_no_rompe_a_un_lector_antiguo() {
-    // La propiedad por la que se eligió protobuf: añadir campos no rompe a
-    // quien fue compilado sin conocerlos. Se simula decodificando un
-    // PreflightResponse a partir de bytes que llevan un campo desconocido.
+fn a_new_field_does_not_break_an_older_reader() {
+    // The property protobuf was chosen for: adding fields does not break
+    // whoever was compiled without knowing about them. Simulated by decoding a
+    // PreflightResponse from bytes that carry an unknown field.
     use prost::Message;
 
     let mut bytes = PreflightResponse {
@@ -110,20 +111,20 @@ fn un_campo_nuevo_no_rompe_a_un_lector_antiguo() {
     }
     .encode_to_vec();
 
-    // Campo 99, varint, valor 1: algo que esta compilación no conoce.
+    // Field 99, varint, value 1: something this build knows nothing about.
     bytes.extend_from_slice(&[0x98, 0x06, 0x01]);
 
-    let vuelta = PreflightResponse::decode(&bytes[..])
-        .expect("un campo desconocido debe ignorarse, no romper la decodificación");
-    assert!(vuelta.ok);
-    assert_eq!(vuelta.server_version, "16.2");
+    let round_tripped = PreflightResponse::decode(&bytes[..])
+        .expect("an unknown field must be ignored, not break decoding");
+    assert!(round_tripped.ok);
+    assert_eq!(round_tripped.server_version, "16.2");
 }
 
 #[test]
-fn los_clientes_y_servidores_generados_existen() {
-    // Comprueba que build_server(true) y build_client(true) hicieron su trabajo.
-    // Solo referencia los tipos: si no existieran, no compilaría.
-    fn _acepta_tipos() {
+fn the_generated_clients_and_servers_exist() {
+    // Checks that build_server(true) and build_client(true) did their job. It
+    // only mentions the types: if they did not exist, this would not compile.
+    fn _accepts_types() {
         let _: Option<sb_proto::plugin_client::PluginClient<tonic::transport::Channel>> = None;
         let _: Option<sb_proto::engine_client::EngineClient<tonic::transport::Channel>> = None;
         let _: Option<sb_proto::storage_client::StorageClient<tonic::transport::Channel>> = None;

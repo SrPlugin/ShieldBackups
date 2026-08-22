@@ -2,18 +2,19 @@ syntax = "proto3";
 
 package shieldbk.v1;
 
-// Todo plugin implementa este servicio. Además implementa Engine, Storage o
-// ambos, y lo declara en Info.
+// Every plugin implements this service. On top of it, a plugin implements
+// Engine, Storage or both, and declares which in Info.
 service Plugin {
-  // Primer RPC sobre el canal ya autenticado. Confirma identidad y capacidades.
+  // First RPC over the already-authenticated channel. Confirms identity and
+  // capabilities.
   rpc Info      (InfoRequest)      returns (InfoResponse);
-  // Describe los campos de configuración que el plugin acepta.
+  // Describes the configuration fields the plugin accepts.
   rpc Schema    (SchemaRequest)    returns (SchemaResponse);
-  // Entrega la configuración validada, incluidos los secretos ya resueltos.
+  // Delivers the validated configuration, including already-resolved secrets.
   rpc Configure (ConfigureRequest) returns (ConfigureResponse);
-  // Comprueba conectividad, permisos y dependencias. Lo usa `doctor`.
+  // Checks connectivity, permissions and dependencies. Used by `doctor`.
   rpc Preflight (PreflightRequest) returns (PreflightResponse);
-  // Cierre ordenado.
+  // Orderly shutdown.
   rpc Shutdown  (ShutdownRequest)  returns (ShutdownResponse);
 }
 
@@ -27,8 +28,8 @@ service Storage {
   rpc Get             (GetRequest)             returns (stream Progress);
   rpc List            (ListRequest)            returns (ListResponse);
   rpc Delete          (DeleteRequest)          returns (DeleteResponse);
-  // Limpia subidas multipart incompletas. Sin esto, un fallo deja partes
-  // huérfanas que el proveedor sigue facturando.
+  // Cleans up incomplete multipart uploads. Without this, a failure leaves
+  // orphaned parts that the provider keeps billing for.
   rpc AbortIncomplete (AbortIncompleteRequest) returns (AbortIncompleteResponse);
 }
 
@@ -60,8 +61,8 @@ message Field {
   string    name          = 1;
   FieldType type          = 2;
   bool      required      = 3;
-  // Un campo secreto nunca se imprime, nunca se loguea y nunca admite valor
-  // literal en el archivo de configuración.
+  // A secret field is never printed, never logged and never accepts a literal
+  // value in the configuration file.
   bool      secret        = 4;
   string    description   = 5;
   string    default_value = 6;
@@ -88,8 +89,8 @@ message Check {
   string name        = 1;
   bool   ok          = 2;
   string detail      = 3;
-  // Qué hacer para arreglarlo. Un preflight que dice "falló" sin decir cómo
-  // arreglarlo no sirve de nada.
+  // What to do to fix it. A preflight that says "it failed" without saying how
+  // to fix it is worth nothing.
   string remediation = 4;
 }
 
@@ -97,21 +98,21 @@ message PreflightRequest {}
 message PreflightResponse {
   bool           ok             = 1;
   repeated Check checks         = 2;
-  // Versión del servidor detectada, para el manifiesto.
+  // Detected server version, for the manifest.
   string         server_version = 3;
 }
 
 message ShutdownRequest {}
 message ShutdownResponse {}
 
-// Ruta del socket Unix por el que fluyen los bytes. El plugin se conecta a él.
+// Path of the Unix socket the bytes flow through. The plugin connects to it.
 //
-// REQUISITO DEL PROTOCOLO: el plugin debe devolver la respuesta del RPC (las
-// cabeceras del stream) ANTES de empezar a escribir en el socket de datos, y
-// hacer el trabajo en una tarea aparte. Un plugin que escriba primero y
-// responda después bloquea al núcleo, que espera esa respuesta para poner en
-// marcha al otro extremo del pipeline. El SDK de Rust lo garantiza; un plugin
-// escrito sin él debe respetarlo explícitamente.
+// PROTOCOL REQUIREMENT: the plugin must return the RPC response (the stream
+// headers) BEFORE it starts writing to the data socket, and do the work in a
+// separate task. A plugin that writes first and responds afterwards blocks the
+// core, which waits for that response before starting up the other end of the
+// pipeline. The Rust SDK guarantees this; a plugin written without it must
+// honour the requirement explicitly.
 message DumpRequest    { string data_socket = 1; }
 message RestoreRequest { string data_socket = 1; }
 
@@ -132,29 +133,32 @@ message GetRequest {
 message ArtifactMeta {
   string key         = 1;
   uint64 size        = 2;
-  // Fecha de última modificación en **RFC-3339 con la hora en UTC y sufijo
-  // `Z`**: `2026-08-21T09:30:00Z`. El formato es parte del contrato, no una
-  // elección de cada plugin.
+  // Last-modified timestamp in **RFC-3339, time in UTC with a `Z` suffix**:
+  // `2026-08-21T09:30:00Z`. The format is part of the contract, not something
+  // each plugin gets to choose.
   //
-  // Exactamente veinte caracteres, `YYYY-MM-DDTHH:MM:SSZ`, **sin fracción de
-  // segundo**. La precisión también es del contrato: si un destino mandara
-  // milisegundos y otro no, sus cadenas dejarían de ser comparables entre sí
-  // —`…:15Z` y `…:15.983Z` se comparan en el carácter 19, donde `Z` es mayor
-  // que `.`— y el artefacto más antiguo saldría por delante del más nuevo. Un
-  // destino que reciba más precisión del servidor la recorta.
+  // Exactly twenty characters, `YYYY-MM-DDTHH:MM:SSZ`, **with no fractional
+  // seconds**. The precision is part of the contract too: if one target sent
+  // milliseconds and another did not, their strings would stop being
+  // comparable with each other — `…:15Z` and `…:15.983Z` differ at character
+  // 19, where `Z` sorts above `.` — and the older artifact would come out
+  // ahead of the newer one. A target that receives more precision from the
+  // server trims it.
   //
-  // Sin fijarlo, dos destinos igual de correctos devuelven cosas
-  // incomparables —uno el epoch en segundos, otro ISO-8601— y el núcleo no
-  // puede ordenar ni comparar artefactos entre destinos: fallaría en
-  // silencio, dando por más reciente lo que solo tiene la cadena mayor.
+  // Without pinning this down, two equally correct targets return
+  // incomparable things — one the epoch in seconds, the other ISO-8601 — and
+  // the core can neither sort nor compare artifacts across targets: it would
+  // fail silently, treating whatever has the greater string as the more
+  // recent.
   //
-  // Se elige RFC-3339 sobre el epoch por dos motivos: ordena igual como texto
-  // que como fecha —de modo que comparar cadenas ya es comparar instantes— y
-  // un operador lo lee sin convertir nada.
+  // RFC-3339 is chosen over the epoch for two reasons: it sorts the same as
+  // text as it does as a date — so comparing strings already means comparing
+  // instants — and an operator can read it without converting anything.
   //
-  // Si el destino no conoce la fecha, **cadena vacía**. Nunca un valor
-  // inventado ni un cero: una fecha falsa es indistinguible de una real y
-  // acabaría decidiendo qué se borra en una retención.
+  // If the target does not know the timestamp, **the empty string**. Never a
+  // made-up value and never a zero: a fake timestamp is indistinguishable from
+  // a real one and would end up deciding what gets deleted under a retention
+  // policy.
   string modified_at = 3;
 }
 

@@ -10,14 +10,14 @@ workspace = true
 
 [dependencies]
 tonic = "0.14.6"
-# El código que genera `tonic-prost-build` referencia `tonic_prost::ProstCodec`,
-# así que este crate es una dependencia de ejecución, no solo de compilación.
+# The code `tonic-prost-build` generates references `tonic_prost::ProstCodec`,
+# so this crate is a runtime dependency, not just a build one.
 tonic-prost = "0.14.6"
 prost = "0.14.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 prost-build = "0.14.4"
-# Trae un binario de protoc precompilado. Sin esto, compilar el proyecto exige
-# instalar el compilador de protobuf a mano en cada máquina y en CI.
+# Ships a precompiled protoc binary. Without it, building the project requires
+# installing the protobuf compiler by hand on every machine and in CI.
 protoc-bin-vendored = "3.2.0"
