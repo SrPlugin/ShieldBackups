@@ -148,7 +148,7 @@ impl From<AgeError> for CliError {
 impl From<LockfileError> for CliError {
     fn from(e: LockfileError) -> Self {
         // The message from `sb-core::lockfile` already says what to do --
-        // including the `shieldbk plugin lock <name>` that has to be typed --
+        // including the `shieldbk plugin lock` that has to be typed --
         // so it is not wrapped in anything: wrapping it would only push it away
         // from the eye.
         Self::Plugin(e.to_string())
@@ -194,7 +194,7 @@ mod tests {
         });
         assert_eq!(error.code(), EXIT_PLUGIN);
         assert!(
-            error.to_string().contains("plugin lock postgres"),
+            error.to_string().contains("plugin lock"),
             "the core's remedy has to arrive intact: {error}"
         );
     }

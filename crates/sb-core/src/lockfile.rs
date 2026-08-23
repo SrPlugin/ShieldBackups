@@ -33,13 +33,14 @@ pub enum LockfileError {
     #[error(
         "the plugin \"{name}\" is not registered in the lockfile. shieldbk does not run binaries \
          it has not verified. Check that \"{path}\" is the binary you expect and register it with \
-         `shieldbk plugin lock {name}`"
+         `shieldbk plugin lock`, which registers every \
+         plugin in the configured directory"
     )]
     NotRegistered { name: String, path: PathBuf },
     #[error(
         "the binary of plugin \"{name}\" ({path}) has changed since it was registered: the \
          lockfile expected sha256 {expected} and the file has {found}. If the change is expected \
-         (you updated the plugin), register it again with `shieldbk plugin lock {name}`. If you \
+         (you updated the plugin), register it again with `shieldbk plugin lock`. If you \
          were not expecting it, do NOT run it: the binary receives the credentials of your \
          database and of your storage"
     )]
