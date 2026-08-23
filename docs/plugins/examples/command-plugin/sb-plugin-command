@@ -1,0 +1,564 @@
+#!/usr/bin/env bun
+/**
+ * sb-plugin-command — a ShieldBackups *source* plugin written in Bun.
+ *
+ * ## What it does
+ *
+ * It wraps a pair of commands: one that writes a serialized copy of something
+ * to stdout, and one that rebuilds that something from stdin. That is the whole
+ * definition of a `Source` in this protocol, so a single generic plugin already
+ * covers `pg_dump`/`pg_restore`, `mysqldump`/`mysql`, `mongodump`/`mongorestore`,
+ * `tar -c`/`tar -x`, `redis-cli --rdb`, `etcdctl snapshot save` and any in-house
+ * tool that behaves the same way.
+ *
+ *     [[target]]
+ *     name      = "app"
+ *     source    = "command"
+ *     storage   = "mock"
+ *     recipient = "age1..."
+ *
+ *     [target.source_config]
+ *     dump    = ["pg_dump", "--format=custom", "--dbname=app"]
+ *     restore = ["pg_restore", "--dbname=app", "--single-transaction"]
+ *
+ * ## Why it exists
+ *
+ * ShieldBackups runs plugins as separate processes that speak gRPC over a Unix
+ * socket with mTLS. The point of that design is that a plugin can be written in
+ * any language. This file is the proof: it is a complete, working plugin, in
+ * some three hundred and fifty lines of JavaScript, that never links against a
+ * single line of Rust and generates no protobuf stubs — `@grpc/proto-loader`
+ * reads the very same `plugin.proto` the core was built from, at startup.
+ *
+ * ## The three things this file is here to teach
+ *
+ *   1. A command is a **list of arguments**, never a string. Look for RULE 1.
+ *   2. A secret never travels in **argv**. Look for RULE 2.
+ *   3. A data RPC **answers first and works afterwards**. Look for RULE 3.
+ *
+ * ## How the startup works
+ *
+ *   - The core launches this binary and writes ONE line of JSON to its stdin:
+ *     the socket to listen on, the TLS material for this session and the names
+ *     both sides present in their certificates.
+ *   - This process brings up its gRPC server on that socket.
+ *   - Only then does it write ONE line of JSON to its stdout: the announcement.
+ *
+ * stdout belongs to that announcement and to nothing else. **Every log line
+ * goes to stderr**, which the core relays into its own log. A stray
+ * `console.log` here is not a cosmetic bug: it corrupts the handshake and the
+ * plugin never starts.
+ */
+
+import { existsSync } from "node:fs";
+import net from "node:net";
+import { join } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
+import grpc from "@grpc/grpc-js";
+import protoLoader from "@grpc/proto-loader";
+
+const NAME = "command";
+const VERSION = "0.1.0";
+const PROTOCOL_VERSION = 1;
+const HANDSHAKE_MAGIC = "SHIELDBK_PLUGIN";
+/** How often a transfer reports progress back to the core. */
+const PROGRESS_INTERVAL_MS = 2000;
+/** How much of the child's stderr is kept to explain a failure. */
+const STDERR_KEPT_BYTES = 8192;
+
+/** Everything this plugin says goes to stderr. See the note about stdout above. */
+const log = (...parts) => console.error(`[${NAME}]`, ...parts);
+
+// ---------------------------------------------------------------------------
+// The protocol definition, loaded at runtime
+// ---------------------------------------------------------------------------
+
+// A published plugin ships its own copy of `plugin.proto` next to its binary;
+// living inside the repository, this example prefers the core's own file, so
+// the two can never drift apart.
+const PROTO_PATH = [
+  join(import.meta.dir, "plugin.proto"),
+  join(import.meta.dir, "../../../../crates/sb-proto/proto/shieldbk/v1/plugin.proto"),
+].find(existsSync);
+
+if (!PROTO_PATH) {
+  log("plugin.proto not found; this plugin cannot describe the protocol it speaks");
+  process.exit(1);
+}
+
+const definition = protoLoader.loadSync(PROTO_PATH, {
+  // `keepCase` is not optional here. Without it proto-loader helpfully renames
+  // `data_socket` to `dataSocket`, the field stops matching the `.proto`, and
+  // every transfer arrives with an empty socket path.
+  keepCase: true,
+  longs: String,
+  defaults: true,
+  oneofs: true,
+});
+const v1 = grpc.loadPackageDefinition(definition).shieldbk.v1;
+
+// ---------------------------------------------------------------------------
+// Configuration schema
+// ---------------------------------------------------------------------------
+
+/**
+ * The fields this plugin accepts. `shieldbk plugin docs command` prints this
+ * table, and the core validates the user's TOML against it before a single
+ * value reaches `Configure`.
+ */
+const SCHEMA = [
+  {
+    name: "dump",
+    type: "FIELD_TYPE_LIST",
+    required: true,
+    secret: false,
+    description: "Command that writes the serialized copy to stdout, as a list of arguments.",
+    default_value: "",
+  },
+  {
+    name: "restore",
+    type: "FIELD_TYPE_LIST",
+    required: false,
+    secret: false,
+    description:
+      "Command that rebuilds the source from stdin, as a list of arguments. Without it, restoring this target is refused.",
+    default_value: "",
+  },
+  {
+    name: "workdir",
+    type: "FIELD_TYPE_PATH",
+    required: false,
+    secret: false,
+    description: "Directory the commands run in. Defaults to the plugin's own.",
+    default_value: "",
+  },
+  {
+    name: "password",
+    type: "FIELD_TYPE_STRING",
+    required: false,
+    // RULE 2, first half. Declaring the field secret is what makes the core
+    // refuse a literal password in the configuration file: it will only accept
+    // a reference — `{ env = "..." }`, `{ file = "..." }`, `{ command = [...] }` —
+    // resolve it itself, and hand the plugin the value and never its origin.
+    secret: true,
+    description:
+      "Password handed to the command through the environment, under the name given by `password_env`. Never appears in argv.",
+    default_value: "",
+  },
+  {
+    name: "password_env",
+    type: "FIELD_TYPE_STRING",
+    required: false,
+    secret: false,
+    description: "Environment variable the password is placed in.",
+    default_value: "PGPASSWORD",
+  },
+  {
+    name: "timeout",
+    type: "FIELD_TYPE_DURATION",
+    required: false,
+    secret: false,
+    description: 'How long a command may run before it is killed. "0s" means no limit.',
+    default_value: "0s",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Configuration state
+// ---------------------------------------------------------------------------
+
+/** Set by `Configure`. While it is null, every data RPC is refused. */
+let config = null;
+
+/**
+ * Unwraps the protocol's `Value`, whose `oneof` proto-loader hands over as
+ * whichever of the four fields is set.
+ */
+function plain(value) {
+  if (!value) return undefined;
+  if (value.string_value !== undefined && value.kind === "string_value") return value.string_value;
+  if (value.int_value !== undefined && value.kind === "int_value") return Number(value.int_value);
+  if (value.bool_value !== undefined && value.kind === "bool_value") return value.bool_value;
+  if (value.list_value !== undefined && value.kind === "list_value") return value.list_value.values;
+  return undefined;
+}
+
+/** `"30s"`, `"5m"`, `"1h"`, `"250ms"` → milliseconds. `"0s"` → no limit. */
+function durationMs(text) {
+  const match = /^(\d+)(ms|s|m|h)$/.exec(String(text).trim());
+  if (!match) throw new Error(`invalid duration "${text}"; write it as 30s, 5m or 1h`);
+  const units = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 };
+  return Number(match[1]) * units[match[2]];
+}
+
+/**
+ * Turns the map the core sent into the settings the rest of the file uses.
+ *
+ * The core has already checked the types against the schema and resolved the
+ * secrets; what is left here is what only this plugin knows — that an empty
+ * command list is useless, and what its defaults are.
+ */
+function readConfig(raw) {
+  const get = (name) => plain(raw[name]);
+
+  const dump = get("dump");
+  if (!Array.isArray(dump) || dump.length === 0) {
+    throw new Error("`dump` cannot be empty: it is the command that produces the backup");
+  }
+  const restore = get("restore") ?? [];
+
+  return {
+    dump,
+    restore,
+    workdir: get("workdir") || undefined,
+    password: get("password") || undefined,
+    passwordEnv: get("password_env") || "PGPASSWORD",
+    timeoutMs: durationMs(get("timeout") || "0s"),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Running the wrapped command
+// ---------------------------------------------------------------------------
+
+/**
+ * Starts one of the configured commands.
+ *
+ * RULE 1 — the command is a **list**, and it is spawned as a list.
+ *
+ * `argv` arrives from the configuration already split into arguments, and it is
+ * handed to `Bun.spawn` still split. There is no `shell: true` anywhere in this
+ * file and there must never be one: a shell would turn `dump = ["..."]` into an
+ * arbitrary-code-execution field, where a backup target called
+ * `db; rm -rf /home` is a valid configuration. Splitting a string on spaces has
+ * the same problem one step earlier, which is why the schema declares a LIST and
+ * not a STRING.
+ *
+ * RULE 2 — the secret goes in the **environment**, never in argv.
+ *
+ * `/proc/<pid>/cmdline` is world-readable and `ps` prints it; a password passed
+ * as `--password=hunter2` is visible to every user on the machine for as long as
+ * the command runs. The environment of a process is readable only by its owner.
+ * That is not perfect — it is inherited by children — but it is the best the
+ * POSIX process model offers for handing a secret to a program you did not
+ * write.
+ */
+function spawnCommand(argv, stdin, stdout) {
+  const env = { ...process.env };
+  if (config.password) env[config.passwordEnv] = config.password;
+
+  const child = Bun.spawn({
+    cmd: argv,
+    cwd: config.workdir,
+    env,
+    stdin,
+    stdout,
+    stderr: "pipe",
+  });
+
+  let killer = null;
+  if (config.timeoutMs > 0) {
+    killer = setTimeout(() => {
+      log(`"${argv[0]}" exceeded the configured timeout; killing it`);
+      child.kill("SIGKILL");
+    }, config.timeoutMs);
+  }
+
+  // The child's stderr is drained as it arrives — an unread pipe eventually
+  // blocks the writer — and its tail is kept to explain a failure. `pg_dump`
+  // saying "permission denied for table users" is the whole diagnosis, and it
+  // would otherwise be lost.
+  let tail = "";
+  const draining = (async () => {
+    for await (const chunk of child.stderr) {
+      tail = (tail + Buffer.from(chunk).toString("utf8")).slice(-STDERR_KEPT_BYTES);
+    }
+  })();
+
+  return {
+    child,
+    /** Waits for the command and throws if it did not succeed. */
+    async settle() {
+      const code = await child.exited;
+      if (killer) clearTimeout(killer);
+      await draining;
+      if (tail.trim()) log(`${argv[0]}: ${tail.trim()}`);
+      if (code !== 0) {
+        const detail = tail.trim() ? `: ${tail.trim().split("\n").slice(-3).join(" / ")}` : "";
+        throw new Error(`"${argv[0]}" exited with code ${code}${detail}`);
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The data channel
+// ---------------------------------------------------------------------------
+
+/**
+ * Connects to the raw Unix socket the core opened for this transfer.
+ *
+ * No TLS and no framing: both ends belong to the same user on the same machine,
+ * inside a 0700 directory. Closing the socket is what signals end of stream.
+ */
+function connectData(path) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(path);
+    socket.once("connect", () => resolve(socket));
+    socket.once("error", reject);
+  });
+}
+
+/** A pass-through that counts the bytes crossing it. */
+function counting(onChunk) {
+  return new Transform({
+    transform(chunk, _encoding, done) {
+      onChunk(chunk.length);
+      done(null, chunk);
+    },
+  });
+}
+
+/**
+ * RULE 3 — answer the RPC first, do the work afterwards.
+ *
+ * `Dump` and `Restore` return a stream of `Progress`. The core waits for the
+ * **response headers** of that stream before it brings up its own end of the
+ * pipeline, so a plugin that connects to the data socket and starts writing
+ * before it has answered deadlocks the backup: nobody is reading yet, the socket
+ * buffer fills, and both processes wait for each other until a timeout fires.
+ *
+ * In grpc-js the headers are not sent until something is written, so they are
+ * flushed explicitly with `sendMetadata` — that call *is* the answer — and only
+ * then does the transfer begin, from a task of its own. The Rust SDK does this
+ * for you; outside Rust it has to be deliberate.
+ */
+function transfer(call, operation, run) {
+  call.sendMetadata(new grpc.Metadata());
+
+  let bytes = 0;
+  const ticker = setInterval(() => call.write({ bytes, message: operation }), PROGRESS_INTERVAL_MS);
+
+  (async () => {
+    try {
+      await run((n) => {
+        bytes += n;
+      });
+      clearInterval(ticker);
+      call.write({ bytes, message: `${operation} finished` });
+      call.end();
+      log(`${operation}: ${bytes} bytes`);
+    } catch (error) {
+      clearInterval(ticker);
+      log(`${operation} failed: ${error.message}`);
+      // Once the headers are out this is the only channel an error can still
+      // travel on, and the core is listening on it precisely for this.
+      call.emit("error", { code: grpc.status.INTERNAL, details: error.message });
+    }
+  })();
+}
+
+// ---------------------------------------------------------------------------
+// The services
+// ---------------------------------------------------------------------------
+
+/** Refuses a data RPC that arrives before `Configure`. */
+function requireConfigured(call) {
+  if (config) return false;
+  call.emit("error", {
+    code: grpc.status.FAILED_PRECONDITION,
+    details: "the plugin has not been configured yet",
+  });
+  return true;
+}
+
+const pluginService = {
+  Info: (_call, done) =>
+    done(null, {
+      name: NAME,
+      version: VERSION,
+      protocol_version: PROTOCOL_VERSION,
+      capabilities: ["CAPABILITY_SOURCE"],
+    }),
+
+  Schema: (_call, done) => done(null, { fields: SCHEMA }),
+
+  Configure: (call, done) => {
+    try {
+      config = readConfig(call.request.config ?? {});
+      // The command is logged; the password is not, and there is no branch in
+      // this file where it could be.
+      log(`configured: dump=${JSON.stringify(config.dump)}`);
+      done(null, {});
+    } catch (error) {
+      done({ code: grpc.status.INVALID_ARGUMENT, details: error.message });
+    }
+  },
+
+  Preflight: (_call, done) => {
+    if (!config) {
+      done({ code: grpc.status.FAILED_PRECONDITION, details: "the plugin has not been configured yet" });
+      return;
+    }
+
+    const checks = [reachable("dump", config.dump)];
+    if (config.restore.length > 0) {
+      checks.push(reachable("restore", config.restore));
+    } else {
+      checks.push({
+        name: "restore",
+        ok: true,
+        detail: "no restore command configured; this target can be backed up but not restored",
+        remediation: "add `restore = [...]` to the target's source_config",
+      });
+    }
+
+    done(null, { ok: checks.every((c) => c.ok), checks, source_version: "" });
+  },
+
+  Shutdown: (_call, done) => {
+    done(null, {});
+    // The reply has to leave before the process does.
+    setTimeout(() => process.exit(0), 50);
+  },
+};
+
+/** Checks that a configured command actually exists on this machine. */
+function reachable(name, argv) {
+  const found = Bun.which(argv[0], { PATH: process.env.PATH });
+  return found
+    ? { name, ok: true, detail: `${argv[0]} → ${found}`, remediation: "" }
+    : {
+        name,
+        ok: false,
+        detail: `\`${argv[0]}\` is not on PATH`,
+        remediation: `install it, or give its absolute path in the target's \`${name}\` field`,
+      };
+}
+
+const sourceService = {
+  /** Source → core: the command's stdout becomes the byte stream. */
+  Dump: (call) => {
+    if (requireConfigured(call)) return;
+
+    transfer(call, "dump", async (count) => {
+      const socket = await connectData(call.request.data_socket);
+      const command = spawnCommand(config.dump, "ignore", "pipe");
+      try {
+        // Ending the socket is what tells the core the dump is over; `pipeline`
+        // does it when the command's stdout reaches EOF.
+        await pipeline(Readable.fromWeb(command.child.stdout), counting(count), socket);
+        await command.settle();
+      } catch (error) {
+        command.child.kill("SIGKILL");
+        socket.destroy();
+        throw error;
+      }
+    });
+  },
+
+  /** Core → source: the byte stream becomes the command's stdin. */
+  Restore: (call) => {
+    if (requireConfigured(call)) return;
+
+    if (config.restore.length === 0) {
+      call.emit("error", {
+        code: grpc.status.FAILED_PRECONDITION,
+        details: "this target has no `restore` command configured",
+      });
+      return;
+    }
+
+    transfer(call, "restore", async (count) => {
+      const socket = await connectData(call.request.data_socket);
+      const counted = socket.pipe(counting(count));
+      const command = spawnCommand(config.restore, Readable.toWeb(counted), "ignore");
+      try {
+        await command.settle();
+      } catch (error) {
+        socket.destroy();
+        throw error;
+      }
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+/** Reads the single JSON line the core writes to stdin, which it then closes. */
+async function readBootstrap() {
+  const text = await Bun.stdin.text();
+  const line = text.split("\n", 1)[0].trim();
+  if (!line) throw new Error("nothing arrived on stdin");
+  const envelope = JSON.parse(line);
+  if (envelope.magic !== HANDSHAKE_MAGIC) throw new Error("the envelope is not a shieldbk one");
+  if (!envelope.core_protocol_versions?.includes(PROTOCOL_VERSION)) {
+    throw new Error(
+      `no protocol version in common: the core speaks ${envelope.core_protocol_versions}, this plugin ${PROTOCOL_VERSION}`,
+    );
+  }
+  return envelope;
+}
+
+function listen(envelope) {
+  const server = new grpc.Server();
+  server.addService(v1.Plugin.service, pluginService);
+  server.addService(v1.Source.service, sourceService);
+
+  // mTLS with the material the core generated for this session alone: this
+  // plugin creates no keys and stores none. The third argument is the important
+  // one — it makes a client certificate mandatory, so that anyone who reaches
+  // the socket without one signed by this session's CA is refused. Without it
+  // the connection would be encrypted but open to anybody.
+  //
+  // `envelope.server_name` / `client_name` are the names the two certificates
+  // carry. grpc-js gives no hook to check the peer's name on top of the CA
+  // check, and here it adds nothing: the CA is ephemeral and signed exactly one
+  // client certificate, the core's.
+  const credentials = grpc.ServerCredentials.createSsl(
+    Buffer.from(envelope.tls.ca_cert_pem),
+    [
+      {
+        private_key: Buffer.from(envelope.tls.server_key_pem),
+        cert_chain: Buffer.from(envelope.tls.server_cert_pem),
+      },
+    ],
+    true,
+  );
+
+  return new Promise((resolve, reject) => {
+    server.bindAsync(`unix:${envelope.control_socket}`, credentials, (error) =>
+      error ? reject(error) : resolve(server),
+    );
+  });
+}
+
+/** The announcement. One line, on stdout, once the socket is really listening. */
+function announce() {
+  process.stdout.write(
+    `${JSON.stringify({
+      magic: HANDSHAKE_MAGIC,
+      protocol_version: PROTOCOL_VERSION,
+      capabilities: ["source"],
+      pid: process.pid,
+    })}\n`,
+  );
+}
+
+try {
+  const envelope = await readBootstrap();
+  await listen(envelope);
+  // Order matters: the core takes the announcement as a promise that the socket
+  // is already accepting connections, and dials it immediately.
+  announce();
+  log(`listening on ${envelope.control_socket}`);
+} catch (error) {
+  log(`could not start: ${error.message}`);
+  process.exit(1);
+}
+
+process.on("SIGTERM", () => process.exit(0));

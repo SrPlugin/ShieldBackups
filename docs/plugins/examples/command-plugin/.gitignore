@@ -1,0 +1,3 @@
+node_modules/
+# Where try-it.sh builds its temporary world.
+run/

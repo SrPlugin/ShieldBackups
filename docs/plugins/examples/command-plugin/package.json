@@ -1,0 +1,11 @@
+{
+  "name": "sb-plugin-command",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ShieldBackups source plugin that wraps any pair of dump/restore commands. Example of writing a plugin outside Rust.",
+  "type": "module",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13"
+  }
+}
