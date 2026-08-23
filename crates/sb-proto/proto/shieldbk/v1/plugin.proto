@@ -126,6 +126,22 @@ message ShutdownResponse {}
 // core, which waits for that response before starting up the other end of the
 // pipeline. The Rust SDK guarantees this; a plugin written without it must
 // honour the requirement explicitly.
+// WRITING A PLUGIN OUTSIDE RUST — three things that are invisible until they
+// bite, learned by writing the worked example in docs/plugins/examples:
+//
+//   * The core connects with ALPN "h2". A TLS server that does not negotiate
+//     it will route the connection to its HTTP/1 path and answer the HTTP/2
+//     preface with a 403; the client then reports a framing error that points
+//     nowhere near the real cause.
+//   * "Answer before writing" (above) usually needs an explicit call. Response
+//     headers are not flushed until the first write in most gRPC libraries, so
+//     the natural implementation deadlocks. In grpc-js it is
+//     `call.sendMetadata(new grpc.Metadata())`; other stacks name it
+//     send-initial-metadata or similar.
+//   * Field names travel as written here. Loaders that camel-case by default
+//     will turn `data_socket` into `dataSocket`, and the RPC then arrives with
+//     an empty path. In @grpc/proto-loader that is `keepCase: true`.
+
 message DumpRequest    { string data_socket = 1; }
 message RestoreRequest { string data_socket = 1; }
 
