@@ -1,5 +1,5 @@
-# `unwrap`/`expect` están prohibidos en código de producción (ver
-# workspace.lints.clippy), pero en un test son la forma correcta de afirmar
-# que una operación no falla.
+# `unwrap` and `expect` are denied in production code (see workspace.lints.clippy
+# in Cargo.toml), but inside a test they are the right way to assert that an
+# operation does not fail.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
