@@ -518,9 +518,9 @@ limit.
 
 Read the first four rows together: **32× the data costs 1.02× the memory.** Each
 extra concurrent target adds about **20 MiB**. End-to-end throughput is
-**≈ 400 MiB/s**; the data socket on its own, with no pipeline attached, has been
-measured at **≈ 3.7 GB/s**, which is why it is worth keeping framing and TLS off
-it.
+**≈ 400 MiB/s**; the data socket on its own, with no pipeline attached, measures
+**≈ 2.7 GB/s** on the same machine, which is why it is worth keeping framing and
+TLS off it — anything added there is paid for once per byte of every backup.
 
 Memory is flat in the size of the input because nothing is buffered end to end:
 the dump goes from one socket, through the compressor, the encryptor and the
@@ -530,7 +530,16 @@ Reproduce it with:
 
 ```sh
 cargo test --release --test memory -- --ignored --nocapture
+cargo test -p sb-transport --release --test throughput -- --ignored --nocapture
 ```
+
+The first command reproduces the table; the second is where the 2.7 GB/s comes
+from — `the_data_channel_moves_bytes_at_the_speed_of_the_socket` in
+[`crates/sb-transport/tests/throughput.rs`](crates/sb-transport/tests/throughput.rs),
+which pushes 256 MiB through a real `DataChannel`, prints the rate and checks
+that every chunk arrived intact and in order. It asserts a floor of 500 MB/s
+rather than the measured figure: the number depends on the machine, and what the
+assertion is there to catch is an order-of-magnitude drop.
 
 Those tests are `#[ignore]`d because they move gigabytes; `--nocapture` is what
 makes the numbers visible, and `--release` matters — the debug profile allocates

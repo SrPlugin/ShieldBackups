@@ -117,7 +117,12 @@ binaries. Encrypting the data channel would not remove a single capability from
 that attacker.
 
 It would cost, on a path that moves hundreds of gigabytes, CPU on every byte —
-and it would do so on the machine that is usually also serving the database.
+and it would do so on the machine that is usually also serving the database. The
+bare channel measures **≈ 2.7 GB/s** (`x86_64`, Linux 6.17, 16 cores, `release`),
+which is the headroom that would be spent; the measurement is
+`the_data_channel_moves_bytes_at_the_speed_of_the_socket` in
+[`crates/sb-transport/tests/throughput.rs`](../crates/sb-transport/tests/throughput.rs),
+run with `cargo test -p sb-transport --release --test throughput -- --ignored --nocapture`.
 
 The asymmetry is the point: **the control plane is where the secrets travel and
 its volume is negligible, so it gets the cryptography.** The data plane carries

@@ -10,7 +10,10 @@ use tokio::net::UnixStream;
 /// machine, talking over a socket inside a `0700` directory. Anyone who can
 /// read that socket already *is* that user and has direct access to the
 /// credentials: encrypting here would not change the threat model and would
-/// cost CPU on the hot path, which moves hundreds of gigabytes.
+/// cost CPU on the hot path, which moves hundreds of gigabytes. That the path
+/// is worth protecting from additions is measured, not assumed:
+/// `tests/throughput.rs` pushes 256 MiB through this channel and reports the
+/// rate (≈ 2.7 GB/s on `x86_64`, Linux 6.17, 16 cores, `release`).
 ///
 /// The control plane *is* encrypted and authenticated, because that is where
 /// the secrets travel and because its volume is negligible.
