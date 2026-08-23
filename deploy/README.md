@@ -419,9 +419,9 @@ other permission bit is set (`0o077`). `0600`, `0400` and `0700` pass; `0640`,
 `0644` and `0444` do not. The error is explicit:
 
 ```
-el archivo de secreto «/run/secrets/db_password» tiene permisos 0444 y es
-accesible para el grupo o para otros; corrígelo con «chmod 600
-/run/secrets/db_password», o usa `file_insecure` si lo monta un orquestador
+the secret file "/run/secrets/db_password" has permissions 0444 and is
+accessible to the group or to others; fix it with "chmod 600
+/run/secrets/db_password", or use `file_insecure` if an orchestrator mounts it
 ```
 
 That check exists because a secrets file readable by every process in the
@@ -462,8 +462,8 @@ password = { file_insecure = "/run/secrets/db_password" }
 It reads the same file and skips the permission check, logging a warning:
 
 ```
-secreto leído sin comprobar permisos (`file_insecure`); prefiere
-`defaultMode: 0400` en el volumen que lo monta
+secret read without checking permissions (`file_insecure`); prefer
+`defaultMode: 0400` in the volume that mounts it
 ```
 
 It relaxes the permission check and nothing else — a missing or unreadable file
@@ -697,10 +697,10 @@ stdout. Logs go to stderr, so the two never mix even with `-vv`. On success:
 ```
 
 On failure the same object carries `ok:false` plus `clase` (`"config"`,
-`"plugin"` or `"operacion"` — the string form of the exit code) and `error`:
+`"plugin"` or `"operation"` — the string form of the exit code) and `error`:
 
 ```json
-{"ok":false,"clase":"plugin","error":"el binario del plugin «postgres» ha cambiado desde que se registró..."}
+{"ok":false,"class":"plugin","error":"the plugin binary \"postgres\" has changed since it was registered..."}
 ```
 
 A failing report still contains everything it managed to produce, which is what
