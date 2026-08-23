@@ -49,63 +49,11 @@ head -c 1048576 /dev/urandom > "$RUN/source/blob.bin"
 printf 'the quick brown fox\n' > "$RUN/source/notes.txt"
 
 step "Generating an age key"
-# `shieldbk` has no `keygen` command, and `age-keygen` may not be installed:
-# this writes an X25519 identity in age's own format so the example can run on
-# its own. A real installation uses `age-keygen -o key.age`.
-cat > "$RUN/keygen.js" <<'KEYGEN'
-import { generateKeyPairSync } from "node:crypto";
-
-const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-const polymod = (values) => {
-  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
-  let chk = 1;
-  for (const v of values) {
-    const top = chk >>> 25;
-    chk = ((chk & 0x1ffffff) << 5) ^ v;
-    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= GEN[i];
-  }
-  return chk;
-};
-const expand = (hrp) => [
-  ...[...hrp].map((c) => c.charCodeAt(0) >>> 5),
-  0,
-  ...[...hrp].map((c) => c.charCodeAt(0) & 31),
-];
-const to5bit = (bytes) => {
-  const out = [];
-  let acc = 0;
-  let bits = 0;
-  for (const b of bytes) {
-    acc = (acc << 8) | b;
-    bits += 8;
-    while (bits >= 5) {
-      bits -= 5;
-      out.push((acc >>> bits) & 31);
-    }
-  }
-  if (bits > 0) out.push((acc << (5 - bits)) & 31);
-  return out;
-};
-const bech32 = (hrp, bytes) => {
-  const data = to5bit(bytes);
-  const checksum = polymod([...expand(hrp), ...data, 0, 0, 0, 0, 0, 0]) ^ 1;
-  const tail = [0, 1, 2, 3, 4, 5].map((i) => (checksum >>> (5 * (5 - i))) & 31);
-  return hrp + "1" + [...data, ...tail].map((d) => CHARSET[d]).join("");
-};
-
-const { publicKey, privateKey } = generateKeyPairSync("x25519");
-// The raw 32 bytes sit at the end of both DER encodings.
-const pub = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
-const sec = privateKey.export({ type: "pkcs8", format: "der" }).subarray(-32);
-
-const recipient = bech32("age", pub);
-const identity = bech32("age-secret-key-", sec).toUpperCase();
-await Bun.write(process.argv[2], `# public key: ${recipient}\n${identity}\n`);
-console.log(recipient);
-KEYGEN
-RECIPIENT="$(bun "$RUN/keygen.js" "$RUN/key.age")"
-chmod 600 "$RUN/key.age"
-rm "$RUN/keygen.js"
+# `shieldbk keygen` writes an age identity in `age-keygen`'s own format, with
+# 0600 permissions and refusing to overwrite an existing file. It needs no
+# configuration: it is what you run before there is one.
+"$SHIELDBK" keygen --output "$RUN/key.age" >/dev/null
+RECIPIENT="$(sed -n 's/^# public key: //p' "$RUN/key.age")"
 echo "recipient: $RECIPIENT"
 
 step "Writing the configuration"
