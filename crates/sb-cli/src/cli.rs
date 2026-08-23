@@ -63,7 +63,7 @@ pub enum Command {
         target: String,
         /// Key of the artifact in the storage target.
         artifact: String,
-        /// File holding the age private key (`age-keygen`).
+        /// File holding the age private key (`shieldbk keygen`).
         #[arg(long, value_name = "PATH")]
         identity: PathBuf,
     },
@@ -87,6 +87,26 @@ pub enum Command {
     Plugin {
         #[command(subcommand)]
         action: PluginAction,
+    },
+
+    /// Generate an age key pair: the key every backup is encrypted to.
+    ///
+    /// Nothing can be backed up without one: the public key goes into the
+    /// `recipient` field of a target and every artifact is encrypted to it,
+    /// while the private key is the only thing that can restore them.
+    ///
+    /// Without `--output` the private key is written to standard output in
+    /// `age-keygen`'s format, so `shieldbk keygen > key.txt` works. With it,
+    /// the file is created with `0600` permissions and an existing one is
+    /// never overwritten.
+    ///
+    /// It needs no configuration file: this is what is run before there is
+    /// one.
+    Keygen {
+        /// File the private key is written to. It is created with `0600` and
+        /// an existing file is refused, never overwritten.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
 
     /// Maintenance tasks on the storage target.
@@ -135,12 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn all_six_commands_are_there() {
+    fn all_seven_commands_are_there() {
         let names: Vec<String> = Cli::command()
             .get_subcommands()
             .map(|c| c.get_name().to_owned())
             .collect();
-        for expected in ["backup", "restore", "verify", "doctor", "plugin", "storage"] {
+        for expected in [
+            "backup", "restore", "verify", "doctor", "plugin", "storage", "keygen",
+        ] {
             assert!(
                 names.contains(&expected.to_owned()),
                 "{expected} is missing"

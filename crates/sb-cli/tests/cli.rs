@@ -18,11 +18,13 @@ use common::{Bench, alter, json_of};
 const EXIT_CONFIG: i32 = 2;
 
 #[test]
-fn the_help_shows_the_six_commands() {
+fn the_help_shows_every_command() {
     let out = Bench::new().cmd().arg("--help").output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    for command in ["backup", "restore", "verify", "doctor", "plugin", "storage"] {
+    for command in [
+        "backup", "restore", "verify", "doctor", "plugin", "storage", "keygen",
+    ] {
         assert!(
             text.contains(command),
             "the help does not mention `{command}`:\n{text}"
@@ -433,5 +435,208 @@ fn doctor_with_a_plugins_only_config_still_requires_targets() {
     assert!(
         text.contains("target"),
         "the error must say targets are missing: {text}"
+    );
+}
+
+/// The line `keygen` writes with the public key, in the same shape
+/// `age-keygen` writes it.
+const PUBLIC_KEY_LINE: &str = "# public key: ";
+
+/// Runs `keygen` with the given extra arguments and returns its output.
+fn keygen(bench: &Bench, args: &[&str]) -> std::process::Output {
+    let mut cmd = bench.cmd();
+    cmd.arg("keygen");
+    cmd.args(args);
+    cmd.output().unwrap()
+}
+
+/// The public key `keygen` announced, taken from the `# public key:` line of
+/// whichever stream carries it.
+fn announced_public_key(text: &str) -> String {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(PUBLIC_KEY_LINE))
+        .unwrap_or_else(|| panic!("no `{PUBLIC_KEY_LINE}` line in:\n---\n{text}\n---"))
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn keygen_needs_no_configuration_at_all() {
+    // It is the first thing anybody runs: at that moment there is no
+    // configuration file, and there is no `recipient` to put in one either
+    // because this is the command that produces it. Requiring a configuration
+    // would make the tool impossible to start using.
+    let bench = Bench::new();
+    let out = keygen(&bench, &[]);
+
+    assert!(
+        out.status.success(),
+        "`keygen` must work with no `--config` and no configuration file: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn keygen_prints_a_public_key_and_a_private_key() {
+    let bench = Bench::new();
+    let out = keygen(&bench, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    assert!(
+        stdout.contains("age1"),
+        "the public key has to be visible, it is what goes into `recipient`: {stdout}"
+    );
+    assert!(
+        stdout.contains("AGE-SECRET-KEY-1"),
+        "without `--output` the private key goes to stdout so it can be piped: {stdout}"
+    );
+}
+
+#[test]
+fn the_generated_key_is_a_real_age_key_and_its_public_half_matches() {
+    // The test that matters. A key with the right shape but derived wrong
+    // would encrypt backups that nobody -- not even its owner -- can open, and
+    // that is only discovered on the day of a restore.
+    let bench = Bench::new();
+    let out = keygen(&bench, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let identity = sb_crypto::Identity::parse(&stdout)
+        .unwrap_or_else(|e| panic!("the output is not a usable age key file ({e}):\n{stdout}"));
+
+    assert_eq!(
+        identity.to_recipient().to_string(),
+        announced_public_key(&stdout),
+        "the announced public key must be the one derived from the private key"
+    );
+}
+
+#[test]
+fn two_runs_give_two_different_keys() {
+    let bench = Bench::new();
+    let first = String::from_utf8_lossy(&keygen(&bench, &[]).stdout).to_string();
+    let second = String::from_utf8_lossy(&keygen(&bench, &[]).stdout).to_string();
+
+    assert_ne!(
+        announced_public_key(&first),
+        announced_public_key(&second),
+        "each run has to generate a fresh key"
+    );
+}
+
+#[test]
+fn output_writes_the_file_with_private_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bench = Bench::new();
+    let key = bench.path("key.txt");
+    let out = keygen(&bench, &["--output", &key.to_string_lossy()]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "a private key file must not be readable by anybody else"
+    );
+
+    let content = std::fs::read_to_string(&key).unwrap();
+    let identity = sb_crypto::Identity::parse(&content)
+        .unwrap_or_else(|e| panic!("the file is not a usable age key file ({e})"));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        identity.to_recipient().to_string(),
+        announced_public_key(&stderr),
+        "the public key told on stderr must be the one in the file"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("AGE-SECRET-KEY-1"),
+        "with `--output` the key lives in the file, not on the terminal"
+    );
+}
+
+#[test]
+fn output_refuses_to_overwrite_and_leaves_the_file_untouched() {
+    // Overwriting a key file is not a mistake that can be undone: every backup
+    // encrypted to the old key becomes unreadable at that instant.
+    let bench = Bench::new();
+    let key = bench.path("key.txt");
+    std::fs::write(&key, "the key that must not be lost\n").unwrap();
+
+    let out = keygen(&bench, &["--output", &key.to_string_lossy()]);
+
+    assert!(!out.status.success(), "it must refuse");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains(&key.to_string_lossy().to_string()),
+        "the error must name the file it refused to overwrite: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("exist"),
+        "the error must say why it refused: {text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key).unwrap(),
+        "the key that must not be lost\n",
+        "the file that was already there must survive intact"
+    );
+}
+
+#[test]
+fn in_json_the_private_key_never_reaches_stdout() {
+    // `--format json` is what a script uses, and a script's stdout ends up in
+    // a CI log and in a shell history. A private key must not travel there.
+    let bench = Bench::new();
+    let out = keygen(&bench, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY-1"),
+        "the private key must never appear in the JSON: {stdout}"
+    );
+    // And what does come out is still a single parseable document: whoever
+    // asked for JSON gets JSON, with the public key in it.
+    let json = json_of(&out.stdout);
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    assert!(
+        json["public_key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("age1")),
+        "the public key is the part a script needs: {json}"
+    );
+}
+
+#[test]
+fn in_json_keygen_prints_one_parseable_document_with_the_public_key() {
+    let bench = Bench::new();
+    let key = bench.path("key.txt");
+    let out = keygen(
+        &bench,
+        &["--format", "json", "--output", &key.to_string_lossy()],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out.stdout);
+    assert_eq!(json["ok"], serde_json::Value::Bool(true));
+
+    let content = std::fs::read_to_string(&key).unwrap();
+    let identity = sb_crypto::Identity::parse(&content).unwrap();
+    assert_eq!(
+        json["public_key"],
+        serde_json::Value::String(identity.to_recipient().to_string()),
+        "the public key is what the script needs: it goes into `recipient`"
+    );
+    assert_eq!(
+        json["path"],
+        serde_json::Value::String(key.to_string_lossy().to_string()),
+        "and the path of the file that was written"
     );
 }

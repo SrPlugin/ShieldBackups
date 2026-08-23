@@ -10,6 +10,7 @@
 mod backup;
 mod concurrency;
 mod doctor;
+mod keygen;
 mod plugin;
 mod restore;
 mod storage;
@@ -26,13 +27,25 @@ use crate::output::Report;
 /// Returns [`CliError`] with the failure's class, which is what decides the
 /// process's exit code.
 pub async fn run(cli: &Cli) -> Result<Report, CliError> {
-    // The configuration is loaded for every command, the `plugin` ones
-    // included: the plugins directory and the lockfile come from it, so without
-    // it there would be no way to know where to look. What changes between them
-    // is how much they demand of it (see [`context`]).
+    // `keygen` is answered before the configuration is even looked for, and
+    // that is the whole point: it is the command somebody runs **first**, when
+    // there is no configuration file yet and no `recipient` to write in one --
+    // because generating that `recipient` is exactly what is being asked for.
+    // Demanding a file here would make the tool impossible to start using.
+    if let Command::Keygen { output } = &cli.command {
+        return keygen::run(cli.format, output.as_deref());
+    }
+
+    // Every other command loads the configuration, the `plugin` ones included:
+    // the plugins directory and the lockfile come from it, so without it there
+    // would be no way to know where to look. What changes between them is how
+    // much they demand of it (see [`context`]).
     let ctx = context(cli)?;
 
     match &cli.command {
+        Command::Keygen { .. } => {
+            unreachable!("`keygen` returns above, before any configuration is read")
+        }
         Command::Backup { target } => backup::run(&ctx, target.as_deref()).await,
         Command::Restore {
             target,
@@ -66,6 +79,8 @@ pub async fn run(cli: &Cli) -> Result<Report, CliError> {
 /// refusing.
 ///
 /// The general case is requiring them, so a new command will do so by default.
+/// `keygen` is not in this function at all: it never gets here, because it
+/// needs no configuration of any kind.
 fn context(cli: &Cli) -> Result<Context, CliError> {
     match &cli.command {
         Command::Plugin { .. } => Context::load_without_requiring_targets(cli),
