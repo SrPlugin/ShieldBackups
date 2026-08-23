@@ -9,6 +9,22 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 
+/// The protocol both sides select through ALPN.
+///
+/// gRPC over TLS **is** HTTP/2 and its specification requires the two ends to
+/// agree on it through ALPN. Between two rustls peers the negotiation can be
+/// skipped without anything breaking, which is why it went unnoticed for a
+/// while; outside Rust it cannot. A gRPC server built on Node's or Bun's
+/// `http2` —which is what a plugin written in JavaScript, Python or Go ends up
+/// using— hands a connection that did not negotiate `h2` to its HTTP/1 path and
+/// answers the HTTP/2 preface with `HTTP/1.0 403 Forbidden`. The client then
+/// reads `HTT` as the length of a frame and gives up with a protocol error that
+/// says nothing about the real cause.
+///
+/// Announcing it here is what makes a plugin in another language possible, and
+/// it is the point of the whole architecture.
+const ALPN_H2: &[u8] = b"h2";
+
 /// Name the plugin presents in its server certificate.
 pub const SERVER_NAME: &str = "shieldbk-plugin";
 /// Name the core presents in its client certificate.
@@ -202,9 +218,10 @@ impl EphemeralPki {
         let roots = root_store(&self.ca_cert_pem)?;
         let chain = parse_certs(&self.client_cert_pem)?;
         let key = parse_key(&self.client_key_pem)?;
-        let cfg = ClientConfig::builder()
+        let mut cfg = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_client_auth_cert(chain, key)?;
+        cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
         Ok(Arc::new(cfg))
     }
 }
@@ -224,9 +241,10 @@ pub fn server_config_from_bundle(bundle: &ServerBundle) -> Result<Arc<ServerConf
         .map_err(|e| PkiError::Material(e.to_string()))?;
     let chain = parse_certs(&bundle.server_cert_pem)?;
     let key = parse_key(&bundle.server_key_pem)?;
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)?;
+    cfg.alpn_protocols = vec![ALPN_H2.to_vec()];
     Ok(Arc::new(cfg))
 }
 
