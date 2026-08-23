@@ -3,7 +3,7 @@ name: CI
 on:
   push:
   pull_request:
-  # Los tests de memoria: ver el job `memoria`.
+  # The memory tests: see the `memory` job.
   schedule:
     - cron: "0 4 * * 1"
   workflow_dispatch:
@@ -13,41 +13,42 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Puerta de entrada de cada push: formato, lints, documentación y la suite de
-  # tests. Si esto falla, lo demás da igual.
+  # The gate every push goes through: formatting, lints, documentation and the
+  # test suite. If this fails, nothing else matters.
   check:
-    name: formato, clippy, doc y tests
+    name: format, clippy, doc and tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `rust-toolchain.toml` fija 1.92 y manda sobre lo que instale esta
-      # acción; se declara igual para no descargar primero otra toolchain.
+      # `rust-toolchain.toml` pins 1.92 and overrides whatever this action
+      # installs; it is declared all the same so as not to download a different
+      # toolchain first.
       - uses: dtolnay/rust-toolchain@1.92
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      # La documentación se pudre en silencio: un enlace intra-doc que apunta a
-      # un elemento privado o que se ha renombrado no rompe ninguna build. Va
-      # como paso de este job y no como job aparte porque reutiliza las
-      # dependencias ya compiladas aquí; en un runner propio costaría varios
-      # minutos de recompilar el árbol entero para nada.
+      # Documentation rots in silence: an intra-doc link pointing at a private
+      # item or at one that has been renamed breaks no build. It goes as a step
+      # of this job and not as a separate job because it reuses the dependencies
+      # already compiled here; on a runner of its own it would cost several
+      # minutes of recompiling the whole tree for nothing.
       - name: cargo doc
         run: cargo doc --no-deps --all-features --workspace
         env:
           RUSTDOCFLAGS: "-D warnings"
-      # Un hilo: varios tests arrancan procesos de plugin y se estorban si
-      # corren en paralelo.
+      # One thread: several tests spawn plugin processes and get in each other's
+      # way if they run in parallel.
       - run: cargo test --all-features --workspace -- --test-threads=1
 
-  # Auditoría de la cadena de suministro: avisos de RustSec, licencias,
-  # procedencia de los crates y duplicados. Es lo único que vigila las
-  # dependencias transitivas, que es por donde entra el problema en una
-  # herramienta que toca credenciales, y no compila nada: cuesta menos de dos
-  # minutos. La configuración entera vive en `deny.toml`.
+  # Supply-chain audit: RustSec advisories, licences, crate provenance and
+  # duplicates. It is the only thing watching the transitive dependencies, which
+  # is where the problem gets in on a tool that handles credentials, and it
+  # compiles nothing: it costs less than two minutes. The whole configuration
+  # lives in `deny.toml`.
   deny:
-    name: auditoría de dependencias
+    name: dependency audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,86 +56,87 @@ jobs:
         with:
           command: check
 
-  # Los tests que levantan contenedores: MinIO para el plugin de R2 y
-  # PostgreSQL para el suyo. Se separan de `check` porque necesitan un entorno
-  # preparado —cliente de PostgreSQL, demonio de contenedores, red hacia el
-  # registro de imágenes— y porque cuando ese entorno falla el error no debe
-  # leerse como un fallo del código.
-  integracion:
-    name: tests de integración con Docker
+  # The tests that bring containers up: MinIO for the R2 plugin and PostgreSQL
+  # for its own. They are kept apart from `check` because they need a prepared
+  # environment -- a PostgreSQL client, a container daemon, a route to the image
+  # registry -- and because when that environment fails the error must not read
+  # as a failure of the code.
+  integration:
+    name: integration tests with Docker
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
-      # `pg_dump` y `psql` para el plugin de PostgreSQL.
-      - name: instalar postgresql-client
+      # `pg_dump` and `psql` for the PostgreSQL plugin.
+      - name: install postgresql-client
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql-client
           pg_dump --version
-      # Los runners de GitHub traen Docker; si algún día dejaran de traerlo,
-      # los tests de testcontainers se saltarían solos y este job daría verde
-      # sin haber probado nada. Mejor fallar aquí.
-      - name: comprobar Docker
+      # GitHub's runners ship Docker; if they ever stopped shipping it, the
+      # testcontainers tests would skip themselves and this job would go green
+      # without having tested anything. Better to fail here.
+      - name: check Docker
         run: docker info > /dev/null
-      # `shell: bash` para tener `pipefail`: con el shell por defecto el código
-      # de salida sería el de `tee` y un test roto pasaría por verde.
-      - name: suite completa
+      # `shell: bash` to get `pipefail`: with the default shell the exit code
+      # would be `tee`'s and a broken test would pass for green.
+      - name: full suite
         shell: bash
-        run: cargo test --all-features --workspace -- --test-threads=1 --nocapture 2>&1 | tee resultado.txt
-      # Los tests de contenedores se saltan solos, por diseño, cuando no hay
-      # Docker: avisan por stderr y devuelven verde. Aquí un salto es un fallo
-      # del entorno, y sin esto pasaría inadvertido.
-      - name: ningún test saltado
+        run: cargo test --all-features --workspace -- --test-threads=1 --nocapture 2>&1 | tee results.txt
+      # The container tests skip themselves, by design, when there is no Docker:
+      # they say so on stderr and return green. Here a skip is a failure of the
+      # environment, and without this it would go unnoticed.
+      - name: no test skipped
         run: |
-          if grep -q "^SALTADO " resultado.txt; then
-            echo "::error::algún test de contenedores se saltó en el job que existe para ejecutarlos"
-            grep "^SALTADO " resultado.txt
+          if grep -q "^SKIPPED " results.txt; then
+            echo "::error::a container test skipped itself in the job that exists to run them"
+            grep "^SKIPPED " results.txt
             exit 1
           fi
 
-  # La MSRV declarada (`rust-version` en el workspace) y la toolchain fijada
-  # (`rust-toolchain.toml`) tienen que ser la misma versión.
+  # The declared MSRV (`rust-version` in the workspace) and the pinned toolchain
+  # (`rust-toolchain.toml`) have to be the same version.
   #
-  # No hay aquí una compilación con 1.92: sería copiar el job `check`.
-  # `rust-toolchain.toml` fuerza 1.92 en todos los jobs y en la máquina de
-  # cualquiera que clone el repositorio, así que usar sin querer una API más
-  # nueva ya rompe la build normal. Lo que ese fichero *no* detecta es que
-  # alguien suba el canal a una versión más nueva y se deje `rust-version` en
-  # 1.92: a partir de ahí el crate anuncia una MSRV que nadie comprueba y que
-  # probablemente ya no se cumple. Eso es lo que mira este job, y por eso son
-  # segundos y no una build entera.
+  # There is no build with 1.92 here: it would be a copy of the `check` job.
+  # `rust-toolchain.toml` forces 1.92 in every job and on the machine of anyone
+  # who clones the repository, so accidentally using a newer API already breaks
+  # the normal build. What that file does *not* catch is somebody bumping the
+  # channel to a newer version and leaving `rust-version` at 1.92: from then on
+  # the crate advertises an MSRV nobody checks and that probably no longer
+  # holds. That is what this job looks at, and why it takes seconds and not a
+  # whole build.
   msrv:
-    name: MSRV declarada
+    name: declared MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: rust-version y rust-toolchain.toml coinciden
+      - name: rust-version and rust-toolchain.toml agree
         run: |
-          declarada=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
-          fijada=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
-          echo "Cargo.toml rust-version = $declarada"
-          echo "rust-toolchain.toml channel = $fijada"
-          if [ "$declarada" != "$fijada" ]; then
-            echo "::error::la MSRV declarada ($declarada) no coincide con la toolchain fijada ($fijada); la CI no está probando la versión que el crate promete soportar"
+          declared=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+          pinned=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          echo "Cargo.toml rust-version = $declared"
+          echo "rust-toolchain.toml channel = $pinned"
+          if [ "$declared" != "$pinned" ]; then
+            echo "::error::the declared MSRV ($declared) does not match the pinned toolchain ($pinned); CI is not testing the version the crate promises to support"
             exit 1
           fi
 
-  # Los tests de memoria mueven ~9 GiB por el disco: en cada push serían un
-  # impuesto que nadie quiere pagar, y lo que vigilan —que el pipeline de
-  # streaming no acumule el backup entero en RAM— cambia con poca frecuencia.
-  # Semanal, más disparo manual para cuando se toca ese pipeline.
-  memoria:
-    name: uso de memoria con backups grandes
+  # The memory tests move ~9 GiB across the disk: on every push they would be a
+  # tax nobody wants to pay, and what they watch -- that the streaming pipeline
+  # does not accumulate the whole backup in RAM -- changes rarely. Weekly, plus
+  # a manual trigger for when that pipeline is touched.
+  memory:
+    name: memory usage with large backups
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
-      # Espacio libre antes de empezar: si el runner no lo tiene, el fallo se
-      # ve aquí y no a mitad de un test de veinte minutos.
+      # Free space before starting: if the runner does not have it, the failure
+      # shows up here and not halfway through a twenty-minute test.
       - run: df -h /
-      # En release: en debug estos tests tardan de más y miden otra cosa.
-      - run: cargo test --release --all-features -p sb-cli --test memoria -- --ignored --nocapture --test-threads=1
+      # In release: in debug these tests take too long and measure something
+      # else.
+      - run: cargo test --release --all-features -p sb-cli --test memory -- --ignored --nocapture --test-threads=1
