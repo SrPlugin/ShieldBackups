@@ -696,7 +696,7 @@ stdout. Logs go to stderr, so the two never mix even with `-vv`. On success:
 {"ok":true,"targets":[{"name":"produccion","artifact_key":"produccion/2026/08/21/produccion-20260821T233123Z-postgres.dump.zst.age"}]}
 ```
 
-On failure the same object carries `ok:false` plus `clase` (`"config"`,
+On failure the same object carries `ok:false` plus `class` (`"config"`,
 `"plugin"` or `"operation"` — the string form of the exit code) and `error`:
 
 ```json
@@ -709,7 +709,7 @@ makes a `doctor` run readable even when it exits 4.
 ```bash
 docker run --rm --init ... shieldbk:0.1.0 \
   --config /etc/shieldbk/config.toml --format json backup \
-  | jq -r 'if .ok then .targets[].artifact_key else "\(.clase): \(.error)" end'
+  | jq -r 'if .ok then .targets[].artifact_key else "\(.class): \(.error)" end'
 ```
 
 A `doctor` run that finds problems exits **4** and still prints its full report,
