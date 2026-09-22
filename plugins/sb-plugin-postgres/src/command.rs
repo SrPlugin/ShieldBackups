@@ -1,0 +1,399 @@
+//! Spawning `pg_dump`/`pg_restore` and turning their exit status into
+//! something the core can show.
+//!
+//! **The secret goes in the environment, never in argv.** `/proc/<pid>/cmdline`
+//! and `ps` are world-readable; a password passed as `--password=hunter2` is
+//! visible to every user on the machine for as long as the command runs. The
+//! environment of a process is readable only by its owner, which is the best
+//! the POSIX process model offers here.
+
+use std::process::Stdio;
+
+use sb_plugin_sdk::tonic::Status;
+use tokio::io::AsyncReadExt as _;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+
+use crate::config::Config;
+
+/// Tail of stderr kept for the error message if the command fails: the
+/// diagnosis -- `pg_dump: error: connection to server ... failed` -- is
+/// usually at the very end, and keeping all of it would let a chatty command
+/// grow the error without bound.
+const STDERR_KEPT_BYTES: usize = 4096;
+
+/// The `pg_dump` invocation for `config`'s target.
+///
+/// `--format=custom` is what makes the output restorable with `pg_restore`
+/// instead of only with `psql`; `--compress=0` disables `pg_dump`'s own
+/// compression because the core already compresses the whole stream with zstd
+/// afterwards, and compressing already-compressed bytes only burns CPU for a
+/// worse ratio than compressing the raw dump once.
+#[must_use]
+pub fn dump_args(config: &Config) -> Vec<String> {
+    let mut args = connection_args(config);
+    args.push("--format=custom".into());
+    args.push("--compress=0".into());
+    args
+}
+
+/// The `pg_restore` invocation for `config`'s target.
+///
+/// `--single-transaction` is what the core's docs promise: a restore that
+/// fails midway rolls back instead of leaving the database half rewritten.
+#[must_use]
+pub fn restore_args(config: &Config) -> Vec<String> {
+    let mut args = connection_args(config);
+    args.push("--single-transaction".into());
+    args
+}
+
+fn connection_args(config: &Config) -> Vec<String> {
+    vec![
+        "-h".into(),
+        config.host.clone(),
+        "-p".into(),
+        config.port.to_string(),
+        "-U".into(),
+        config.user.clone(),
+        "-d".into(),
+        config.database.clone(),
+        // Fail instead of blocking on a prompt: there is no tty for either
+        // process to read one from, and a hang here would look like a stuck
+        // backup instead of the missing credential it is.
+        "--no-password".into(),
+    ]
+}
+
+/// A spawned `pg_dump`/`pg_restore`, with its stderr already being drained.
+///
+/// The stderr pipe is drained as soon as the process is spawned: an unread
+/// pipe eventually fills and blocks the writer, which for `pg_dump` would
+/// stall the dump on a full stderr buffer instead of on anything real.
+#[derive(Debug)]
+pub struct Running {
+    label: &'static str,
+    child: Child,
+    stderr: tokio::task::JoinHandle<String>,
+}
+
+impl Running {
+    /// Spawns `program` with `args`, exporting `config`'s password as
+    /// `PGPASSWORD` if there is one.
+    ///
+    /// No shell is ever involved: `args` reaches the process as an argv, not
+    /// as a string a shell would re-split or re-interpret.
+    ///
+    /// # Errors
+    /// [`Status::unavailable`] if `program` cannot be started -- most likely
+    /// because it is not on `PATH` or the configured path does not exist.
+    ///
+    /// # Panics
+    /// Never in practice: stderr is always requested as [`Stdio::piped`] two
+    /// lines above, so taking it back out always finds it there.
+    pub fn spawn(
+        label: &'static str,
+        program: &str,
+        args: &[String],
+        config: &Config,
+        stdin: Stdio,
+        stdout: Stdio,
+    ) -> Result<Self, Status> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(Stdio::piped());
+        if let Some(password) = config.password() {
+            command.env("PGPASSWORD", password);
+        }
+        let mut child = command.spawn().map_err(|e| {
+            Status::unavailable(format!(
+                "could not start `{program}`: {e}; is it installed and on PATH, or does the configured path point at it?"
+            ))
+        })?;
+        #[expect(clippy::unwrap_used, reason = "just requested as Stdio::piped() above")]
+        let stderr_pipe = child.stderr.take().unwrap();
+        let stderr = tokio::spawn(drain(stderr_pipe));
+        Ok(Self {
+            label,
+            child,
+            stderr,
+        })
+    }
+
+    /// Takes the child's stdout.
+    ///
+    /// # Panics
+    /// If `stdout` was not spawned as [`Stdio::piped`]: that is a bug in the
+    /// caller, not a runtime condition, so it is left to panic rather than
+    /// threaded through as a `Result` nothing can do about.
+    #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "documented above: a caller bug, not a runtime condition"
+    )]
+    pub fn stdout(&mut self) -> ChildStdout {
+        self.child
+            .stdout
+            .take()
+            .expect("stdout requested from a command not spawned with Stdio::piped()")
+    }
+
+    /// Takes the child's stdin.
+    ///
+    /// # Panics
+    /// If `stdin` was not spawned as [`Stdio::piped`]: that is a bug in the
+    /// caller, not a runtime condition, so it is left to panic rather than
+    /// threaded through as a `Result` nothing can do about.
+    #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "documented above: a caller bug, not a runtime condition"
+    )]
+    pub fn stdin(&mut self) -> ChildStdin {
+        self.child
+            .stdin
+            .take()
+            .expect("stdin requested from a command not spawned with Stdio::piped()")
+    }
+
+    /// Kills the child immediately. For the failure paths, where there is no
+    /// point letting `pg_dump`/`pg_restore` run to completion.
+    pub fn kill(&mut self) {
+        let _ = self.child.start_kill();
+    }
+
+    /// Waits for the command to exit and turns a non-zero status into an
+    /// error carrying the tail of its stderr.
+    ///
+    /// # Errors
+    /// [`Status::internal`] if the command could not be waited on or if it
+    /// exited with a non-zero status.
+    pub async fn settle(mut self) -> Result<(), Status> {
+        let status = self
+            .child
+            .wait()
+            .await
+            .map_err(|e| Status::internal(format!("waiting for `{}`: {e}", self.label)))?;
+        let tail = self.stderr.await.unwrap_or_default();
+        let tail = tail.trim();
+        if !tail.is_empty() {
+            tracing::info!(command = self.label, "{tail}");
+        }
+        if status.success() {
+            Ok(())
+        } else {
+            let detail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {tail}")
+            };
+            Err(Status::internal(format!(
+                "`{}` exited with {status}{detail}",
+                self.label
+            )))
+        }
+    }
+}
+
+/// Reads stderr to the end and keeps only its last [`STDERR_KEPT_BYTES`].
+///
+/// The cut is made on the raw bytes and decoded afterwards with
+/// `from_utf8_lossy`, so slicing at a byte offset that lands inside a
+/// multi-byte character cannot panic -- it only turns into one replacement
+/// character at the start of the tail.
+async fn drain(mut stderr: ChildStderr) -> String {
+    let mut buf = Vec::new();
+    let _ = stderr.read_to_end(&mut buf).await;
+    let start = buf.len().saturating_sub(STDERR_KEPT_BYTES);
+    String::from_utf8_lossy(&buf[start..]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::process::Stdio;
+
+    use sb_plugin_sdk::sb_proto::{Value, value::Kind};
+
+    use super::{Running, dump_args, restore_args};
+    use crate::config::Config;
+
+    fn config(password: Option<&str>) -> Config {
+        let mut map = HashMap::from([
+            (
+                "host".to_string(),
+                Value {
+                    kind: Some(Kind::StringValue("db.internal".into())),
+                },
+            ),
+            (
+                "database".to_string(),
+                Value {
+                    kind: Some(Kind::StringValue("app".into())),
+                },
+            ),
+            (
+                "user".to_string(),
+                Value {
+                    kind: Some(Kind::StringValue("backup".into())),
+                },
+            ),
+        ]);
+        if let Some(p) = password {
+            map.insert(
+                "password".to_string(),
+                Value {
+                    kind: Some(Kind::StringValue(p.into())),
+                },
+            );
+        }
+        Config::from_map(&map).unwrap()
+    }
+
+    #[test]
+    fn dump_args_names_the_target_and_forces_the_custom_format() {
+        let args = dump_args(&config(None));
+        assert_eq!(
+            args,
+            vec![
+                "-h",
+                "db.internal",
+                "-p",
+                "5432",
+                "-U",
+                "backup",
+                "-d",
+                "app",
+                "--no-password",
+                "--format=custom",
+                "--compress=0",
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_args_ask_for_a_single_transaction() {
+        let args = restore_args(&config(None));
+        assert_eq!(
+            args,
+            vec![
+                "-h",
+                "db.internal",
+                "-p",
+                "5432",
+                "-U",
+                "backup",
+                "-d",
+                "app",
+                "--no-password",
+                "--single-transaction",
+            ]
+        );
+    }
+
+    #[test]
+    fn neither_command_ever_carries_the_password() {
+        // `/proc/<pid>/cmdline` and `ps` are world-readable; a password in argv
+        // would be visible to every user on the machine for as long as the
+        // command runs.
+        for args in [
+            dump_args(&config(Some("hunter2"))),
+            restore_args(&config(Some("hunter2"))),
+        ] {
+            assert!(!args.iter().any(|a| a.contains("hunter2")));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_command_settles_ok() {
+        let running = Running::spawn(
+            "test",
+            "/bin/sh",
+            &["-c".into(), "exit 0".into()],
+            &config(None),
+            Stdio::null(),
+            Stdio::null(),
+        )
+        .unwrap();
+        running.settle().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_command_settles_with_its_stderr_tail() {
+        let running = Running::spawn(
+            "test",
+            "/bin/sh",
+            &["-c".into(), "echo something-went-wrong >&2; exit 7".into()],
+            &config(None),
+            Stdio::null(),
+            Stdio::null(),
+        )
+        .unwrap();
+        let e = running.settle().await.unwrap_err();
+        assert!(
+            e.message().contains("something-went-wrong"),
+            "{}",
+            e.message()
+        );
+        assert!(e.message().contains("test"), "{}", e.message());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_binary_fails_at_spawn_and_not_at_settle() {
+        let e = Running::spawn(
+            "test",
+            "/no/such/binary-anywhere",
+            &[],
+            &config(None),
+            Stdio::null(),
+            Stdio::null(),
+        )
+        .unwrap_err();
+        assert!(e.message().contains("no/such/binary-anywhere"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_password_reaches_the_child_only_through_its_environment() {
+        let mut running = Running::spawn(
+            "test",
+            "/bin/sh",
+            &["-c".into(), "printf '%s' \"$PGPASSWORD\"".into()],
+            &config(Some("hunter2")),
+            Stdio::null(),
+            Stdio::piped(),
+        )
+        .unwrap();
+        let mut out = running.stdout();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf)
+            .await
+            .unwrap();
+        running.settle().await.unwrap();
+        assert_eq!(buf, b"hunter2");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_password_pgpassword_is_not_set_at_all() {
+        // Not even empty: an operator relying on `.pgpass` or peer
+        // authentication must not have an empty `PGPASSWORD` silently override
+        // it, which `libpq` treats differently from the variable being unset.
+        let mut running = Running::spawn(
+            "test",
+            "/bin/sh",
+            &["-c".into(), "printf '%s' \"${PGPASSWORD-absent}\"".into()],
+            &config(None),
+            Stdio::null(),
+            Stdio::piped(),
+        )
+        .unwrap();
+        let mut out = running.stdout();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf)
+            .await
+            .unwrap();
+        running.settle().await.unwrap();
+        assert_eq!(buf, b"absent");
+    }
+}

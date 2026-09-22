@@ -3969,6 +3969,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sb-plugin-postgres"
+version = "0.1.0"
+dependencies = [
+ "sb-plugin-sdk",
+ "sb-transport",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sb-plugin-r2"
 version = "0.1.0"
 dependencies = [

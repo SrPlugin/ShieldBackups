@@ -1,0 +1,40 @@
+[package]
+name = "sb-plugin-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Exposed as a library so that `tests/integration.rs` can drive the plugin's
+# `Plugin`/`Source` services directly, the way `sb-plugin-r2`'s integration
+# test does against MinIO.
+[lib]
+name = "sb_plugin_postgres"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sb-plugin-postgres"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The SDK is the plugin's only dependency: it re-exports sb-proto, tonic and
+# `connect_data`, which is everything needed to talk to the core.
+sb-plugin-sdk = { version = "0.1.0", path = "../../crates/sb-plugin-sdk" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Only the tests need the transport: there they play the role of the core --
+# setting up the envelope, the ephemeral PKI and the data channels -- not of a
+# plugin.
+sb-transport = { version = "0.1.0", path = "../../crates/sb-transport" }
+tempfile = "3"
+# A real PostgreSQL server in Docker, so the round trip through `pg_dump` /
+# `pg_restore` is exercised against the real thing instead of a fake speaking
+# a fraction of the wire protocol. Same pattern `sb-plugin-r2` uses with MinIO.
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
