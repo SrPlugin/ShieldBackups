@@ -15,9 +15,9 @@ never sees the private key: it is handed a byte stream, not a decryption
 capability. [`docs/plugins/examples/command-plugin/`](docs/plugins/examples/command-plugin/)
 is a complete, working plugin in about 350 lines of JavaScript that proves it.
 
-- **Status:** 0.1.0. PostgreSQL is not in this repository yet; the shipped
-  plugins are `r2` (Cloudflare R2 / any S3-compatible store) and `mock` (a test
-  fixture that is also the fastest way to try the whole cycle).
+- **Status:** 0.1.0. The shipped plugins are `postgres` (wraps `pg_dump`/
+  `pg_restore`), `r2` (Cloudflare R2 / any S3-compatible store) and `mock` (a
+  test fixture that is also the fastest way to try the whole cycle).
 - **Platform:** Linux. The transport is Unix sockets and the permission checks
   are POSIX modes.
 - **License:** Apache-2.0. No `unsafe` anywhere in the workspace
@@ -27,6 +27,8 @@ is a complete, working plugin in about 350 lines of JavaScript that proves it.
 
 ## Table of contents
 
+- [Why ShieldBackups](#why-shieldbackups)
+- [Advantages](#advantages)
 - [How it works](#how-it-works)
 - [Why the ciphertext is what gets hashed](#why-the-ciphertext-is-what-gets-hashed)
 - [Getting started in five minutes](#getting-started-in-five-minutes)
@@ -39,6 +41,74 @@ is a complete, working plugin in about 350 lines of JavaScript that proves it.
 - [Where to go next](#where-to-go-next)
 
 ---
+
+## Why ShieldBackups
+
+Most backup tooling makes one of two choices, and both cost something:
+
+- **A single monolithic binary that knows about Postgres, MySQL, S3, GCS,
+  encryption and compression all at once.** Adding a new source or a new
+  destination means recompiling, and often means trusting a maintainer's
+  release cycle for a feature you need next week.
+- **A pile of shell scripts stitched together with cron**, each one calling
+  `pg_dump` and piping it into whatever uploads to storage this month. It
+  works until someone forgets `--single-transaction`, until a secret ends up
+  in `ps`, until nobody remembers which script is authoritative.
+
+ShieldBackups' answer is the process-boundary plugin architecture described
+below: pay the cost of an RPC call per plugin operation, and get back a system
+where a plugin can be written in any language by someone who has never seen
+the core's source, where the core's security guarantees (streaming, no
+plaintext on disk, ephemeral keys, verify-without-decrypt) apply to every
+plugin automatically because they live in the one place every plugin's bytes
+have to pass through, and where a broken or malicious plugin is contained by
+the shape of the contract: a storage plugin only ever receives ciphertext, and
+a source plugin never receives the encryption key.
+
+The design bias that follows from this: ShieldBackups does **full snapshots**,
+not incremental or deduplicated backups. That is what a byte-stream contract
+between two subprocesses naturally supports, and it is why the tool competes
+with `pg_dump`-and-upload workflows rather than with block-level backup
+systems like restic or Borg.
+
+## Advantages
+
+Stated plainly, backed by what is actually measured and tested, not by
+marketing:
+
+- **Memory does not scale with backup size.** The whole pipeline is one
+  streaming pass; nothing is buffered whole. A 64 MiB backup and a 2 GiB
+  backup both fit comfortably under 31 MiB of combined core+plugin memory —
+  see the numbers in [Memory and throughput](#memory-and-throughput). A
+  container's memory limit does not have to grow with the database.
+- **A compromised plugin's blast radius is architecturally bounded.** The
+  private key never leaves the core; a storage plugin handles ciphertext
+  only, and a source plugin already had the data it produces. Credentials
+  cross the wire only as resolved values over an ephemeral, per-run mTLS
+  channel — never as a literal in a config file that ends up in git, never in
+  a process's `argv`, where `ps` and `/proc/<pid>/cmdline` would publish it to
+  every user on the machine.
+- **Backups are verifiable without the ability to read them.** `shieldbk
+  verify` re-streams an artifact and checks its hash against the manifest
+  with no private key involved — the machine that checks your backups nightly
+  does not have to be a machine that can decrypt them.
+- **Extending it costs a plugin, not a fork.** A new source or a new storage
+  target is a separate binary that implements a handful of RPCs; the core,
+  the CLI, the security model and every other plugin are untouched.
+- **A restore that fails partway does not corrupt what was already there.**
+  `pg_restore --single-transaction` rolls back a truncated restore instead of
+  leaving the database half rewritten, and the contract asks every other
+  source plugin to make the same promise its own way.
+- **No `unsafe` anywhere in the workspace** (`unsafe_code = "forbid"`,
+  enforced at the lint level, not by convention), Apache-2.0, permissively
+  licensed dependencies only, audited with `cargo deny` on every change to
+  the dependency tree.
+- **Tested against the real thing, not a mock of it, where it matters.** The
+  R2 plugin's integration suite runs against a real S3-speaking server
+  (MinIO) in Docker; the PostgreSQL plugin's runs a real dump-and-restore
+  round trip against a real PostgreSQL server in Docker, checking that the
+  rows that come out are the rows that went in — and neither requires
+  installing anything beyond Docker on the machine that runs them.
 
 ## How it works
 
@@ -590,7 +660,8 @@ cargo build --release -p sb-cli           # just the CLI
 ```
 
 Rust 1.92 (pinned in `rust-toolchain.toml`). The binaries land in
-`target/release/`: `shieldbk`, `sb-plugin-r2`, `sb-plugin-mock`. Install the
+`target/release/`: `shieldbk`, `sb-plugin-postgres`, `sb-plugin-r2`,
+`sb-plugin-mock`. Install the
 plugins by copying them into `plugins.dir` under their own names —
 `sb-plugin-<name>` is the only lookup rule — and running `shieldbk plugin lock`.
 
