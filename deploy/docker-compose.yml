@@ -1,0 +1,53 @@
+# `backup` and `prune` are one-shot: Compose has no scheduler, so both are
+# `restart: "no"` and get driven by cron with `docker compose run --rm`. See
+# deploy/README.md for the full write-up of every flag here.
+#
+# Before using this file:
+#   - Set IMAGE below (or via .env, see .env.example) to the tag you built:
+#       docker build --build-arg PG_MAJOR=<your server's major> -t shieldbk:0.1.0-pgNN .
+#   - Point `networks.default.name` at the network your Postgres container is
+#     already on (`docker network ls`), so `host` in config.toml can be the
+#     container's name instead of an IP.
+#   - Put your real config at ./config.toml and your secrets at ./secrets/
+#     (chmod 600 each — see "Mounted secrets are world-readable by default"
+#     in deploy/README.md).
+
+x-shieldbk-common: &shieldbk-common
+  image: ${SHIELDBK_IMAGE:-shieldbk:0.1.0}
+  init: true # reaps orphaned plugin processes; see deploy/README.md #2
+  restart: "no"
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777,nosuid,nodev
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  user: "10001:10001"
+  mem_limit: 512m
+  cpus: 1.0
+  environment:
+    R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?set R2_ACCESS_KEY_ID}
+  volumes:
+    - ./config.toml:/etc/shieldbk/config.toml:ro
+    - ./secrets:/run/secrets:ro
+
+services:
+  backup:
+    <<: *shieldbk-common
+    command: ["--config", "/etc/shieldbk/config.toml", "backup"]
+
+  prune:
+    <<: *shieldbk-common
+    # Target name must match a `[[target]]` in config.toml that sets
+    # `retention_days` (on itself or in `[defaults]`) — otherwise this exits 2.
+    command:
+      ["--config", "/etc/shieldbk/config.toml", "storage", "prune", "app"]
+
+  doctor:
+    <<: *shieldbk-common
+    command: ["--config", "/etc/shieldbk/config.toml", "doctor"]
+
+networks:
+  default:
+    external: true
+    # Replace with the network your Postgres container is on.
+    name: CHANGE_ME_postgres_network
