@@ -200,6 +200,7 @@ mod tests {
             storage_config: sb_config::ConfigTable::new(),
             compression_level: None,
             artifact_template: None,
+            retention_days: None,
         }
     }
 

@@ -343,6 +343,125 @@ fn storage_gc_talks_to_the_storage_target_and_counts_what_it_aborted() {
 }
 
 #[test]
+fn storage_prune_without_retention_days_refuses_with_a_config_error() {
+    // Pruning deletes backups; running it on a target that never opted in
+    // would be deleting on a guessed default, which is exactly what the
+    // config field exists to prevent.
+    let (bench, config, _id, _key) = prepared();
+    let out = bench
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "storage",
+            "prune",
+            "production",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "no `retention_days` is a configuration error, not a plugin or operation one"
+    );
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains("retention_days"),
+        "the message has to name the missing field: {text}"
+    );
+}
+
+#[test]
+fn storage_prune_deletes_expired_artifacts_and_their_manifests() {
+    let bench = Bench::new();
+    bench.install_mock();
+    let (id, _key) = identity(&bench);
+    // `retention_days = 0`: by the time `prune` runs, the artifact `backup`
+    // already wrote is older than "now", so it is exactly the case that has
+    // to be deleted -- and the only reliable way to test deletion without a
+    // clock the test controls.
+    let config = bench.config(&format!(
+        r#"
+[plugins]
+dir = {dir:?}
+lockfile = {lock:?}
+
+[defaults]
+retention_days = 0
+
+[[target]]
+name = "production"
+source = "mock"
+storage = "mock"
+recipient = "{recipient}"
+
+[target.source_config]
+dir = {data:?}
+seed = 7
+size = 65536
+
+[target.storage_config]
+dir = {data:?}
+"#,
+        dir = bench.plugins_dir().to_string_lossy(),
+        lock = bench.lockfile().to_string_lossy(),
+        data = bench.data_dir().to_string_lossy(),
+        recipient = id.to_recipient(),
+    ));
+
+    let lock = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
+        .output()
+        .unwrap();
+    assert!(lock.status.success());
+
+    let backup = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+    assert!(backup.status.success());
+    assert!(
+        !walk(&bench.data_dir()).is_empty(),
+        "the backup has to have written something before it can be pruned"
+    );
+
+    // `modified_at` has one-second resolution (see `sb-core::naming`'s own
+    // note on `{timestamp}`), so the cutoff computed a moment later has to
+    // land in the next second for the artifact to compare as strictly older.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let out = bench
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--format",
+            "json",
+            "storage",
+            "prune",
+            "production",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out.stdout);
+    assert_eq!(json["deleted"], 1);
+    assert_eq!(json["kept"], 0);
+
+    assert!(
+        walk(&bench.data_dir()).is_empty(),
+        "the expired artifact and its manifest both had to go"
+    );
+}
+
+#[test]
 fn plugin_docs_shows_the_plugins_schema_and_no_value() {
     let (bench, config, _id, _key) = prepared();
     let out = bench

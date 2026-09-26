@@ -356,6 +356,7 @@ lockfile = "~/.shieldbk/plugins.lock" # the hashes that authorise them
 [defaults]
 compression_level = 6                 # zstd, 1..=22
 artifact_template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age"
+# retention_days = 5                  # `storage prune` deletes older artifacts; unset means keep forever
 
 [[target]]
 name      = "production"
@@ -364,6 +365,7 @@ storage   = "r2"                      # -> <dir>/sb-plugin-r2
 recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
 # compression_level = 12              # optional per-target override
 # artifact_template = "…"             # optional per-target override
+# retention_days = 5                  # optional per-target override
 
 [target.source_config]                # opaque to the core; the plugin's schema rules
 host     = "db.internal"
@@ -492,6 +494,23 @@ prefix. A failed upload leaves orphaned parts that the provider keeps billing
 for. It is deliberately scoped to the target's prefix: a bucket may hold more
 than this `shieldbk`'s backups, and aborting somebody else's uploads would be
 worse than the problem it came to solve.
+
+### `shieldbk storage prune TARGET`
+
+Deletes the artifacts (and their manifests) older than the target's
+`retention_days`, using the storage target's own `List`/`Delete` RPCs — the
+core never needs to know it is Postgres or R2 on the other end, only that
+`ArtifactMeta.modified_at` is older than the cutoff. Refuses with a
+configuration error if `retention_days` is not set, on the target or in
+`[defaults]`: pruning deletes backups, so it never runs on a guessed default.
+
+```sh
+shieldbk storage prune production
+```
+
+Run it on the same schedule as `backup` (a `cron` right after it, or its own
+hourly entry) so the storage target never grows past what `retention_days`
+allows.
 
 ### Exit codes
 
@@ -631,9 +650,12 @@ losing them.
 - **No incremental backups. No deduplication.** Every run is a complete
   snapshot, compressed and encrypted from scratch. Ten daily backups of a 500 GB
   tree cost ten times the compressed size of that tree, and ten times the time.
-- **No retention or pruning.** Nothing deletes an old artifact. `storage gc`
-  aborts incomplete *uploads*; it does not implement a policy. Expiring old
-  backups is a lifecycle rule on your bucket, or a cron job of your own.
+- **Retention is opt-in and age-based, nothing else.** `storage prune` deletes
+  artifacts older than `retention_days`; without that field set, nothing is
+  ever deleted. There is no "keep the last N" policy — only age. `storage gc`
+  is separate: it aborts incomplete *uploads*, not old backups. A storage
+  target's own lifecycle rule (e.g. R2's) is a perfectly good alternative to
+  running `prune`, and the two are safe to use together.
 - **No scheduler and no daemon.** `shieldbk` starts, does one thing and exits.
   Point cron, a systemd timer or a Kubernetes `CronJob` at it.
 - **No automatic retries.** A transient network failure fails the run and exits

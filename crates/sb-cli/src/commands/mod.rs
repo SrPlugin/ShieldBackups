@@ -64,6 +64,7 @@ pub async fn run(cli: &Cli) -> Result<Report, CliError> {
         },
         Command::Storage { action } => match action {
             StorageAction::Gc { target } => storage::gc(&ctx, target).await,
+            StorageAction::Prune { target } => storage::prune(&ctx, target).await,
         },
     }
 }

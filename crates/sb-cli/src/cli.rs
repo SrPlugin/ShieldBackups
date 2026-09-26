@@ -139,6 +139,11 @@ pub enum StorageAction {
         /// Target whose storage is cleaned up.
         target: String,
     },
+    /// Delete the artifacts older than the target's `retention_days`.
+    Prune {
+        /// Target whose old artifacts are deleted.
+        target: String,
+    },
 }
 
 #[cfg(test)]

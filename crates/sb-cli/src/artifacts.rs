@@ -18,7 +18,7 @@ use sb_config::{Defaults, Target};
 use sb_core::model::manifest_key_for;
 use sb_core::plugin::PluginClient;
 use sb_proto::storage_client::StorageClient;
-use sb_proto::{AbortIncompleteRequest, ArtifactMeta, ListRequest};
+use sb_proto::{AbortIncompleteRequest, ArtifactMeta, DeleteRequest, ListRequest};
 
 use crate::error::CliError;
 
@@ -102,6 +102,29 @@ pub async fn list(storage: &PluginClient, prefix: &str) -> Result<Vec<ArtifactMe
         .into_iter()
         .filter(|a| !a.key.ends_with(&suffix))
         .collect())
+}
+
+/// Deletes `key` from the storage target. Idempotent: a key that is already
+/// gone is not an error, the same guarantee `sb-plugin-r2`'s own `delete`
+/// documents.
+///
+/// # Errors
+/// Returns [`CliError::Operation`] if the storage target rejects the request
+/// for a reason other than the key's absence.
+pub async fn delete(storage: &PluginClient, key: &str) -> Result<(), CliError> {
+    let mut grpc = StorageClient::new(storage.channel());
+    grpc.delete(DeleteRequest {
+        key: key.to_owned(),
+    })
+    .await
+    .map_err(|status| {
+        CliError::operation(format!(
+            "the storage target `{}` could not delete `{key}`: {}",
+            storage.name(),
+            status.message()
+        ))
+    })?;
+    Ok(())
 }
 
 /// Asks the storage target to abort the incomplete uploads under `prefix`.

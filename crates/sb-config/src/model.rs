@@ -121,6 +121,12 @@ pub struct Defaults {
     pub compression_level: i32,
     /// Template of the artifact's key in the destination.
     pub artifact_template: String,
+    /// How many days an artifact is kept before `storage prune` deletes it.
+    ///
+    /// `None` by default: deleting a backup is destructive, so a target that
+    /// never opted in keeps every artifact forever instead of silently losing
+    /// one to a config a future reader never noticed.
+    pub retention_days: Option<u32>,
 }
 
 impl Default for Defaults {
@@ -129,6 +135,7 @@ impl Default for Defaults {
             compression_level: DEFAULT_LEVEL,
             artifact_template:
                 "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age".to_owned(),
+            retention_days: None,
         }
     }
 }
@@ -163,6 +170,9 @@ pub struct Target {
     /// Its own template; if absent, [`Defaults`]' one wins.
     #[serde(default)]
     pub artifact_template: Option<String>,
+    /// Its own retention, in days; if absent, [`Defaults`]' one wins.
+    #[serde(default)]
+    pub retention_days: Option<u32>,
 }
 
 impl Target {
@@ -180,6 +190,13 @@ impl Target {
         self.artifact_template
             .as_deref()
             .unwrap_or(&defaults.artifact_template)
+    }
+
+    /// Retention, in days, that will be applied: the target's if it defines
+    /// one, otherwise the global one. `None` means "keep forever".
+    #[must_use]
+    pub fn effective_retention_days(&self, defaults: &Defaults) -> Option<u32> {
+        self.retention_days.or(defaults.retention_days)
     }
 }
 
