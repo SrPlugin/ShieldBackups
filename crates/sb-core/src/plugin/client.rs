@@ -49,6 +49,8 @@ pub enum Capability {
     Source,
     /// It can store and retrieve artifacts: it is a storage.
     Storage,
+    /// It can be told how a command went and pass that on: it is a notifier.
+    Notifier,
 }
 
 impl Capability {
@@ -59,6 +61,7 @@ impl Capability {
         match self {
             Self::Source => "source",
             Self::Storage => "storage",
+            Self::Notifier => "notifier",
         }
     }
 }

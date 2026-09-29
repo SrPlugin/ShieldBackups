@@ -3,7 +3,7 @@ syntax = "proto3";
 package shieldbk.v1;
 
 // Every plugin implements this service. On top of it, a plugin implements
-// Source, Storage or both, and declares which in Info.
+// any of Source, Storage and Notifier, and declares which in Info.
 service Plugin {
   // First RPC over the already-authenticated channel. Confirms identity and
   // capabilities.
@@ -44,10 +44,21 @@ service Storage {
   rpc AbortIncomplete (AbortIncompleteRequest) returns (AbortIncompleteResponse);
 }
 
+// Something that wants to hear how a command went: Slack, Discord, a mailbox, a
+// ticket, a dead-man's-switch URL. The core never knows which -- it hands every
+// notifier the same event and the plugin decides what to do with it.
+//
+// Delivery is best-effort by design: a notifier that fails is reported on
+// stderr and never changes the exit code of the command it was telling about.
+service Notifier {
+  rpc Notify (NotifyRequest) returns (NotifyResponse);
+}
+
 enum Capability {
   CAPABILITY_UNSPECIFIED = 0;
   CAPABILITY_SOURCE      = 1;
   CAPABILITY_STORAGE     = 2;
+  CAPABILITY_NOTIFIER    = 3;
 }
 
 message InfoRequest {}
@@ -193,6 +204,21 @@ message ArtifactMeta {
 
 message ListRequest  { string prefix = 1; }
 message ListResponse { repeated ArtifactMeta artifacts = 1; }
+
+// What happened, exactly as the command reported it.
+message NotifyRequest {
+  // The command that ran: `backup`, `restore`, `verify`, `doctor`,
+  // `storage gc` or `storage prune`.
+  string command     = 1;
+  // Whether it succeeded. A `doctor` that found problems is not ok.
+  bool   ok          = 2;
+  // The very JSON document `--format json` prints for that run, verdict
+  // included (`ok`, and `class`/`code`/`error` when it failed). Its shape is
+  // the command's public contract, so a notifier can rely on it as much as a
+  // script piping `jq` does.
+  string report_json = 3;
+}
+message NotifyResponse {}
 
 message DeleteRequest  { string key = 1; }
 message DeleteResponse {}

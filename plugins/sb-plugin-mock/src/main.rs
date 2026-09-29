@@ -1,4 +1,4 @@
-//! `sb-plugin-mock`: a plugin that is both a source and a storage target.
+//! `sb-plugin-mock`: a plugin that is a source, a storage target and a notifier.
 //!
 //! It exists so that the core -- pipeline, orchestration and CLI -- can be
 //! tested end to end without a database, without the network and without
@@ -9,6 +9,7 @@
 
 mod config;
 mod keys;
+mod notifier;
 mod plugin;
 mod source;
 mod storage;
@@ -19,12 +20,13 @@ use sb_plugin_sdk::PluginRuntime;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A single shared state: `Configure` arrives through the Plugin service and
-    // both the source and the storage target read it. Without it, each service
+    // the source, the storage target and the notifier read it. Without it, each service
     // would have its own idea of where `dir` is.
     let state = config::State::new(plugin::NAME);
     PluginRuntime::new(plugin::MockPlugin::new(state.clone()))
         .with_source(source::MockSource::new(state.clone()))
-        .with_storage(storage::MockStorage::new(state))
+        .with_storage(storage::MockStorage::new(state.clone()))
+        .with_notifier(notifier::MockNotifier::new(state))
         .serve()
         .await?;
     Ok(())

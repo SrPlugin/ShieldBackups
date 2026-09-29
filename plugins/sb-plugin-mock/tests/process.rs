@@ -18,13 +18,14 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use sb_plugin_mock::deterministic_data;
+use sb_plugin_sdk::sb_proto::notifier_client::NotifierClient;
 use sb_plugin_sdk::sb_proto::plugin_client::PluginClient;
 use sb_plugin_sdk::sb_proto::source_client::SourceClient;
 use sb_plugin_sdk::sb_proto::storage_client::StorageClient;
 use sb_plugin_sdk::sb_proto::value::Kind;
 use sb_plugin_sdk::sb_proto::{
     ConfigureRequest, DeleteRequest, DumpRequest, GetRequest, InfoRequest, ListRequest,
-    PreflightRequest, PutRequest, RestoreRequest, Value,
+    NotifyRequest, PreflightRequest, PutRequest, RestoreRequest, Value,
 };
 use sb_plugin_sdk::tonic::transport::Channel;
 use sb_plugin_sdk::tonic::{Code, Status};
@@ -89,6 +90,9 @@ impl LivePlugin {
     }
     fn storage(&self) -> StorageClient<Channel> {
         StorageClient::new(self.channel.clone())
+    }
+    fn notifier(&self) -> NotifierClient<Channel> {
+        NotifierClient::new(self.channel.clone())
     }
 
     async fn configure(&self, dir: &Path, seed: i64, size: i64) {
@@ -184,10 +188,13 @@ async fn get(live: &LivePlugin, sockets: &Path, name: &str, key: &str) -> Result
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it_starts_announces_itself_and_declares_both_capabilities() {
+async fn it_starts_announces_itself_and_declares_its_three_capabilities() {
     let live = LivePlugin::start().await;
     assert_eq!(live.ready.protocol_version, 1);
-    assert_eq!(live.ready.capabilities, vec!["source", "storage"]);
+    assert_eq!(
+        live.ready.capabilities,
+        vec!["source", "storage", "notifier"]
+    );
     assert!(live.ready.pid > 0);
 }
 
@@ -203,8 +210,49 @@ async fn info_identifies_itself_as_mock_over_the_mtls_channel() {
     assert_eq!(info.name, "mock");
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.protocol_version, 1);
-    // 1 = source, 2 = storage.
-    assert_eq!(info.capabilities, vec![1, 2]);
+    // 1 = source, 2 = storage, 3 = notifier.
+    assert_eq!(info.capabilities, vec![1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notification_is_appended_to_the_notifications_file_as_one_json_line() {
+    let live = LivePlugin::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    live.configure(dir.path(), 1, 1).await;
+
+    for (command, ok) in [("backup", true), ("verify", false)] {
+        live.notifier()
+            .notify(NotifyRequest {
+                command: command.into(),
+                ok,
+                report_json: format!(r#"{{"ok":{ok}}}"#),
+            })
+            .await
+            .unwrap();
+    }
+
+    let text = std::fs::read_to_string(dir.path().join("notifications.jsonl")).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per notification: {text}");
+    assert_eq!(
+        lines[0],
+        r#"{"command":"backup","ok":true,"report":{"ok":true}}"#
+    );
+    assert_eq!(
+        lines[1],
+        r#"{"command":"verify","ok":false,"report":{"ok":false}}"#
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_notification_before_configure_fails_with_failed_precondition() {
+    let live = LivePlugin::start().await;
+    let e = live
+        .notifier()
+        .notify(NotifyRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition, "{}", e.message());
 }
 
 #[tokio::test(flavor = "multi_thread")]

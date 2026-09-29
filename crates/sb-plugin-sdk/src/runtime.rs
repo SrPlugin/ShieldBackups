@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sb_proto::PROTOCOL_VERSION;
+use sb_proto::notifier_server::{Notifier, NotifierServer};
 use sb_proto::plugin_server::{Plugin, PluginServer};
 use sb_proto::source_server::{Source, SourceServer};
 use sb_proto::storage_server::{Storage, StorageServer};
@@ -62,7 +63,7 @@ pub enum SdkError {
 }
 
 /// Capabilities that are announced, derived from the registered services.
-fn capabilities(source: bool, storage: bool) -> Vec<String> {
+fn capabilities(source: bool, storage: bool, notifier: bool) -> Vec<String> {
     let mut v = Vec::new();
     if source {
         v.push("source".to_string());
@@ -70,14 +71,23 @@ fn capabilities(source: bool, storage: bool) -> Vec<String> {
     if storage {
         v.push("storage".to_string());
     }
+    if notifier {
+        v.push("notifier".to_string());
+    }
     v
 }
 
-fn build_ready(protocol_version: u32, source: bool, storage: bool, pid: u32) -> Ready {
+fn build_ready(
+    protocol_version: u32,
+    source: bool,
+    storage: bool,
+    notifier: bool,
+    pid: u32,
+) -> Ready {
     Ready {
         magic: MAGIC.into(),
         protocol_version,
-        capabilities: capabilities(source, storage),
+        capabilities: capabilities(source, storage, notifier),
         pid,
     }
 }
@@ -108,6 +118,7 @@ pub struct PluginRuntime<P> {
     plugin: P,
     source: Option<Registration>,
     storage: Option<Registration>,
+    notifier: Option<Registration>,
 }
 
 impl<P: Plugin> PluginRuntime<P> {
@@ -119,6 +130,7 @@ impl<P: Plugin> PluginRuntime<P> {
             plugin,
             source: None,
             storage: None,
+            notifier: None,
         }
     }
 
@@ -140,6 +152,15 @@ impl<P: Plugin> PluginRuntime<P> {
     pub fn with_storage<S: Storage>(mut self, storage: S) -> Self {
         self.storage = Some(Box::new(move |r: Routes| {
             r.add_service(StorageServer::new(storage))
+        }));
+        self
+    }
+
+    /// Registers the notifier. Announces the `notifier` capability.
+    #[must_use]
+    pub fn with_notifier<N: Notifier>(mut self, notifier: N) -> Self {
+        self.notifier = Some(Box::new(move |r: Routes| {
+            r.add_service(NotifierServer::new(notifier))
         }));
         self
     }
@@ -170,6 +191,7 @@ impl<P: Plugin> PluginRuntime<P> {
 
         let source = self.source.is_some();
         let storage = self.storage.is_some();
+        let notifier = self.notifier.is_some();
 
         // The Plugin service goes wrapped: `Shutdown` is first served by the
         // plugin's implementation and then ends the process, without the plugin
@@ -183,6 +205,9 @@ impl<P: Plugin> PluginRuntime<P> {
             routes = register(routes);
         }
         if let Some(register) = self.storage {
+            routes = register(routes);
+        }
+        if let Some(register) = self.notifier {
             routes = register(routes);
         }
 
@@ -207,9 +232,16 @@ impl<P: Plugin> PluginRuntime<P> {
             socket = %socket.display(),
             source,
             storage,
+            notifier,
             "control channel listening; announcing ready"
         );
-        announce(&build_ready(version, source, storage, std::process::id()))?;
+        announce(&build_ready(
+            version,
+            source,
+            storage,
+            notifier,
+            std::process::id(),
+        ))?;
 
         // We live until one of two things happens: the channel goes down by
         // itself —and then its error is the plugin's result— or the core asks
@@ -332,27 +364,32 @@ mod tests {
 
     #[test]
     fn a_plugin_with_no_extra_services_only_announces_the_basics() {
-        assert!(capabilities(false, false).is_empty());
+        assert!(capabilities(false, false, false).is_empty());
     }
 
     #[test]
     fn a_source_announces_source() {
-        assert_eq!(capabilities(true, false), vec!["source"]);
+        assert_eq!(capabilities(true, false, false), vec!["source"]);
     }
 
     #[test]
     fn a_storage_announces_storage() {
-        assert_eq!(capabilities(false, true), vec!["storage"]);
+        assert_eq!(capabilities(false, true, false), vec!["storage"]);
     }
 
     #[test]
     fn a_plugin_that_does_both_announces_both() {
-        assert_eq!(capabilities(true, true), vec!["source", "storage"]);
+        assert_eq!(capabilities(true, true, false), vec!["source", "storage"]);
+    }
+
+    #[test]
+    fn a_notifier_announces_notifier() {
+        assert_eq!(capabilities(false, false, true), vec!["notifier"]);
     }
 
     #[test]
     fn the_ready_line_carries_the_magic_and_the_negotiated_version() {
-        let r = build_ready(1, true, false, 4242);
+        let r = build_ready(1, true, false, false, 4242);
         assert_eq!(r.magic, sb_transport::MAGIC);
         assert_eq!(r.protocol_version, 1);
         assert_eq!(r.capabilities, vec!["source"]);
@@ -363,7 +400,7 @@ mod tests {
     fn the_ready_serializes_into_a_single_line() {
         // The core reads it with a read_line: if it carried newlines it would be
         // cut short.
-        let line = build_ready(1, true, true, 1).to_line().unwrap();
+        let line = build_ready(1, true, true, true, 1).to_line().unwrap();
         assert!(!line.contains('\n'));
         assert!(sb_transport::Ready::from_line(&line).is_ok());
     }
@@ -372,10 +409,12 @@ mod tests {
     fn the_declared_capabilities_match_the_registered_services() {
         // The reason for deriving them instead of passing them by hand: a plugin
         // cannot announce a source it does not implement.
-        for (source, storage) in [(false, false), (true, false), (false, true), (true, true)] {
-            let r = build_ready(1, source, storage, 1);
+        for bits in 0..8_u8 {
+            let (source, storage, notifier) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let r = build_ready(1, source, storage, notifier, 1);
             assert_eq!(r.capabilities.contains(&"source".to_string()), source);
             assert_eq!(r.capabilities.contains(&"storage".to_string()), storage);
+            assert_eq!(r.capabilities.contains(&"notifier".to_string()), notifier);
         }
     }
 }
