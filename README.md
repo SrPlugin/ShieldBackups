@@ -16,7 +16,8 @@ capability. [`docs/plugins/examples/command-plugin/`](docs/plugins/examples/comm
 is a complete, working plugin in about 350 lines of JavaScript that proves it.
 
 - **Status:** 0.1.0. The shipped plugins are `postgres` (wraps `pg_dump`/
-  `pg_restore`), `r2` (Cloudflare R2 / any S3-compatible store) and `mock` (a
+  `pg_restore`), `r2` (Cloudflare R2 / any S3-compatible store), `webhook` (a notifier: it
+  POSTs the result of every command to Slack, Discord or any URL) and `mock` (a
   test fixture that is also the fastest way to try the whole cycle).
 - **Platform:** Linux. The transport is Unix sockets and the permission checks
   are POSIX modes.
@@ -447,8 +448,17 @@ format = "slack"
   `shieldbk plugin lock`, it talks over mTLS, and its secrets are references,
   never literals.
 
+The official `webhook` notifier POSTs to a URL, and its `format` is `json` (the
+report exactly as `--format json` prints it, for n8n, healthchecks.io or your
+own endpoint), `slack` or `discord`. The URL is a secret because it carries the
+token, so it is only ever a reference; it is never logged or echoed in an
+error, redirects are not followed, and anything but `https://` is refused
+unless the host is loopback or `allow_http = true`.
+
 Writing a notifier for a channel nobody has covered yet is one RPC — see
-[`docs/plugins/writing-a-plugin.md`](docs/plugins/writing-a-plugin.md).
+[`docs/plugins/writing-a-plugin.md`](docs/plugins/writing-a-plugin.md), and
+[`docs/plugins/examples/folder-plugin/`](docs/plugins/examples/folder-plugin/)
+for one that tells Telegram.
 
 ## The commands
 
@@ -745,7 +755,7 @@ cargo build --release -p sb-cli           # just the CLI
 
 Rust 1.92 (pinned in `rust-toolchain.toml`). The binaries land in
 `target/release/`: `shieldbk`, `sb-plugin-postgres`, `sb-plugin-r2`,
-`sb-plugin-mock`. Install the
+`sb-plugin-webhook`, `sb-plugin-mock`. Install the
 plugins by copying them into `plugins.dir` under their own names —
 `sb-plugin-<name>` is the only lookup rule — and running `shieldbk plugin lock`.
 

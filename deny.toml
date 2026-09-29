@@ -70,6 +70,10 @@ allow = [
     "MIT-0",          # aws-lc-sys, dentro de su expresión compuesta
     "Unicode-3.0",    # la familia icu_* y unicode-ident, vía idna
     "Zlib",           # foldhash
+    # webpki-roots, the Mozilla root-certificate list `ureq` ships so that
+    # `sb-plugin-webhook` can verify a Slack or Discord HTTPS endpoint. Permissive,
+    # no copyleft, and it covers a data file rather than code.
+    "CDLA-Permissive-2.0",
 ]
 
 # ---------------------------------------------------------------------------

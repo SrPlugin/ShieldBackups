@@ -1,0 +1,30 @@
+[package]
+name = "sb-plugin-webhook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "sb-plugin-webhook"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sb-plugin-sdk = { version = "0.1.0", path = "../../crates/sb-plugin-sdk" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+# The HTTP client is blocking (run under `spawn_blocking`) because a
+# notification is one small POST: an async stack such as hyper would only add
+# dependencies. Default features are kept off on purpose: `gzip` is useless for
+# a response nobody reads. `rustls` brings the TLS provider and the root store.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# ureq reports through the `log` facade, and the SDK's subscriber bridges it
+# into `tracing`; at trace level ureq prints the request path, which is where a
+# webhook token lives. `log::set_max_level` is how the plugin shuts that off.
+log = "0.4"
