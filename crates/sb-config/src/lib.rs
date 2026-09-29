@@ -10,8 +10,8 @@ pub mod secrets;
 pub mod validate;
 
 pub use model::{
-    Config, ConfigError, ConfigTable, ConfigValue, Defaults, GfsRetention, PluginsConfig,
-    Retention, SecretRef, Target,
+    Config, ConfigError, ConfigTable, ConfigValue, Defaults, GfsRetention, Notify, NotifyOn,
+    PluginsConfig, Retention, SecretRef, Target,
 };
 pub use secrets::{SecretError, resolve};
 pub use validate::{ValidationError, validate_and_convert};

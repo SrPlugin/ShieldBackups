@@ -260,6 +260,51 @@ impl Target {
     }
 }
 
+/// When a [`Notify`] is told about a command.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyOn {
+    /// Only when the command failed. The default: an alert that fires on every
+    /// success is one people learn to ignore.
+    #[default]
+    Failure,
+    /// Only when it succeeded -- what a dead-man's-switch ping wants.
+    Success,
+    /// Every time.
+    Always,
+}
+
+impl NotifyOn {
+    /// Whether a command that ended `ok` is to be told about.
+    #[must_use]
+    pub fn matches(self, ok: bool) -> bool {
+        match self {
+            Self::Failure => !ok,
+            Self::Success => ok,
+            Self::Always => true,
+        }
+    }
+}
+
+/// Somebody who wants to hear how a command went.
+///
+/// The core does not know what a Slack channel or a mailbox is: `plugin` names a
+/// notifier plugin and `config` is that plugin's opaque table, validated later
+/// against its schema, exactly as a target's `source_config` is.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    /// Name of the notifier plugin (`webhook`, …). Opaque, like a target's
+    /// `source`.
+    pub plugin: String,
+    /// When to tell it.
+    #[serde(default)]
+    pub on: NotifyOn,
+    /// Configuration of the notifier plugin. Opaque here.
+    #[serde(default)]
+    pub config: ConfigTable,
+}
+
 /// The complete configuration of `shieldbk`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -273,6 +318,9 @@ pub struct Config {
     /// The declared targets, in file order.
     #[serde(rename = "target", default)]
     pub targets: Vec<Target>,
+    /// Who is told how each command went, in file order.
+    #[serde(rename = "notify", default)]
+    pub notify: Vec<Notify>,
 }
 
 /// What can go wrong while reading a configuration.
@@ -399,6 +447,10 @@ impl Config {
             )?;
         }
 
+        for notify in &config.notify {
+            validate_plugin_name(&notify.plugin)?;
+        }
+
         tracing::debug!(targets = config.targets.len(), "configuration loaded");
         Ok(config)
     }
@@ -420,6 +472,29 @@ fn validate_level(level: i32, location: &str) -> Result<(), ConfigError> {
         location: location.to_owned(),
         value: level.to_string(),
         reason: format!("zstd only accepts levels from {MIN_LEVEL} to {MAX_LEVEL}"),
+    })
+}
+
+/// Checks that a plugin name can be turned into a binary name without surprises.
+///
+/// `plugin` ends up in a path (`<dir>/sb-plugin-<name>`), so anything but the
+/// characters a binary is realistically named with is refused instead of being
+/// sanitised: a `/` or a `..` here would point outside the plugins directory.
+fn validate_plugin_name(name: &str) -> Result<(), ConfigError> {
+    if !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidValue {
+        field: "plugin".to_owned(),
+        location: "a [[notify]] block".to_owned(),
+        value: name.to_owned(),
+        reason: "a plugin name is letters, digits, `-` and `_`, because it becomes part of the \
+                 binary's file name"
+            .to_owned(),
     })
 }
 
@@ -847,6 +922,69 @@ recipient = "age1x"
     fn a_misspelt_gfs_bucket_is_rejected() {
         let toml = with_retention("", "[target.retention]\nkeep_dayly = 7");
         assert!(Config::parse(&toml).is_err());
+    }
+
+    #[test]
+    fn a_notify_block_is_read_with_its_opaque_config() {
+        let toml = format!(
+            "{EXAMPLE_TARGET}\n[[notify]]\nplugin = \"webhook\"\non = \"always\"\n\
+             [notify.config]\nurl = {{ env = \"HOOK\" }}\nformat = \"slack\"\n"
+        );
+        let c = Config::parse(&toml).unwrap();
+        assert_eq!(c.notify.len(), 1);
+        assert_eq!(c.notify[0].plugin, "webhook");
+        assert_eq!(c.notify[0].on, NotifyOn::Always);
+        assert!(matches!(
+            c.notify[0].config.get("url"),
+            Some(ConfigValue::Secret(SecretRef::Env(v))) if v == "HOOK"
+        ));
+    }
+
+    #[test]
+    fn nobody_is_notified_unless_the_config_says_so() {
+        assert!(Config::parse(EXAMPLE_TARGET).unwrap().notify.is_empty());
+    }
+
+    #[test]
+    fn a_notify_block_defaults_to_telling_only_about_failures() {
+        let toml = format!("{EXAMPLE_TARGET}\n[[notify]]\nplugin = \"webhook\"\n");
+        let c = Config::parse(&toml).unwrap();
+        assert_eq!(c.notify[0].on, NotifyOn::Failure);
+    }
+
+    #[test]
+    fn each_moment_matches_the_outcomes_it_names() {
+        for (on, when_ok, when_failed) in [
+            (NotifyOn::Failure, false, true),
+            (NotifyOn::Success, true, false),
+            (NotifyOn::Always, true, true),
+        ] {
+            assert_eq!(on.matches(true), when_ok, "{on:?} on success");
+            assert_eq!(on.matches(false), when_failed, "{on:?} on failure");
+        }
+    }
+
+    #[test]
+    fn a_notify_block_with_a_bad_moment_or_a_typo_is_rejected() {
+        for extra in ["on = \"sometimes\"", "plugn = \"x\""] {
+            let toml = format!("{EXAMPLE_TARGET}\n[[notify]]\nplugin = \"webhook\"\n{extra}\n");
+            assert!(Config::parse(&toml).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn a_notify_plugin_name_cannot_escape_the_plugins_directory() {
+        for bad in ["", "../evil", "a/b", "with space", "dot.dot", "nul\\u0000"] {
+            let toml = format!("{EXAMPLE_TARGET}\n[[notify]]\nplugin = \"{bad}\"\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidValue { .. } | ConfigError::InvalidToml(_)
+                ),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
