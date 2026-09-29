@@ -1,0 +1,5 @@
+node_modules/
+# Where try-it.sh builds its temporary world.
+run/
+# The output of `bun build --compile`.
+/sb-plugin-folder

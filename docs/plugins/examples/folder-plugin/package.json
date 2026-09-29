@@ -1,0 +1,20 @@
+{
+  "name": "sb-plugin-folder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One ShieldBackups plugin that does the whole cycle: folder source, directory storage and Telegram notifier. Example of writing a plugin outside Rust.",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile sb-plugin-folder.ts --outfile sb-plugin-folder"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}

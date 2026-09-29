@@ -652,6 +652,11 @@ working `Source` plugin written in Bun/TypeScript. It links against no Rust and
 generates no protobuf stubs — `@grpc/proto-loader` reads the core's own
 `plugin.proto` at startup.
 
+**[`examples/folder-plugin/`](examples/folder-plugin/)** is the whole cycle in
+one TypeScript plugin: a `Source` that tars a folder, a `Storage` that keeps
+artifacts in a directory and a `Notifier` that tells a Telegram chat — back up,
+store, notify — with `./try-it.sh` running it against a fake Telegram.
+
 ```sh
 cd docs/plugins/examples/command-plugin
 ./try-it.sh
