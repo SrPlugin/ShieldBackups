@@ -461,6 +461,162 @@ dir = {data:?}
     );
 }
 
+/// A bench with one backup already taken, and a config whose retention is
+/// whatever the caller writes: `defaults` goes under `[defaults]` and `target`
+/// under the target's own table.
+fn backed_up_with_retention(defaults: &str, target: &str) -> (Bench, std::path::PathBuf) {
+    let bench = Bench::new();
+    bench.install_mock();
+    let (id, _key) = identity(&bench);
+    let config = bench.config(&format!(
+        r#"
+[plugins]
+dir = {dir:?}
+lockfile = {lock:?}
+
+[defaults]
+{defaults}
+
+[[target]]
+name = "production"
+source = "mock"
+storage = "mock"
+recipient = "{recipient}"
+
+[target.source_config]
+dir = {data:?}
+seed = 7
+size = 65536
+
+[target.storage_config]
+dir = {data:?}
+
+{target}
+"#,
+        dir = bench.plugins_dir().to_string_lossy(),
+        lock = bench.lockfile().to_string_lossy(),
+        data = bench.data_dir().to_string_lossy(),
+        recipient = id.to_recipient(),
+    ));
+    for args in [["plugin", "lock"], ["backup", "--format=human"]] {
+        let out = bench
+            .cmd()
+            .args(["--config", &config.to_string_lossy()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    (bench, config)
+}
+
+#[test]
+fn storage_prune_dry_run_says_what_would_go_and_deletes_nothing() {
+    let (bench, config) = backed_up_with_retention("retention_days = 0", "");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let before = walk(&bench.data_dir());
+
+    let out = bench
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--format",
+            "json",
+            "storage",
+            "prune",
+            "production",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out.stdout);
+    assert_eq!(json["dry_run"], serde_json::Value::Bool(true));
+    assert_eq!(json["deleted"], 0);
+    assert_eq!(json["expired"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        walk(&bench.data_dir()),
+        before,
+        "a dry run must leave the storage target exactly as it found it"
+    );
+}
+
+#[test]
+fn storage_prune_with_a_gfs_retention_keeps_the_newest_artifact() {
+    let (bench, config) =
+        backed_up_with_retention("", "[target.retention]\nkeep_daily = 1\nkeep_monthly = 1");
+
+    let out = bench
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--format",
+            "json",
+            "storage",
+            "prune",
+            "production",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out.stdout);
+    assert_eq!(json["policy"]["kind"], "gfs");
+    assert_eq!(json["policy"]["keep_daily"], 1);
+    assert_eq!(json["deleted"], 0);
+    assert_eq!(json["kept"], 1);
+    assert!(
+        !walk(&bench.data_dir()).is_empty(),
+        "the only artifact is the newest of its day and month: it stays"
+    );
+}
+
+#[test]
+fn a_config_naming_both_kinds_of_retention_is_a_config_error() {
+    let (bench, config) = backed_up_with_retention("", "");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replacen(
+            "[defaults]\n",
+            "[defaults]\nretention_days = 5\n[defaults.retention]\nkeep_daily = 1\n",
+            1,
+        ),
+    )
+    .unwrap();
+
+    let out = bench
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "storage",
+            "prune",
+            "production",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains("retention_days") && text.contains("[defaults]"),
+        "the message has to name what conflicts and where: {text}"
+    );
+}
+
 #[test]
 fn plugin_docs_shows_the_plugins_schema_and_no_value() {
     let (bench, config, _id, _key) = prepared();

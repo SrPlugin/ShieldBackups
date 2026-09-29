@@ -139,10 +139,13 @@ pub enum StorageAction {
         /// Target whose storage is cleaned up.
         target: String,
     },
-    /// Delete the artifacts older than the target's `retention_days`.
+    /// Delete the artifacts the target's retention no longer keeps.
     Prune {
         /// Target whose old artifacts are deleted.
         target: String,
+        /// Say what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -184,6 +187,24 @@ mod tests {
         assert_eq!(cli.format, Format::Json);
         assert_eq!(cli.verbose, 2);
         assert!(matches!(cli.command, Command::Backup { target: None }));
+    }
+
+    #[test]
+    fn prune_deletes_for_real_unless_asked_for_a_dry_run() {
+        let real = Cli::try_parse_from(["shieldbk", "storage", "prune", "t"]).unwrap();
+        assert!(matches!(
+            real.command,
+            Command::Storage {
+                action: StorageAction::Prune { dry_run: false, .. }
+            }
+        ));
+        let dry = Cli::try_parse_from(["shieldbk", "storage", "prune", "t", "--dry-run"]).unwrap();
+        assert!(matches!(
+            dry.command,
+            Command::Storage {
+                action: StorageAction::Prune { dry_run: true, .. }
+            }
+        ));
     }
 
     #[test]

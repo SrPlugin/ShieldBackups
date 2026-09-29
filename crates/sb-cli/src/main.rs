@@ -21,6 +21,7 @@ mod logging;
 mod output;
 mod paths;
 mod plugins;
+mod retention;
 
 use std::process::ExitCode;
 

@@ -357,6 +357,11 @@ lockfile = "~/.shieldbk/plugins.lock" # the hashes that authorise them
 compression_level = 6                 # zstd, 1..=22
 artifact_template = "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age"
 # retention_days = 5                  # `storage prune` deletes older artifacts; unset means keep forever
+# [defaults.retention]                # ...or a grandfather-father-son schedule (not both)
+# keep_daily = 7                      # newest artifact of each of the last 7 days that have one
+# keep_weekly = 4
+# keep_monthly = 12
+# keep_yearly = 3
 
 [[target]]
 name      = "production"
@@ -365,7 +370,7 @@ storage   = "r2"                      # -> <dir>/sb-plugin-r2
 recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
 # compression_level = 12              # optional per-target override
 # artifact_template = "…"             # optional per-target override
-# retention_days = 5                  # optional per-target override
+# retention_days = 5                  # optional per-target override (or a `[target.retention]` table)
 
 [target.source_config]                # opaque to the core; the plugin's schema rules
 host     = "db.internal"
@@ -495,22 +500,45 @@ for. It is deliberately scoped to the target's prefix: a bucket may hold more
 than this `shieldbk`'s backups, and aborting somebody else's uploads would be
 worse than the problem it came to solve.
 
-### `shieldbk storage prune TARGET`
+### `shieldbk storage prune TARGET [--dry-run]`
 
-Deletes the artifacts (and their manifests) older than the target's
-`retention_days`, using the storage target's own `List`/`Delete` RPCs — the
-core never needs to know it is Postgres or R2 on the other end, only that
-`ArtifactMeta.modified_at` is older than the cutoff. Refuses with a
-configuration error if `retention_days` is not set, on the target or in
-`[defaults]`: pruning deletes backups, so it never runs on a guessed default.
+Deletes the artifacts (and their manifests) that the target's retention no
+longer keeps, using the storage target's own `List`/`Delete` RPCs — the core
+never needs to know it is Postgres or R2 on the other end, only each
+`ArtifactMeta.modified_at`. Refuses with a configuration error if there is no
+retention, on the target or in `[defaults]`: pruning deletes backups, so it never
+runs on a guessed default.
+
+Two kinds of retention, and a config that names both is rejected:
+
+- `retention_days = N` keeps everything younger than `N` days.
+- A grandfather-father-son table keeps the **newest artifact of each of the
+  last N periods that have one**, for days, ISO weeks, months and years, and an
+  artifact kept by any of them is kept:
+
+  ```toml
+  [target.retention]
+  keep_daily   = 7
+  keep_weekly  = 4
+  keep_monthly = 12
+  keep_yearly  = 3
+  ```
+
+  Periods are counted among the days that actually have a backup, so an outage
+  does not eat the history that is left. A policy that keeps nothing is
+  rejected, and an artifact whose age the storage target did not report is never
+  deleted.
+
+`--dry-run` lists what would go (`expired` in the JSON) and deletes nothing.
+Try a new policy with it first.
 
 ```sh
+shieldbk storage prune production --dry-run
 shieldbk storage prune production
 ```
 
 Run it on the same schedule as `backup` (a `cron` right after it, or its own
-hourly entry) so the storage target never grows past what `retention_days`
-allows.
+hourly entry) so the storage target never grows past what the retention allows.
 
 ### Exit codes
 
@@ -650,9 +678,10 @@ losing them.
 - **No incremental backups. No deduplication.** Every run is a complete
   snapshot, compressed and encrypted from scratch. Ten daily backups of a 500 GB
   tree cost ten times the compressed size of that tree, and ten times the time.
-- **Retention is opt-in and age-based, nothing else.** `storage prune` deletes
-  artifacts older than `retention_days`; without that field set, nothing is
-  ever deleted. There is no "keep the last N" policy — only age. `storage gc`
+- **Retention is opt-in.** `storage prune` deletes what `retention_days` or a
+  grandfather-father-son `[retention]` table no longer keeps; without either
+  set, nothing is ever deleted. There is no "keep the last N artifacts" policy
+  — only age and calendar periods. `storage gc`
   is separate: it aborts incomplete *uploads*, not old backups. A storage
   target's own lifecycle rule (e.g. R2's) is a perfectly good alternative to
   running `prune`, and the two are safe to use together.
