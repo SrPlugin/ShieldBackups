@@ -201,6 +201,7 @@ mod tests {
             compression_level: None,
             artifact_template: None,
             retention_days: None,
+            retention: None,
         }
     }
 

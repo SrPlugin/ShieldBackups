@@ -127,6 +127,9 @@ pub struct Defaults {
     /// never opted in keeps every artifact forever instead of silently losing
     /// one to a config a future reader never noticed.
     pub retention_days: Option<u32>,
+    /// Grandfather-father-son alternative to [`Defaults::retention_days`].
+    /// Naming both is a configuration error.
+    pub retention: Option<GfsRetention>,
 }
 
 impl Default for Defaults {
@@ -136,7 +139,54 @@ impl Default for Defaults {
             artifact_template:
                 "{target}/{yyyy}/{mm}/{dd}/{target}-{timestamp}-{source}.dump.zst.age".to_owned(),
             retention_days: None,
+            retention: None,
         }
+    }
+}
+
+/// How many artifacts a grandfather-father-son retention keeps for each kind
+/// of period. `0` -- or leaving the key out -- means that period is not used.
+///
+/// For every period, the **newest artifact of each of the `keep_*` most recent
+/// periods that have one** is kept, and an artifact kept by any of them is kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GfsRetention {
+    /// Newest artifact of each of this many most recent days (UTC).
+    pub keep_daily: u32,
+    /// Newest artifact of each of this many most recent ISO weeks.
+    pub keep_weekly: u32,
+    /// Newest artifact of each of this many most recent months.
+    pub keep_monthly: u32,
+    /// Newest artifact of each of this many most recent years.
+    pub keep_yearly: u32,
+}
+
+impl GfsRetention {
+    /// Whether it keeps nothing at all, which would delete every artifact.
+    #[must_use]
+    pub fn keeps_nothing(&self) -> bool {
+        self.keep_daily == 0
+            && self.keep_weekly == 0
+            && self.keep_monthly == 0
+            && self.keep_yearly == 0
+    }
+}
+
+/// What `storage prune` keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retention {
+    /// Everything younger than this many days.
+    Days(u32),
+    /// A grandfather-father-son schedule.
+    Gfs(GfsRetention),
+}
+
+impl Retention {
+    /// The retention a `retention_days` / `[retention]` pair means. Validation
+    /// guarantees that at most one of them is set.
+    fn from_parts(days: Option<u32>, gfs: Option<GfsRetention>) -> Option<Self> {
+        days.map(Self::Days).or(gfs.map(Self::Gfs))
     }
 }
 
@@ -173,6 +223,10 @@ pub struct Target {
     /// Its own retention, in days; if absent, [`Defaults`]' one wins.
     #[serde(default)]
     pub retention_days: Option<u32>,
+    /// Its own grandfather-father-son retention. Like `retention_days`, it
+    /// replaces whatever [`Defaults`] say, of either kind.
+    #[serde(default)]
+    pub retention: Option<GfsRetention>,
 }
 
 impl Target {
@@ -192,11 +246,17 @@ impl Target {
             .unwrap_or(&defaults.artifact_template)
     }
 
-    /// Retention, in days, that will be applied: the target's if it defines
-    /// one, otherwise the global one. `None` means "keep forever".
+    /// Retention that will be applied: the target's if it defines one,
+    /// otherwise the global one. `None` means "keep forever".
+    ///
+    /// The target's replaces the defaults **whole and of either kind**: a
+    /// target with its own `[retention]` does not also inherit the defaults'
+    /// `retention_days`, and a `[retention]` is never merged field by field,
+    /// because what a target keeps has to be readable in one place.
     #[must_use]
-    pub fn effective_retention_days(&self, defaults: &Defaults) -> Option<u32> {
-        self.retention_days.or(defaults.retention_days)
+    pub fn effective_retention(&self, defaults: &Defaults) -> Option<Retention> {
+        Retention::from_parts(self.retention_days, self.retention)
+            .or_else(|| Retention::from_parts(defaults.retention_days, defaults.retention))
     }
 }
 
@@ -315,6 +375,11 @@ impl Config {
         let config: Self = toml::from_str(text)?;
 
         validate_level(config.defaults.compression_level, "[defaults]")?;
+        validate_retention(
+            config.defaults.retention_days,
+            config.defaults.retention,
+            "[defaults]",
+        )?;
 
         let mut seen = BTreeSet::new();
         for target in &config.targets {
@@ -327,6 +392,11 @@ impl Config {
             if let Some(level) = target.compression_level {
                 validate_level(level, &format!("the target \"{}\"", target.name))?;
             }
+            validate_retention(
+                target.retention_days,
+                target.retention,
+                &format!("the target \"{}\"", target.name),
+            )?;
         }
 
         tracing::debug!(targets = config.targets.len(), "configuration loaded");
@@ -350,6 +420,33 @@ fn validate_level(level: i32, location: &str) -> Result<(), ConfigError> {
         location: location.to_owned(),
         value: level.to_string(),
         reason: format!("zstd only accepts levels from {MIN_LEVEL} to {MAX_LEVEL}"),
+    })
+}
+
+/// Checks that a retention says one thing and that thing keeps something.
+///
+/// Both mistakes end the same way -- backups deleted that nobody meant to
+/// delete -- so neither is resolved by picking a winner or a default.
+fn validate_retention(
+    days: Option<u32>,
+    gfs: Option<GfsRetention>,
+    location: &str,
+) -> Result<(), ConfigError> {
+    let reason = match (days, gfs) {
+        (Some(_), Some(_)) => {
+            "`retention_days` and `[retention]` are two ways of saying what \
+                               to keep: pick one, because guessing which wins deletes backups"
+        }
+        (_, Some(gfs)) if gfs.keeps_nothing() => {
+            "every `keep_*` is zero, so it would delete every artifact, the newest included"
+        }
+        _ => return Ok(()),
+    };
+    Err(ConfigError::InvalidValue {
+        field: "retention".to_owned(),
+        location: location.to_owned(),
+        value: "retention".to_owned(),
+        reason: reason.to_owned(),
     })
 }
 
@@ -631,6 +728,125 @@ recipient = "age1x"
             Config::parse(toml).is_err(),
             "an unknown field must be rejected"
         );
+    }
+
+    fn with_retention(defaults: &str, target: &str) -> String {
+        format!(
+            "{defaults}\n[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\"\n{target}\n"
+        )
+    }
+
+    #[test]
+    fn without_any_retention_nothing_is_ever_deleted() {
+        let c = Config::parse(EXAMPLE_TARGET).unwrap();
+        assert_eq!(c.targets[0].effective_retention(&c.defaults), None);
+    }
+
+    #[test]
+    fn retention_days_is_still_the_simple_case() {
+        let c = Config::parse(&with_retention("[defaults]\nretention_days = 30", "")).unwrap();
+        assert_eq!(
+            c.targets[0].effective_retention(&c.defaults),
+            Some(Retention::Days(30))
+        );
+    }
+
+    #[test]
+    fn a_gfs_retention_is_read_from_its_own_table() {
+        let toml = with_retention(
+            "",
+            "[target.retention]\nkeep_daily = 7\nkeep_weekly = 4\nkeep_monthly = 12\nkeep_yearly = 3",
+        );
+        let c = Config::parse(&toml).unwrap();
+        assert_eq!(
+            c.targets[0].effective_retention(&c.defaults),
+            Some(Retention::Gfs(GfsRetention {
+                keep_daily: 7,
+                keep_weekly: 4,
+                keep_monthly: 12,
+                keep_yearly: 3,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_gfs_bucket_left_out_keeps_nothing_for_that_period() {
+        let toml = with_retention("", "[target.retention]\nkeep_monthly = 6");
+        let c = Config::parse(&toml).unwrap();
+        let Some(Retention::Gfs(gfs)) = c.targets[0].effective_retention(&c.defaults) else {
+            panic!("expected a GFS retention");
+        };
+        assert_eq!((gfs.keep_daily, gfs.keep_monthly), (0, 6));
+    }
+
+    #[test]
+    fn the_targets_own_retention_replaces_the_defaults_whole_and_of_either_kind() {
+        // Merging field by field would let a target inherit `keep_daily` from
+        // the defaults without ever writing it: what a target keeps has to be
+        // readable in one place.
+        let toml = with_retention(
+            "[defaults]\nretention_days = 30\n[defaults.retention]\nkeep_daily = 1",
+            "",
+        );
+        assert!(
+            Config::parse(&toml).is_err(),
+            "the defaults name both kinds: see the next test"
+        );
+
+        let toml = with_retention(
+            "[defaults]\nretention_days = 30",
+            "[target.retention]\nkeep_monthly = 6",
+        );
+        let c = Config::parse(&toml).unwrap();
+        assert!(matches!(
+            c.targets[0].effective_retention(&c.defaults),
+            Some(Retention::Gfs(_))
+        ));
+
+        let toml = with_retention(
+            "[defaults.retention]\nkeep_monthly = 6",
+            "retention_days = 5",
+        );
+        let c = Config::parse(&toml).unwrap();
+        assert_eq!(
+            c.targets[0].effective_retention(&c.defaults),
+            Some(Retention::Days(5))
+        );
+    }
+
+    #[test]
+    fn naming_both_kinds_of_retention_at_once_is_rejected() {
+        // Which one wins is exactly the kind of guess that deletes backups.
+        for toml in [
+            with_retention("", "retention_days = 5\n[target.retention]\nkeep_daily = 1"),
+            with_retention(
+                "[defaults]\nretention_days = 5\n[defaults.retention]\nkeep_daily = 1",
+                "",
+            ),
+        ] {
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidValue { .. }), "{err}");
+            assert!(err.to_string().contains("retention_days"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_retention_that_keeps_nothing_is_rejected() {
+        // It would delete every artifact on the first run, the newest included.
+        for toml in [
+            with_retention("", "[target.retention]\nkeep_daily = 0"),
+            with_retention("", "[target.retention]"),
+            with_retention("[defaults.retention]", ""),
+        ] {
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidValue { .. }), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_misspelt_gfs_bucket_is_rejected() {
+        let toml = with_retention("", "[target.retention]\nkeep_dayly = 7");
+        assert!(Config::parse(&toml).is_err());
     }
 
     #[test]
