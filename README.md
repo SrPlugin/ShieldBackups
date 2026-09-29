@@ -33,6 +33,7 @@ is a complete, working plugin in about 350 lines of JavaScript that proves it.
 - [Why the ciphertext is what gets hashed](#why-the-ciphertext-is-what-gets-hashed)
 - [Getting started in five minutes](#getting-started-in-five-minutes)
 - [Configuration](#configuration)
+- [Notifications](#notifications)
 - [The commands](#the-commands)
 - [Security, plainly](#security-plainly)
 - [Memory and throughput](#memory-and-throughput)
@@ -416,6 +417,38 @@ instant. The rendered key is validated — no absolute paths, no `..`, no `.`, n
 empty segments, no control characters, at most 1024 bytes — and the validation
 runs on the **filled** key, so a target named `..` is caught just like a `..`
 written into the template by hand.
+
+## Notifications
+
+`shieldbk` does not know what Slack, Discord, Telegram or a mailbox is, and it
+never will: **notifying is a plugin role**, like a source or a storage. After
+`backup`, `restore`, `verify`, `doctor`, `storage gc` and `storage prune`, every
+`[[notify]]` block that asked to hear about the outcome gets the same JSON
+document `--format json` prints, and its plugin decides what to do with it.
+
+```toml
+[[notify]]
+plugin = "webhook"          # -> <dir>/sb-plugin-webhook
+on     = "failure"          # "failure" (default), "success" or "always"
+
+[notify.config]             # opaque to the core; the plugin's schema rules
+url    = { env = "SLACK_WEBHOOK_URL" }
+format = "slack"
+```
+
+- **`on = "failure"` is the default**, because an alert that fires on every
+  success is one people learn to ignore. A dead-man's-switch ping is
+  `on = "success"`: the thing that pages you is the ping *not* arriving.
+- **A notification never changes the outcome.** The exit code and stdout are
+  the command's, untouched; a notifier that cannot be reached is a `warning:` on
+  stderr, because a silent alerting failure is exactly what alerting exists to
+  prevent. Each notifier has 30 seconds, and is killed when they run out.
+- **Same rules as any plugin**: the binary must be registered with
+  `shieldbk plugin lock`, it talks over mTLS, and its secrets are references,
+  never literals.
+
+Writing a notifier for a channel nobody has covered yet is one RPC — see
+[`docs/plugins/writing-a-plugin.md`](docs/plugins/writing-a-plugin.md).
 
 ## The commands
 

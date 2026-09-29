@@ -24,6 +24,7 @@ For *how* to write a plugin, start with
 - [Service `Plugin`](#service-plugin)
 - [Service `Source`](#service-source)
 - [Service `Storage`](#service-storage)
+- [Service `Notifier`](#service-notifier)
 - [Shared messages](#shared-messages)
 - [Enumerations](#enumerations)
 - [Call order](#call-order)
@@ -300,6 +301,43 @@ else's uploads would be worse than the problem it came to solve.
 A store with no multipart concept returns `aborted: 0`. The call must still
 succeed — `0` means "nothing to do", not "unsupported".
 
+## Service `Notifier`
+
+A notifier is told how a command went and passes it on: Slack, Discord, a
+mailbox, a ticket, a dead-man's-switch URL. The core does not know which — it
+hands every notifier the same event and the plugin decides what to do with it.
+
+### `Notify(NotifyRequest) → NotifyResponse`
+
+```proto
+message NotifyRequest {
+  string command     = 1;  // backup, restore, verify, doctor, storage gc, storage prune
+  bool   ok          = 2;  // a doctor that found problems is not ok
+  string report_json = 3;  // the document `--format json` prints for that run
+}
+message NotifyResponse {}
+```
+
+`report_json` is exactly what a script piping `--format json` into `jq` would
+read: the command's own body plus `ok` at the root, and `class`, `code` and
+`error` when it failed. Its shape is the command's public contract, so a
+notifier may rely on it as much as a script does. A command that failed before
+it had a report (an unknown target, an unreadable configuration) still gets
+one: `ok`, `class`, `code` and `error` and nothing else.
+
+Which blocks are told is decided by the core, from the `on` of each `[[notify]]`
+block (`failure` by default, `success` or `always`), **before** any process is
+started: a notifier that asked only for failures is never launched on a good
+day.
+
+**Delivery is best-effort, and the contract says so.** A notifier that fails —
+by returning an error, by not starting, by taking longer than 30 seconds — is
+reported on the core's stderr and changes nothing else: not the exit code, not
+stdout. The backup worked or it did not; a Slack outage does not turn a good
+backup into a failed one. What a notifier must do for itself is keep its
+credentials out of what it returns: the message of the gRPC status ends up on
+the operator's terminal, so a webhook URL or a bot token has no place in it.
+
 ## Shared messages
 
 ### `Field`
@@ -424,11 +462,13 @@ enum Capability {
   CAPABILITY_UNSPECIFIED = 0;
   CAPABILITY_SOURCE      = 1;
   CAPABILITY_STORAGE     = 2;
+  CAPABILITY_NOTIFIER    = 3;
 }
 ```
 
 Announced in `InfoResponse.capabilities`, and in lowercase string form
-(`"source"`, `"storage"`) in the `Ready` line. A plugin may declare both.
+(`"source"`, `"storage"`, `"notifier"`) in the `Ready` line. A plugin may
+declare any subset of them.
 
 The core checks the capability it needs **before** creating any data channel:
 finding out that a plugin cannot play its assigned role costs a string
@@ -593,6 +633,18 @@ storage: Schema, Configure
 Storage.AbortIncomplete { prefix }
 Shutdown
 ```
+
+### Notification — after `backup`, `restore`, `verify`, `doctor`, `storage gc` and `storage prune`
+
+```
+for each [[notify]] block whose `on` matches the outcome (at most 4 at a time):
+  the prelude, with role "notify"
+  Notifier.Notify { command, ok, report_json }        (30 s for the whole block)
+  Shutdown
+```
+
+It runs after the command's own work is finished, so it cannot delay or alter
+it, and its failure is a warning on stderr rather than a result.
 
 ## Who closes what
 

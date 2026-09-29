@@ -21,7 +21,7 @@ of people who know Rust. Instead:
 
 ## Table of contents
 
-- [The three services](#the-three-services)
+- [The four services](#the-four-services)
 - [The startup handshake](#the-startup-handshake)
 - [The TLS names in the envelope](#the-tls-names-in-the-envelope)
 - [The data channel](#the-data-channel)
@@ -35,10 +35,11 @@ of people who know Rust. Instead:
 
 ---
 
-## The three services
+## The four services
 
-`crates/sb-proto/proto/shieldbk/v1/plugin.proto` defines three gRPC services.
-A plugin serves them on a single socket.
+`crates/sb-proto/proto/shieldbk/v1/plugin.proto` defines four gRPC services.
+A plugin serves them on a single socket: `Plugin` always, and any subset of
+`Source`, `Storage` and `Notifier`.
 
 ### `Plugin` — mandatory, always
 
@@ -87,9 +88,40 @@ multipart upload leaves orphaned parts that the provider keeps billing for. A
 store with no multipart concept returns `aborted: 0` — the call still has to
 succeed.
 
-**A plugin may implement both axes.** `sb-plugin-mock` does; it announces
-`CAPABILITY_SOURCE` and `CAPABILITY_STORAGE` and serves both services on the
-same socket.
+### `Notifier` — implement it if the plugin *tells somebody* how a command went
+
+```proto
+rpc Notify (NotifyRequest) returns (NotifyResponse);
+```
+
+`NotifyRequest` carries `command`, `ok` and `report_json` — the very document
+`--format json` prints for that run. The core never knows what a Slack channel
+or a Telegram chat is: a `[[notify]]` block in the configuration names the
+plugin, says when to tell it (`on = "failure" | "success" | "always"`) and gives
+it an opaque config table, validated against the plugin's `Schema` like any
+other. Delivery is best-effort by contract: a notifier that fails is a warning
+on stderr and never changes the exit code of the command it was telling about.
+
+```toml
+[[notify]]
+plugin = "webhook"
+on     = "failure"
+
+[notify.config]
+url    = { env = "SLACK_WEBHOOK_URL" }   # a secret: never a literal
+format = "slack"
+```
+
+Write your notifier so its errors never contain a credential — a webhook URL or
+a bot token — because the status message ends up on the operator's terminal.
+
+**A plugin may implement any subset of the roles.** `sb-plugin-mock` implements
+all three: it announces `CAPABILITY_SOURCE`, `CAPABILITY_STORAGE` and
+`CAPABILITY_NOTIFIER` and serves the three services on the same socket. Each role
+is started as its **own process** with its **own config table**
+(`source_config`, `storage_config`, `[notify.config]`), so a plugin that serves
+several declares in one `Schema` every field any of its roles needs, marks them
+all `required: false`, and checks the ones a call needs when the call arrives.
 
 The declared capabilities are checked **before** the core starts any transfer,
 against the `capabilities` list from `Info` and from the startup announcement.
