@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use sb_config::{ConfigTable, Target, validate_and_convert};
+use sb_config::{ConfigTable, Notify, Target, validate_and_convert};
 use sb_core::lockfile::Lockfile;
 use sb_core::plugin::{Capability, PluginClient};
 
@@ -153,22 +153,59 @@ pub async fn start_for(
     target: &Target,
     role: Role,
 ) -> Result<PluginClient, CliError> {
-    let name = role.name_in(target);
+    start_configured(
+        ctx,
+        role.name_in(target),
+        role.capability(),
+        role.section(),
+        role.config_in(target),
+        &format!("target `{}`", target.name),
+    )
+    .await
+}
+
+/// Starts the notifier plugin a `[[notify]]` block names, already configured
+/// and with its capability checked, the same way [`start_for`] does for a
+/// target's roles.
+///
+/// # Errors
+/// The same as [`start_for`].
+pub async fn start_notifier(ctx: &Context, notify: &Notify) -> Result<PluginClient, CliError> {
+    start_configured(
+        ctx,
+        &notify.plugin,
+        Capability::Notifier,
+        "notify",
+        &notify.config,
+        "a `[[notify]]` block",
+    )
+    .await
+}
+
+/// What [`start_for`] and [`start_notifier`] share: verify, start, check the
+/// capability, validate the configuration against the plugin's schema and hand
+/// it over. `owner` only feeds the messages, saying whose plugin it is.
+async fn start_configured(
+    ctx: &Context,
+    name: &str,
+    capability: Capability,
+    section: &str,
+    config: &ConfigTable,
+    owner: &str,
+) -> Result<PluginClient, CliError> {
     let client = start(ctx, name).await?;
 
     // The capability is checked here and not at use time: asking a plugin that
     // only knows how to store for a dump has to fail when it is chosen, not
     // halfway through the backup.
-    if let Err(source) = client.require_capability(role.capability()) {
+    if let Err(source) = client.require_capability(capability) {
         let _ = client.shutdown().await;
         return Err(CliError::config(format!(
-            "the target `{}` uses `{name}` as {}, but {source}",
-            target.name,
-            role.section()
+            "the {owner} uses `{name}` as {section}, but {source}"
         )));
     }
 
-    match configure(&client, target, role).await {
+    match configure(&client, config, section, owner).await {
         Ok(()) => Ok(client),
         Err(error) => {
             // A plugin that could not be configured cannot be left alive: it is
@@ -182,16 +219,18 @@ pub async fn start_for(
 
 /// Asks it for the schema, validates the configuration against it and hands it
 /// over.
-async fn configure(client: &PluginClient, target: &Target, role: Role) -> Result<(), CliError> {
+async fn configure(
+    client: &PluginClient,
+    config: &ConfigTable,
+    section: &str,
+    owner: &str,
+) -> Result<(), CliError> {
     let schema = client.schema().await?;
-    let section = role.section();
-    let values =
-        validate_and_convert(role.config_in(target), &schema, section).map_err(|source| {
-            CliError::config(format!(
-                "the `{section}` configuration of target `{}` is not valid: {source}",
-                target.name
-            ))
-        })?;
+    let values = validate_and_convert(config, &schema, section).map_err(|source| {
+        CliError::config(format!(
+            "the `{section}` configuration of {owner} is not valid: {source}"
+        ))
+    })?;
 
     // What gets logged is **how many** fields go, never which ones nor their
     // values: among them there are passwords.

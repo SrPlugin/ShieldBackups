@@ -11,6 +11,7 @@ mod backup;
 mod concurrency;
 mod doctor;
 mod keygen;
+mod notify;
 mod plugin;
 mod restore;
 mod storage;
@@ -42,31 +43,55 @@ pub async fn run(cli: &Cli) -> Result<Report, CliError> {
     // much they demand of it (see [`context`]).
     let ctx = context(cli)?;
 
+    let result = execute(&ctx, cli).await;
+    if let Some(command) = notified_as(&cli.command) {
+        notify::tell(&ctx, command, &result).await;
+    }
+    result
+}
+
+/// The name a command is told to notifiers under, or `None` for the ones that
+/// are not: `keygen` runs before there is a configuration, and the `plugin`
+/// commands are installation chores, not something whose outcome anybody is
+/// paged about.
+const fn notified_as(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Backup { .. } => Some("backup"),
+        Command::Restore { .. } => Some("restore"),
+        Command::Verify { .. } => Some("verify"),
+        Command::Doctor { .. } => Some("doctor"),
+        Command::Storage {
+            action: StorageAction::Gc { .. },
+        } => Some("storage gc"),
+        Command::Storage {
+            action: StorageAction::Prune { .. },
+        } => Some("storage prune"),
+        Command::Keygen { .. } | Command::Plugin { .. } => None,
+    }
+}
+
+async fn execute(ctx: &Context, cli: &Cli) -> Result<Report, CliError> {
     match &cli.command {
         Command::Keygen { .. } => {
             unreachable!("`keygen` returns above, before any configuration is read")
         }
-        Command::Backup { target } => backup::run(&ctx, target.as_deref()).await,
+        Command::Backup { target } => backup::run(ctx, target.as_deref()).await,
         Command::Restore {
             target,
             artifact,
             identity,
-        } => restore::run(&ctx, target, artifact, identity).await,
-        Command::Verify { target, artifact } => {
-            verify::run(&ctx, target, artifact.as_deref()).await
-        }
-        Command::Doctor { target } => doctor::run(&ctx, target.as_deref()).await,
+        } => restore::run(ctx, target, artifact, identity).await,
+        Command::Verify { target, artifact } => verify::run(ctx, target, artifact.as_deref()).await,
+        Command::Doctor { target } => doctor::run(ctx, target.as_deref()).await,
         Command::Plugin { action } => match action {
-            PluginAction::List => plugin::list(&ctx),
-            PluginAction::Docs { plugin: name } => plugin::docs(&ctx, name).await,
-            PluginAction::Verify => plugin::verify(&ctx),
-            PluginAction::Lock => plugin::lock(&ctx),
+            PluginAction::List => plugin::list(ctx),
+            PluginAction::Docs { plugin: name } => plugin::docs(ctx, name).await,
+            PluginAction::Verify => plugin::verify(ctx),
+            PluginAction::Lock => plugin::lock(ctx),
         },
         Command::Storage { action } => match action {
-            StorageAction::Gc { target } => storage::gc(&ctx, target).await,
-            StorageAction::Prune { target, dry_run } => {
-                storage::prune(&ctx, target, *dry_run).await
-            }
+            StorageAction::Gc { target } => storage::gc(ctx, target).await,
+            StorageAction::Prune { target, dry_run } => storage::prune(ctx, target, *dry_run).await,
         },
     }
 }

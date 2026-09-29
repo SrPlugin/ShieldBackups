@@ -461,10 +461,11 @@ dir = {data:?}
     );
 }
 
-/// A bench with one backup already taken, and a config whose retention is
-/// whatever the caller writes: `defaults` goes under `[defaults]` and `target`
-/// under the target's own table.
-fn backed_up_with_retention(defaults: &str, target: &str) -> (Bench, std::path::PathBuf) {
+/// A bench with the mock installed and registered and a config that adds
+/// whatever the caller writes: `defaults` goes under `[defaults]` and `extra`
+/// at the end of the file, where it can be another target's table or a whole
+/// `[[notify]]` block. No backup has been taken yet.
+fn locked_with(defaults: &str, extra: &str) -> (Bench, std::path::PathBuf) {
     let bench = Bench::new();
     bench.install_mock();
     let (id, _key) = identity(&bench);
@@ -491,27 +492,56 @@ size = 65536
 [target.storage_config]
 dir = {data:?}
 
-{target}
+{extra}
 "#,
         dir = bench.plugins_dir().to_string_lossy(),
         lock = bench.lockfile().to_string_lossy(),
         data = bench.data_dir().to_string_lossy(),
         recipient = id.to_recipient(),
+        extra = extra.replace("@NOTIFY@", &bench.path("notify").to_string_lossy()),
     ));
-    for args in [["plugin", "lock"], ["backup", "--format=human"]] {
-        let out = bench
-            .cmd()
-            .args(["--config", &config.to_string_lossy()])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "plugin", "lock"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "plugin lock failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     (bench, config)
+}
+
+/// [`locked_with`], plus one backup already taken. `target` lands in the
+/// config's tail, so it is where a retention table for the target goes.
+fn backed_up_with_retention(defaults: &str, target: &str) -> (Bench, std::path::PathBuf) {
+    let (bench, config) = locked_with(defaults, target);
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (bench, config)
+}
+
+/// The events the mock notifier recorded, one parsed JSON value per line.
+fn notifications(bench: &Bench) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(bench.path("notify").join("notifications.jsonl"))
+        .map(|text| text.lines().map(|l| json_of(l.as_bytes())).collect())
+        .unwrap_or_default()
+}
+
+/// A `[[notify]]` block for the mock notifier. `@NOTIFY@` stands for the
+/// directory it records under, which only exists once the bench does:
+/// [`locked_with`] fills it in.
+fn notify_mock(on: &str) -> String {
+    format!("[[notify]]\nplugin = \"mock\"\non = \"{on}\"\n[notify.config]\ndir = \"@NOTIFY@\"\n")
 }
 
 #[test]
@@ -615,6 +645,116 @@ fn a_config_naming_both_kinds_of_retention_is_a_config_error() {
         text.contains("retention_days") && text.contains("[defaults]"),
         "the message has to name what conflicts and where: {text}"
     );
+}
+
+#[test]
+fn a_backup_tells_the_notifier_that_asked_and_the_report_is_the_json_contract() {
+    let (bench, config) = locked_with("", &notify_mock("always"));
+
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = notifications(&bench);
+    assert_eq!(events.len(), 1, "one command, one notification");
+    assert_eq!(events[0]["command"], "backup");
+    assert_eq!(events[0]["ok"], serde_json::Value::Bool(true));
+    // What the notifier reads is what `--format json` prints.
+    assert_eq!(events[0]["report"]["ok"], serde_json::Value::Bool(true));
+    assert!(
+        events[0]["report"]["targets"][0]["artifact_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("production/")),
+        "{}",
+        events[0]
+    );
+}
+
+#[test]
+fn a_notifier_that_only_wants_failures_stays_quiet_when_all_went_well() {
+    // `on` defaults to `failure`: an alert that fires on every success is one
+    // people learn to ignore.
+    let (bench, config) = locked_with("", &notify_mock("failure"));
+
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(notifications(&bench).is_empty());
+}
+
+#[test]
+fn a_command_that_fails_before_it_has_a_report_is_still_notified() {
+    let (bench, config) = locked_with("", &notify_mock("failure"));
+
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "verify", "no-such"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an unknown target is a config error"
+    );
+
+    let events = notifications(&bench);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["command"], "verify");
+    assert_eq!(events[0]["ok"], serde_json::Value::Bool(false));
+    assert_eq!(events[0]["report"]["class"], "config");
+}
+
+#[test]
+fn a_notifier_that_cannot_be_reached_never_changes_the_commands_exit_code() {
+    // The backup worked; the alerting did not. The exit code tells about the
+    // backup, and the alerting failure is said on stderr instead of being lost.
+    let (bench, config) = locked_with("", "[[notify]]\nplugin = \"ghost\"\non = \"always\"\n");
+
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains("could not notify") && text.contains("ghost"),
+        "the failure has to be said, and name the plugin: {text}"
+    );
+}
+
+#[test]
+fn a_notification_never_pollutes_the_json_on_stdout() {
+    let (bench, config) = locked_with("", &notify_mock("always"));
+
+    let out = bench
+        .cmd()
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--format",
+            "json",
+            "backup",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // `json_of` fails unless stdout is exactly one JSON document.
+    assert_eq!(json_of(&out.stdout)["ok"], serde_json::Value::Bool(true));
 }
 
 #[test]

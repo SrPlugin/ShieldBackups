@@ -98,9 +98,7 @@ impl Output {
                     let _ = writeln!(err, "error: {failure}");
                 }
             }
-            Format::Json => {
-                write_json(&wrap(report.json.clone(), report.failure.as_ref()));
-            }
+            Format::Json => write_json(&document(report)),
         }
     }
 
@@ -112,6 +110,16 @@ impl Output {
     pub fn failure(&self, error: &CliError) {
         self.emit(&Report::new("", serde_json::json!({})).with_failure(error.duplicate()));
     }
+}
+
+/// The JSON document `--format json` prints for `report`: the command's own
+/// body with the verdict added.
+///
+/// It is also what a notifier is handed, so that what a plugin reads and what a
+/// script pipes into `jq` are the same thing and cannot drift apart.
+#[must_use]
+pub fn document(report: &Report) -> serde_json::Value {
+    wrap(report.json.clone(), report.failure.as_ref())
 }
 
 /// Adds the verdict -- and the failure, if there is one -- to the command's
