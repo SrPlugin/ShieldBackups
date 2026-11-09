@@ -188,12 +188,12 @@ async fn get(live: &LivePlugin, sockets: &Path, name: &str, key: &str) -> Result
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it_starts_announces_itself_and_declares_its_three_capabilities() {
+async fn it_starts_announces_itself_and_declares_its_four_capabilities() {
     let live = LivePlugin::start().await;
     assert_eq!(live.ready.protocol_version, 1);
     assert_eq!(
         live.ready.capabilities,
-        vec!["source", "storage", "notifier"]
+        vec!["source", "storage", "notifier", "drill"]
     );
     assert!(live.ready.pid > 0);
 }
@@ -210,8 +210,8 @@ async fn info_identifies_itself_as_mock_over_the_mtls_channel() {
     assert_eq!(info.name, "mock");
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.protocol_version, 1);
-    // 1 = source, 2 = storage, 3 = notifier.
-    assert_eq!(info.capabilities, vec![1, 2, 3]);
+    // 1 = source, 2 = storage, 3 = notifier, 4 = drill.
+    assert_eq!(info.capabilities, vec![1, 2, 3, 4]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

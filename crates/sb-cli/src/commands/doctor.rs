@@ -202,6 +202,7 @@ mod tests {
             artifact_template: None,
             retention_days: None,
             retention: None,
+            drill: None,
         }
     }
 

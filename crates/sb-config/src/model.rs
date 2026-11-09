@@ -190,6 +190,42 @@ impl Retention {
     }
 }
 
+/// How a target proves its backups restore: the question to ask after
+/// restoring into a disposable place, and, if the default will not do, where
+/// that place is.
+///
+/// The core does not know what a database is, so it cannot run the question. It
+/// hands `check` to the source plugin, which does -- see the `Drill` service in
+/// the protocol -- and `source_config` is how an operator points that plugin at
+/// somewhere other than the production database (a staging server with a role
+/// that may create databases, say).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drill {
+    /// What to ask once the artifact is restored. Opaque here: for a SQL source
+    /// it is a query that has to return `true`.
+    pub check: String,
+    /// Fields laid **over** the target's `source_config` for the drill, and
+    /// only for it. Left out, the drill connects exactly as the backup does.
+    #[serde(default)]
+    pub source_config: ConfigTable,
+}
+
+impl Drill {
+    /// The source configuration a drill runs with: the target's own, with this
+    /// block's fields on top of it.
+    ///
+    /// It is an overlay and not a replacement because a drill almost always
+    /// differs from the backup in two or three fields (a host, a user) and
+    /// repeating the other six invites them to drift apart.
+    #[must_use]
+    pub fn source_config_over(&self, target_source_config: &ConfigTable) -> ConfigTable {
+        let mut merged = target_source_config.clone();
+        merged.extend(self.source_config.clone());
+        merged
+    }
+}
+
 /// Something to back up, with the source that produces it and the storage that
 /// keeps it.
 ///
@@ -227,6 +263,10 @@ pub struct Target {
     /// replaces whatever [`Defaults`] say, of either kind.
     #[serde(default)]
     pub retention: Option<GfsRetention>,
+    /// How `shieldbk drill` proves this target's backups restore. Without it
+    /// the target cannot be drilled.
+    #[serde(default)]
+    pub drill: Option<Drill>,
 }
 
 impl Target {
@@ -445,6 +485,9 @@ impl Config {
                 target.retention,
                 &format!("the target \"{}\"", target.name),
             )?;
+            if let Some(drill) = &target.drill {
+                validate_drill(drill, &target.name)?;
+            }
         }
 
         for notify in &config.notify {
@@ -494,6 +537,25 @@ fn validate_plugin_name(name: &str) -> Result<(), ConfigError> {
         value: name.to_owned(),
         reason: "a plugin name is letters, digits, `-` and `_`, because it becomes part of the \
                  binary's file name"
+            .to_owned(),
+    })
+}
+
+/// Checks that a drill asks something.
+///
+/// An empty `check` would restore the artifact into the scratch place and then
+/// verify nothing, which is the failure a drill exists to catch: a green result
+/// that proves no more than "the restore did not crash".
+fn validate_drill(drill: &Drill, target: &str) -> Result<(), ConfigError> {
+    if !drill.check.trim().is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError::InvalidValue {
+        field: "check".to_owned(),
+        location: format!("the drill of the target \"{target}\""),
+        value: drill.check.clone(),
+        reason: "it is empty, so the drill would restore the artifact and verify nothing: write \
+                 the question whose answer shows the data is there"
             .to_owned(),
     })
 }
@@ -1000,5 +1062,79 @@ recipient = "age1x"
                 "\"{bad}\" should be rejected"
             );
         }
+    }
+
+    fn with_drill(drill: &str) -> String {
+        format!("{EXAMPLE_TARGET}\n[target.drill]\n{drill}\n")
+    }
+
+    #[test]
+    fn a_target_has_no_drill_unless_the_config_says_so() {
+        assert!(
+            Config::parse(EXAMPLE_TARGET).unwrap().targets[0]
+                .drill
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_drill_is_read_with_its_check_and_its_overlay() {
+        let toml = with_drill(
+            "check = \"SELECT count(*) > 0 FROM users\"\n\
+             [target.drill.source_config]\nhost = \"staging\"\npassword = { env = \"P\" }",
+        );
+        let c = Config::parse(&toml).unwrap();
+        let drill = c.targets[0].drill.as_ref().unwrap();
+        assert_eq!(drill.check, "SELECT count(*) > 0 FROM users");
+        assert!(matches!(
+            drill.source_config.get("host"),
+            Some(ConfigValue::String(s)) if s == "staging"
+        ));
+        assert!(matches!(
+            drill.source_config.get("password"),
+            Some(ConfigValue::Secret(SecretRef::Env(_)))
+        ));
+    }
+
+    #[test]
+    fn a_drill_without_a_check_or_with_a_blank_one_is_rejected() {
+        // It would restore and then verify nothing: a green light that proves
+        // less than it seems to.
+        assert!(Config::parse(&with_drill("source_config = {}")).is_err());
+        for blank in ["", "   ", "\\t"] {
+            let err = Config::parse(&with_drill(&format!("check = \"{blank}\""))).unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidValue { .. }), "{err}");
+            assert!(
+                err.to_string().contains("\"t\""),
+                "it must name the target: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelt_drill_field_is_rejected() {
+        assert!(Config::parse(&with_drill("check = \"x\"\nchek = \"y\"")).is_err());
+    }
+
+    #[test]
+    fn the_drill_overlay_wins_field_by_field_and_leaves_the_rest_alone() {
+        let toml = format!(
+            "{}\n[target.source_config]\nhost = \"prod\"\ndatabase = \"app\"\n\
+             [target.drill]\ncheck = \"x\"\n[target.drill.source_config]\nhost = \"staging\"\n",
+            "[[target]]\nname = \"t\"\nsource = \"e\"\nstorage = \"s\"\nrecipient = \"age1x\""
+        );
+        let c = Config::parse(&toml).unwrap();
+        let target = &c.targets[0];
+        let merged = target
+            .drill
+            .as_ref()
+            .unwrap()
+            .source_config_over(&target.source_config);
+        assert!(matches!(merged.get("host"), Some(ConfigValue::String(s)) if s == "staging"));
+        assert!(matches!(merged.get("database"), Some(ConfigValue::String(s)) if s == "app"));
+        // And the target's own table is untouched: the backup still goes to prod.
+        assert!(
+            matches!(target.source_config.get("host"), Some(ConfigValue::String(s)) if s == "prod")
+        );
     }
 }

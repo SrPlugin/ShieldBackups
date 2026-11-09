@@ -35,6 +35,7 @@ impl Plugin for MockPlugin {
                 Capability::Source as i32,
                 Capability::Storage as i32,
                 Capability::Notifier as i32,
+                Capability::Drill as i32,
             ],
         }))
     }

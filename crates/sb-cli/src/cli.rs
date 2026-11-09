@@ -68,6 +68,28 @@ pub enum Command {
         identity: PathBuf,
     },
 
+    /// Prove that a target's latest backup restores, in a place that is thrown
+    /// away afterwards.
+    ///
+    /// Restores the artifact into a disposable place the source plugin
+    /// provisions -- a scratch database, say -- asks the question in the
+    /// target's `[target.drill]` block, reports whether the answer was right
+    /// and tears the place down. It never writes where the backup comes from.
+    ///
+    /// It needs the private key for the same reason `restore` does, and takes
+    /// it the same way. The exit code is 4 if the restore or the check fails,
+    /// which is what a cron job pages on.
+    Drill {
+        /// Target whose latest backup is restored.
+        target: String,
+        /// File holding the age private key (`shieldbk keygen`).
+        #[arg(long, value_name = "PATH")]
+        identity: PathBuf,
+        /// A specific artifact. Without it, the newest one of the target.
+        #[arg(long, value_name = "KEY")]
+        artifact: Option<String>,
+    },
+
     /// Check that the artifacts are still intact. It does not need the key.
     Verify {
         /// Target whose artifacts are checked.
@@ -163,13 +185,13 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_commands_are_there() {
+    fn all_eight_commands_are_there() {
         let names: Vec<String> = Cli::command()
             .get_subcommands()
             .map(|c| c.get_name().to_owned())
             .collect();
         for expected in [
-            "backup", "restore", "verify", "doctor", "plugin", "storage", "keygen",
+            "backup", "restore", "drill", "verify", "doctor", "plugin", "storage", "keygen",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -224,6 +246,33 @@ mod tests {
         let cli =
             Cli::try_parse_from(["shieldbk", "restore", "t", "key", "--identity", "/k"]).unwrap();
         assert!(matches!(cli.command, Command::Restore { .. }));
+    }
+
+    #[test]
+    fn drill_requires_the_identity_and_takes_an_optional_artifact() {
+        // Same reasoning as `restore`: no private key, no restore to prove.
+        assert!(Cli::try_parse_from(["shieldbk", "drill", "t"]).is_err());
+
+        let latest = Cli::try_parse_from(["shieldbk", "drill", "t", "--identity", "/k"]).unwrap();
+        assert!(matches!(
+            latest.command,
+            Command::Drill { artifact: None, .. }
+        ));
+
+        let named = Cli::try_parse_from([
+            "shieldbk",
+            "drill",
+            "t",
+            "--identity",
+            "/k",
+            "--artifact",
+            "t/2026/a.age",
+        ])
+        .unwrap();
+        assert!(matches!(
+            named.command,
+            Command::Drill { artifact: Some(key), .. } if key == "t/2026/a.age"
+        ));
     }
 
     #[test]

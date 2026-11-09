@@ -430,8 +430,12 @@ process boundaries.
 
 - **age** with an X25519 recipient. Each artifact is encrypted to the public key
   in the target's `recipient` field.
-- The **private key never enters the core** except for `restore`, where it is
-  read from the file named by `--identity`.
+- The **private key never enters the core** except for `restore` and `drill`,
+  where it is read from the file named by `--identity`. A scheduled `drill` is
+  therefore the one recurring job that needs the key on the machine that runs
+  it: put it where that is acceptable, and note that a drill's restore only ever
+  lands in a scratch place the source plugin made, never in the database the
+  target backs up.
 - **No plugin ever sees the private key**, on any code path.
 - `shieldbk keygen --output PATH` writes the key file with mode `0600` and
   **refuses to overwrite an existing file** — losing a key silently is

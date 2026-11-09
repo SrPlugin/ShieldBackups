@@ -1,4 +1,4 @@
-//! The operations the user asks for: backup, restore, verify and doctor.
+//! The operations the user asks for: backup, restore, verify, drill and doctor.
 //!
 //! Each one composes the same three pieces —two live plugins, two data channels
 //! and the `sb-crypto` pipeline— and none of those pieces knows about the
@@ -19,6 +19,7 @@
 pub mod backup;
 pub mod channel;
 pub mod doctor;
+pub mod drill;
 pub mod restore;
 pub mod verify;
 

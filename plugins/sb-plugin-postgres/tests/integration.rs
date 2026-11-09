@@ -43,15 +43,19 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use sb_plugin_postgres::config::{self, Config, State};
+use sb_plugin_postgres::drill::{PostgresDrill, Scratch};
 use sb_plugin_postgres::plugin::PostgresPlugin;
 use sb_plugin_postgres::source::PostgresSource;
+use sb_plugin_sdk::sb_proto::drill_client::DrillClient;
+use sb_plugin_sdk::sb_proto::drill_server::Drill as _;
 use sb_plugin_sdk::sb_proto::plugin_client::PluginClient;
 use sb_plugin_sdk::sb_proto::plugin_server::Plugin as _;
 use sb_plugin_sdk::sb_proto::source_client::SourceClient;
 use sb_plugin_sdk::sb_proto::source_server::Source as _;
 use sb_plugin_sdk::sb_proto::value::Kind;
 use sb_plugin_sdk::sb_proto::{
-    ConfigureRequest, DumpRequest, PreflightRequest, RestoreRequest, Value,
+    CheckRequest, ConfigureRequest, DumpRequest, PreflightRequest, ProvisionRequest,
+    RestoreRequest, TeardownRequest, Value,
 };
 use sb_plugin_sdk::tonic::transport::Channel;
 use sb_plugin_sdk::tonic::{Code, Request, Status};
@@ -187,6 +191,11 @@ fn values(server: &Server, dir: &TempDir) -> HashMap<String, Value> {
             config::FIELD_PG_RESTORE_PATH.to_string(),
             text(&docker_wrapper(dir, "pg_restore")),
         ),
+        // Only a restore drill runs `psql`, and it runs the same containerised way.
+        (
+            config::FIELD_PSQL_PATH.to_string(),
+            text(&docker_wrapper(dir, "psql")),
+        ),
     ])
 }
 
@@ -234,7 +243,7 @@ fn psql(server: &Server, sql: &str) -> String {
 fn service(config: Config) -> PostgresSource {
     let state = State::new("postgres");
     state.store(config);
-    PostgresSource::new(state)
+    PostgresSource::new(state, Scratch::default())
 }
 
 fn plugin_service(config: Config) -> PostgresPlugin {
@@ -443,7 +452,7 @@ async fn the_full_cycle_through_the_real_plugin_binary() {
 
     let live = LivePlugin::start().await;
     assert_eq!(live.ready.protocol_version, 1);
-    assert_eq!(live.ready.capabilities, vec!["source"]);
+    assert_eq!(live.ready.capabilities, vec!["source", "drill"]);
     assert!(live.ready.pid > 0);
 
     PluginClient::new(live.channel.clone())
@@ -523,4 +532,166 @@ async fn dump_before_configure_yields_failed_precondition_over_the_wire() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), Code::FailedPrecondition);
+}
+
+// ---------------------------------------------------------------------------
+// The restore drill, against a real server
+// ---------------------------------------------------------------------------
+
+/// How many scratch databases `server` holds right now.
+fn scratch_databases(server: &Server) -> String {
+    psql(
+        server,
+        "SELECT count(*) FROM pg_database WHERE datname LIKE 'drill\\_%';",
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drill_restores_into_a_scratch_database_and_leaves_the_real_one_alone() {
+    skip_without_docker!();
+    let source_server = start_postgres(Some(
+        "CREATE TABLE widgets (id serial primary key, name text not null); \
+         INSERT INTO widgets (name) VALUES ('one'), ('two'), ('three');",
+    ))
+    .await;
+    // The server the drill runs on. Its own `postgres` database stands for what
+    // the target is configured to back up: it has no `widgets`, and must still
+    // have none when the drill is done.
+    let drill_server = start_postgres(None).await;
+    let sockets = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let artifact = dump(
+        &service(Config::from_map(&values(&source_server, &dir)).unwrap()),
+        sockets.path(),
+    )
+    .await
+    .unwrap();
+
+    let state = State::new("postgres");
+    state.store(Config::from_map(&values(&drill_server, &dir)).unwrap());
+    let scratch = Scratch::default();
+    let source = PostgresSource::new(state.clone(), scratch.clone());
+    let drill = PostgresDrill::new(state, scratch);
+
+    // Provision: one scratch database appears.
+    assert_eq!(scratch_databases(&drill_server), "0");
+    let provisioned = drill
+        .provision(Request::new(ProvisionRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        provisioned.description.contains("drill_"),
+        "{provisioned:?}"
+    );
+    assert_eq!(scratch_databases(&drill_server), "1");
+
+    // Restore: through the ordinary source, which now lands in the scratch one.
+    restore(&source, sockets.path(), artifact).await.unwrap();
+    assert_eq!(
+        psql(
+            &drill_server,
+            "SELECT to_regclass('public.widgets') IS NULL;"
+        ),
+        "t",
+        "the drill restored into the database the target is configured to back up"
+    );
+
+    // Check: the three rows are there, and the verdicts say so in words.
+    let ask = |query: &str| {
+        let request = Request::new(CheckRequest {
+            query: query.into(),
+        });
+        let drill = &drill;
+        async move { drill.check(request).await.unwrap().into_inner() }
+    };
+    let holds = ask("SELECT count(*) = 3 FROM widgets").await;
+    assert!(holds.ok, "{}", holds.detail);
+    let wrong = ask("SELECT count(*) = 4 FROM widgets").await;
+    assert!(!wrong.ok);
+    assert!(wrong.detail.contains("`f`"), "{}", wrong.detail);
+    let missing = ask("SELECT count(*) > 0 FROM no_such_table").await;
+    assert!(!missing.ok);
+    assert!(
+        missing.detail.contains("does not exist"),
+        "{}",
+        missing.detail
+    );
+
+    // Teardown: the scratch database is gone, and a second one is a no-op.
+    drill
+        .teardown(Request::new(TeardownRequest {}))
+        .await
+        .unwrap();
+    assert_eq!(scratch_databases(&drill_server), "0");
+    drill
+        .teardown(Request::new(TeardownRequest {}))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drill_without_createdb_fails_to_provision_and_says_what_to_grant() {
+    skip_without_docker!();
+    let server = start_postgres(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    psql(
+        &server,
+        "CREATE ROLE limited LOGIN PASSWORD 'limited' NOCREATEDB;",
+    );
+    let mut map = values(&server, &dir);
+    map.insert(config::FIELD_USER.to_string(), text("limited"));
+    map.insert(config::FIELD_PASSWORD.to_string(), text("limited"));
+
+    let state = State::new("postgres");
+    state.store(Config::from_map(&map).unwrap());
+    let drill = PostgresDrill::new(state, Scratch::default());
+
+    let error = drill
+        .provision(Request::new(ProvisionRequest {}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message().contains("CREATEDB"),
+        "the operator has to be told what to grant: {}",
+        error.message()
+    );
+    assert_eq!(scratch_databases(&server), "0");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_real_binary_serves_the_drill_service() {
+    // Registered in the binary and announced, not only implemented: the unit
+    // tests above call the service directly and could not tell.
+    skip_without_docker!();
+    let server = start_postgres(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let live = LivePlugin::start().await;
+    assert!(
+        live.ready.capabilities.contains(&"drill".to_string()),
+        "{:?}",
+        live.ready.capabilities
+    );
+
+    PluginClient::new(live.channel.clone())
+        .configure(ConfigureRequest {
+            config: values(&server, &dir),
+        })
+        .await
+        .unwrap();
+
+    let mut drill = DrillClient::new(live.channel.clone());
+    drill.provision(ProvisionRequest {}).await.unwrap();
+    assert_eq!(scratch_databases(&server), "1");
+    let answer = drill
+        .check(CheckRequest {
+            query: "SELECT true".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(answer.ok, "{}", answer.detail);
+    drill.teardown(TeardownRequest {}).await.unwrap();
+    assert_eq!(scratch_databases(&server), "0");
 }

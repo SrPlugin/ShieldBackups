@@ -10,6 +10,7 @@
 mod backup;
 mod concurrency;
 mod doctor;
+mod drill;
 mod keygen;
 mod notify;
 mod plugin;
@@ -60,6 +61,7 @@ const fn notified_as(command: &Command) -> Option<&'static str> {
         Command::Restore { .. } => Some("restore"),
         Command::Verify { .. } => Some("verify"),
         Command::Doctor { .. } => Some("doctor"),
+        Command::Drill { .. } => Some("drill"),
         Command::Storage {
             action: StorageAction::Gc { .. },
         } => Some("storage gc"),
@@ -81,6 +83,11 @@ async fn execute(ctx: &Context, cli: &Cli) -> Result<Report, CliError> {
             artifact,
             identity,
         } => restore::run(ctx, target, artifact, identity).await,
+        Command::Drill {
+            target,
+            identity,
+            artifact,
+        } => drill::run(ctx, target, artifact.as_deref(), identity).await,
         Command::Verify { target, artifact } => verify::run(ctx, target, artifact.as_deref()).await,
         Command::Doctor { target } => doctor::run(ctx, target.as_deref()).await,
         Command::Plugin { action } => match action {

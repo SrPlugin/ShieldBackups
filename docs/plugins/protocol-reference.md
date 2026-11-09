@@ -25,6 +25,7 @@ For *how* to write a plugin, start with
 - [Service `Source`](#service-source)
 - [Service `Storage`](#service-storage)
 - [Service `Notifier`](#service-notifier)
+- [Service `Drill`](#service-drill)
 - [Shared messages](#shared-messages)
 - [Enumerations](#enumerations)
 - [Call order](#call-order)
@@ -311,7 +312,7 @@ hands every notifier the same event and the plugin decides what to do with it.
 
 ```proto
 message NotifyRequest {
-  string command     = 1;  // backup, restore, verify, doctor, storage gc, storage prune
+  string command     = 1;  // backup, restore, verify, drill, doctor, storage gc, storage prune
   bool   ok          = 2;  // a doctor that found problems is not ok
   string report_json = 3;  // the document `--format json` prints for that run
 }
@@ -337,6 +338,78 @@ stdout. The backup worked or it did not; a Slack outage does not turn a good
 backup into a failed one. What a notifier must do for itself is keep its
 credentials out of what it returns: the message of the gRPC status ends up on
 the operator's terminal, so a webhook URL or a bot token has no place in it.
+
+## Service `Drill`
+
+A drill proves that a backup restores. It is a source that can make a **disposable
+place** to restore into, answer whether what landed there is right, and throw the
+place away. A database is the obvious case — a scratch database — but so is a
+temporary directory or a throwaway volume. The core never knows which: it runs the
+sequence and reports the verdict.
+
+A plugin that implements `Drill` **also implements `Source`**, and the two are the
+same process. That is not an accident of packaging, it is the mechanism: between
+`Provision` and `Teardown`, `Source.Restore` writes into the disposable place and
+**never** into what the plugin was configured to back up. The plugin keeps that
+state itself — see `PostgresDrill` and `Scratch` in `sb-plugin-postgres` — and the
+core has nothing to configure or get wrong.
+
+It is additive, like `Notifier`: a source that does not implement it keeps working
+for everything but `shieldbk drill`, and the core refuses a drill up front, naming
+the plugin, if the capability is missing.
+
+### `Provision(ProvisionRequest) → ProvisionResponse`
+
+```proto
+message ProvisionRequest {}
+message ProvisionResponse {
+  string description = 1;  // where restores now land: a database name, a directory
+}
+```
+
+Creates the disposable place. From here on, `Source.Restore` writes there.
+`description` goes into the report, so it must name the place without leaking a
+credential. A second `Provision` without a `Teardown` in between is
+`FAILED_PRECONDITION`: it would orphan the first place.
+
+Record the place **only once it exists.** A `Provision` that fails leaves nothing
+for `Teardown` to remove.
+
+### `Check(CheckRequest) → CheckResponse`
+
+```proto
+message CheckRequest  { string query = 1; }
+message CheckResponse {
+  bool   ok     = 1;
+  string detail = 2;  // why, in a line; shown whether it passed or not
+}
+```
+
+`query` is exactly what the operator wrote in `[target.drill] check`. The core does
+not interpret it: what a query means is the plugin's. (`sb-plugin-postgres` passes
+only if it prints exactly `t`.)
+
+**A check that does not hold is an answer, not an error.** Return `ok = false` and
+say why in `detail`. That includes a query that fails *because the restore lost
+something* — a missing table is the very thing a drill looks for. Return an RPC
+error only when the question could not be asked at all (no `psql`, no scratch place
+provisioned: `FAILED_PRECONDITION`).
+
+### `Teardown(TeardownRequest) → TeardownResponse`
+
+```proto
+message TeardownRequest {}
+message TeardownResponse {}
+```
+
+Throws the disposable place away. **Idempotent**: with nothing provisioned it
+succeeds and does nothing, because the core calls it whatever happened before —
+after a failed `Provision`, a failed restore, a failed check. If dropping fails,
+return the error and keep the place recorded, so a retry knows what to drop.
+
+The core reports a failing `Teardown` and does **not** let it change the verdict:
+the backup restored or it did not, and a leftover scratch database is a leak to
+tell about, not a reason to call a good backup bad.
 
 ## Shared messages
 
@@ -463,11 +536,12 @@ enum Capability {
   CAPABILITY_SOURCE      = 1;
   CAPABILITY_STORAGE     = 2;
   CAPABILITY_NOTIFIER    = 3;
+  CAPABILITY_DRILL       = 4;
 }
 ```
 
 Announced in `InfoResponse.capabilities`, and in lowercase string form
-(`"source"`, `"storage"`, `"notifier"`) in the `Ready` line. A plugin may
+(`"source"`, `"storage"`, `"notifier"`, `"drill"`) in the `Ready` line. A plugin may
 declare any subset of them.
 
 The core checks the capability it needs **before** creating any data channel:
@@ -607,6 +681,29 @@ next: the verdict is per artifact.
 
 The verdict requires **both** the digest and the byte count to match.
 
+### `drill`
+
+```
+source:  Schema, Configure   (the target's source_config, with [target.drill]'s laid over it)
+storage: Schema, Configure
+capabilities checked: source + drill on the source, storage on the storage
+Storage.List { prefix }                             (only when no --artifact was named)
+Storage.Get  { "<key>.manifest.json", data_socket }  → expected digest
+Drill.Provision
+  … the same calls as `restore`, from Source.Restore on …
+Drill.Check { query }
+Drill.Teardown                                      ← ALWAYS, whatever happened above
+Shutdown ×2
+```
+
+The restore in the middle is the `restore` operation, unchanged — a drill that
+restored by some other path would prove that *that* path works. What the drill adds
+is around it.
+
+`Teardown` runs after a failed `Provision`, a failed restore and a failed check
+alike. Each drill RPC has a **5-minute** deadline, not the control channel's one
+minute: a check is a query against a freshly restored database and may scan.
+
 ### `doctor`
 
 ```
@@ -634,7 +731,7 @@ Storage.AbortIncomplete { prefix }
 Shutdown
 ```
 
-### Notification — after `backup`, `restore`, `verify`, `doctor`, `storage gc` and `storage prune`
+### Notification — after `backup`, `restore`, `verify`, `drill`, `doctor`, `storage gc` and `storage prune`
 
 ```
 for each [[notify]] block whose `on` matches the outcome (at most 4 at a time):
@@ -682,6 +779,7 @@ answer. A source that writes files directly has to bring its own.
 |---|---|---|
 | Plugin announces itself on stdout | **30 s** | `the plugin did not announce itself within the startup deadline`. EOF gives the same error, sooner. |
 | Any control-plane RPC | **60 s** | `the plugin "{p}" did not answer {op} in 60 s` |
+| Any `Drill` RPC (`Provision`, `Check`, `Teardown`) | **5 min** | `the plugin "{p}" did not answer {op} in 300 s`; the drill fails at that stage and still tears down |
 | Transfer RPC response headers | **60 s** | transfer error |
 | Plugin connects to a data socket | **30 s** | transfer error naming the plugin and the operation |
 | SDK: socket must exist before announcing | **2 s** | `the control channel never listened on {path} after {waited_ms} ms` |

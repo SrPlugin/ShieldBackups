@@ -104,6 +104,25 @@ pub async fn list(storage: &PluginClient, prefix: &str) -> Result<Vec<ArtifactMe
         .collect())
 }
 
+/// The newest of `artifacts`: the greatest `modified_at`, and among equals the
+/// greatest key.
+///
+/// The timestamp is RFC-3339 UTC by the protocol's contract, so comparing the
+/// strings is comparing the instants. An artifact whose storage does not know its
+/// timestamp -- the empty string, by contract -- sorts below every one that does:
+/// it can never be proved newest, so it never wins over one that can. The key is
+/// the tiebreak because the default template puts the backup's own timestamp in
+/// it, which makes "the greatest key" a sensible newest when the storage's clock
+/// cannot tell two artifacts apart.
+#[must_use]
+pub fn latest(artifacts: Vec<ArtifactMeta>) -> Option<ArtifactMeta> {
+    artifacts.into_iter().max_by(|a, b| {
+        a.modified_at
+            .cmp(&b.modified_at)
+            .then_with(|| a.key.cmp(&b.key))
+    })
+}
+
 /// Deletes `key` from the storage target. Idempotent: a key that is already
 /// gone is not an error, the same guarantee `sb-plugin-r2`'s own `delete`
 /// documents.
@@ -153,6 +172,55 @@ pub async fn abort_incomplete(storage: &PluginClient, prefix: &str) -> Result<u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn meta(key: &str, modified_at: &str) -> ArtifactMeta {
+        ArtifactMeta {
+            key: key.into(),
+            size: 1,
+            modified_at: modified_at.into(),
+        }
+    }
+
+    #[test]
+    fn the_latest_artifact_is_the_one_modified_last() {
+        let newest = latest(vec![
+            meta("a", "2026-11-01T00:00:00Z"),
+            meta("c", "2026-11-03T00:00:00Z"),
+            meta("b", "2026-11-02T00:00:00Z"),
+        ])
+        .unwrap();
+        assert_eq!(newest.key, "c");
+    }
+
+    #[test]
+    fn an_artifact_with_an_unknown_timestamp_never_beats_one_with_a_known_one() {
+        // The empty string is the contract's "I do not know", and a made-up
+        // winner is how a drill would end up restoring the wrong backup.
+        let newest = latest(vec![
+            meta("zzz-unknown", ""),
+            meta("known", "2026-11-01T00:00:00Z"),
+        ])
+        .unwrap();
+        assert_eq!(newest.key, "known");
+    }
+
+    #[test]
+    fn when_the_timestamps_tie_the_greatest_key_wins() {
+        // The default template embeds the backup's own timestamp in the key.
+        let same = "2026-11-01T00:00:00Z";
+        let newest = latest(vec![
+            meta("app-20261101T020000Z", same),
+            meta("app-20261101T030000Z", same),
+            meta("app-20261101T010000Z", same),
+        ])
+        .unwrap();
+        assert_eq!(newest.key, "app-20261101T030000Z");
+    }
+
+    #[test]
+    fn with_no_artifacts_there_is_no_latest() {
+        assert!(latest(Vec::new()).is_none());
+    }
 
     #[test]
     fn the_default_template_gives_the_targets_folder() {

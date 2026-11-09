@@ -34,8 +34,10 @@ impl Plugin for PostgresPlugin {
             name: NAME.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: PROTOCOL_VERSION,
-            // Source only: a database is dumped and restored, never stored.
-            capabilities: vec![Capability::Source as i32],
+            // A source, and a drill on top of it: a database is dumped and
+            // restored, never stored, and can be restored into a scratch
+            // database to prove the backup works.
+            capabilities: vec![Capability::Source as i32, Capability::Drill as i32],
         }))
     }
 
@@ -255,14 +257,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn info_announces_only_the_source_capability() {
+    async fn info_announces_the_source_and_drill_capabilities() {
         let info = plugin()
             .info(Request::new(InfoRequest {}))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(info.name, super::NAME);
-        assert_eq!(info.capabilities, vec![Capability::Source as i32]);
+        assert_eq!(
+            info.capabilities,
+            vec![Capability::Source as i32, Capability::Drill as i32]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

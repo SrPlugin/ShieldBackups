@@ -21,7 +21,7 @@ of people who know Rust. Instead:
 
 ## Table of contents
 
-- [The four services](#the-four-services)
+- [The five services](#the-five-services)
 - [The startup handshake](#the-startup-handshake)
 - [The TLS names in the envelope](#the-tls-names-in-the-envelope)
 - [The data channel](#the-data-channel)
@@ -35,11 +35,11 @@ of people who know Rust. Instead:
 
 ---
 
-## The four services
+## The five services
 
-`crates/sb-proto/proto/shieldbk/v1/plugin.proto` defines four gRPC services.
+`crates/sb-proto/proto/shieldbk/v1/plugin.proto` defines five gRPC services.
 A plugin serves them on a single socket: `Plugin` always, and any subset of
-`Source`, `Storage` and `Notifier`.
+`Source`, `Storage`, `Notifier` and `Drill`.
 
 ### `Plugin` — mandatory, always
 
@@ -115,9 +115,36 @@ format = "slack"
 Write your notifier so its errors never contain a credential — a webhook URL or
 a bot token — because the status message ends up on the operator's terminal.
 
+### `Drill` — implement it if the source can *prove its backups restore*
+
+```proto
+rpc Provision (ProvisionRequest) returns (ProvisionResponse);
+rpc Check     (CheckRequest)     returns (CheckResponse);
+rpc Teardown  (TeardownRequest)  returns (TeardownResponse);
+```
+
+It is what `shieldbk drill` calls: make a disposable place, let the ordinary
+`Source.Restore` fill it, ask whether what landed is right, throw it away. A
+plugin that implements `Drill` **also implements `Source`**, and they share state:
+between `Provision` and `Teardown` your `Restore` has to write into the
+disposable place and *never* into what the plugin was configured to back up.
+That one rule is what makes a drill safe to schedule, so test it directly — the
+mock's `a_restore_during_a_drill_never_lands_where_the_plugin_backs_up_from` and
+Postgres's real-server test are the shape.
+
+- **A check that does not hold is `ok = false`, not an RPC error.** A query that
+  fails because the restore lost a table is the thing being looked for.
+- **`Teardown` is idempotent**, because the core calls it after every outcome.
+- The operator's `[target.drill] check` reaches you verbatim in `CheckRequest.query`;
+  what it means is yours to define and document, so make a passing check
+  unambiguous (Postgres: prints exactly `t`).
+
+See [`Service Drill`](protocol-reference.md#service-drill) for the full contract.
+
 **A plugin may implement any subset of the roles.** `sb-plugin-mock` implements
-all three: it announces `CAPABILITY_SOURCE`, `CAPABILITY_STORAGE` and
-`CAPABILITY_NOTIFIER` and serves the three services on the same socket. Each role
+all four: it announces `CAPABILITY_SOURCE`, `CAPABILITY_STORAGE`,
+`CAPABILITY_NOTIFIER` and `CAPABILITY_DRILL` and serves all four, plus `Plugin`, on
+the same socket. Each role
 is started as its **own process** with its **own config table**
 (`source_config`, `storage_config`, `[notify.config]`), so a plugin that serves
 several declares in one `Schema` every field any of its roles needs, marks them

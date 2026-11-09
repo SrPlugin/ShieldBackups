@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sb_proto::PROTOCOL_VERSION;
+use sb_proto::drill_server::{Drill, DrillServer};
 use sb_proto::notifier_server::{Notifier, NotifierServer};
 use sb_proto::plugin_server::{Plugin, PluginServer};
 use sb_proto::source_server::{Source, SourceServer};
@@ -62,32 +63,27 @@ pub enum SdkError {
     Io(#[from] std::io::Error),
 }
 
+/// The capabilities a plugin can announce, in the order it announces them.
+const ANNOUNCEABLE: [&str; 4] = ["source", "storage", "notifier", "drill"];
+
 /// Capabilities that are announced, derived from the registered services.
-fn capabilities(source: bool, storage: bool, notifier: bool) -> Vec<String> {
-    let mut v = Vec::new();
-    if source {
-        v.push("source".to_string());
-    }
-    if storage {
-        v.push("storage".to_string());
-    }
-    if notifier {
-        v.push("notifier".to_string());
-    }
-    v
+///
+/// `registered` names the services the plugin registered; what comes out is those
+/// among [`ANNOUNCEABLE`], in its order and nothing else, so a plugin cannot
+/// announce what it did not register.
+fn capabilities(registered: &[&str]) -> Vec<String> {
+    ANNOUNCEABLE
+        .iter()
+        .filter(|capability| registered.contains(capability))
+        .map(|capability| (*capability).to_string())
+        .collect()
 }
 
-fn build_ready(
-    protocol_version: u32,
-    source: bool,
-    storage: bool,
-    notifier: bool,
-    pid: u32,
-) -> Ready {
+fn build_ready(protocol_version: u32, registered: &[&str], pid: u32) -> Ready {
     Ready {
         magic: MAGIC.into(),
         protocol_version,
-        capabilities: capabilities(source, storage, notifier),
+        capabilities: capabilities(registered),
         pid,
     }
 }
@@ -119,6 +115,7 @@ pub struct PluginRuntime<P> {
     source: Option<Registration>,
     storage: Option<Registration>,
     notifier: Option<Registration>,
+    drill: Option<Registration>,
 }
 
 impl<P: Plugin> PluginRuntime<P> {
@@ -131,6 +128,7 @@ impl<P: Plugin> PluginRuntime<P> {
             source: None,
             storage: None,
             notifier: None,
+            drill: None,
         }
     }
 
@@ -165,6 +163,19 @@ impl<P: Plugin> PluginRuntime<P> {
         self
     }
 
+    /// Registers the restore drill. Announces the `drill` capability.
+    ///
+    /// A plugin that does this is also a source, and registers one with
+    /// [`PluginRuntime::with_source`]: the drill only provisions, checks and
+    /// tears down, and the restore itself is the source's.
+    #[must_use]
+    pub fn with_drill<D: Drill>(mut self, drill: D) -> Self {
+        self.drill = Some(Box::new(move |r: Routes| {
+            r.add_service(DrillServer::new(drill))
+        }));
+        self
+    }
+
     /// Runs the plugin until the core closes it.
     ///
     /// It ends when the core calls `Shutdown` —the SDK intercepts it, so the
@@ -189,9 +200,15 @@ impl<P: Plugin> PluginRuntime<P> {
         let version = bootstrap.negotiate(&[PROTOCOL_VERSION])?;
         let tls = server_config_from_bundle(&bootstrap.tls)?;
 
-        let source = self.source.is_some();
-        let storage = self.storage.is_some();
-        let notifier = self.notifier.is_some();
+        let registered: Vec<&str> = [
+            ("source", self.source.is_some()),
+            ("storage", self.storage.is_some()),
+            ("notifier", self.notifier.is_some()),
+            ("drill", self.drill.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| present.then_some(name))
+        .collect();
 
         // The Plugin service goes wrapped: `Shutdown` is first served by the
         // plugin's implementation and then ends the process, without the plugin
@@ -208,6 +225,9 @@ impl<P: Plugin> PluginRuntime<P> {
             routes = register(routes);
         }
         if let Some(register) = self.notifier {
+            routes = register(routes);
+        }
+        if let Some(register) = self.drill {
             routes = register(routes);
         }
 
@@ -230,18 +250,10 @@ impl<P: Plugin> PluginRuntime<P> {
         tracing::debug!(
             protocol = version,
             socket = %socket.display(),
-            source,
-            storage,
-            notifier,
+            ?registered,
             "control channel listening; announcing ready"
         );
-        announce(&build_ready(
-            version,
-            source,
-            storage,
-            notifier,
-            std::process::id(),
-        ))?;
+        announce(&build_ready(version, &registered, std::process::id()))?;
 
         // We live until one of two things happens: the channel goes down by
         // itself —and then its error is the plugin's result— or the core asks
@@ -364,32 +376,55 @@ mod tests {
 
     #[test]
     fn a_plugin_with_no_extra_services_only_announces_the_basics() {
-        assert!(capabilities(false, false, false).is_empty());
+        assert!(capabilities(&[]).is_empty());
     }
 
     #[test]
     fn a_source_announces_source() {
-        assert_eq!(capabilities(true, false, false), vec!["source"]);
+        assert_eq!(capabilities(&["source"]), vec!["source"]);
     }
 
     #[test]
     fn a_storage_announces_storage() {
-        assert_eq!(capabilities(false, true, false), vec!["storage"]);
+        assert_eq!(capabilities(&["storage"]), vec!["storage"]);
     }
 
     #[test]
     fn a_plugin_that_does_both_announces_both() {
-        assert_eq!(capabilities(true, true, false), vec!["source", "storage"]);
+        assert_eq!(
+            capabilities(&["source", "storage"]),
+            vec!["source", "storage"]
+        );
     }
 
     #[test]
     fn a_notifier_announces_notifier() {
-        assert_eq!(capabilities(false, false, true), vec!["notifier"]);
+        assert_eq!(capabilities(&["notifier"]), vec!["notifier"]);
+    }
+
+    #[test]
+    fn a_drill_announces_drill() {
+        assert_eq!(capabilities(&["source", "drill"]), vec!["source", "drill"]);
+    }
+
+    #[test]
+    fn the_announcement_keeps_a_stable_order_whatever_the_registration_order() {
+        // The core compares by name, but a log line that reads differently from
+        // one start to the next is noise when something is being debugged.
+        assert_eq!(
+            capabilities(&["drill", "notifier", "storage", "source"]),
+            vec!["source", "storage", "notifier", "drill"]
+        );
+    }
+
+    #[test]
+    fn something_that_is_not_a_capability_is_never_announced() {
+        assert!(capabilities(&["teleport"]).is_empty());
     }
 
     #[test]
     fn the_ready_line_carries_the_magic_and_the_negotiated_version() {
-        let r = build_ready(1, true, false, false, 4242);
+        let r = build_ready(1, &["source"], 4242);
         assert_eq!(r.magic, sb_transport::MAGIC);
         assert_eq!(r.protocol_version, 1);
         assert_eq!(r.capabilities, vec!["source"]);
@@ -400,21 +435,24 @@ mod tests {
     fn the_ready_serializes_into_a_single_line() {
         // The core reads it with a read_line: if it carried newlines it would be
         // cut short.
-        let line = build_ready(1, true, true, true, 1).to_line().unwrap();
+        let line = build_ready(1, &ANNOUNCEABLE, 1).to_line().unwrap();
         assert!(!line.contains('\n'));
         assert!(sb_transport::Ready::from_line(&line).is_ok());
     }
 
     #[test]
-    fn the_declared_capabilities_match_the_registered_services() {
+    fn every_combination_of_services_announces_exactly_what_was_registered() {
         // The reason for deriving them instead of passing them by hand: a plugin
         // cannot announce a source it does not implement.
-        for bits in 0..8_u8 {
-            let (source, storage, notifier) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
-            let r = build_ready(1, source, storage, notifier, 1);
-            assert_eq!(r.capabilities.contains(&"source".to_string()), source);
-            assert_eq!(r.capabilities.contains(&"storage".to_string()), storage);
-            assert_eq!(r.capabilities.contains(&"notifier".to_string()), notifier);
+        for bits in 0..(1_u8 << ANNOUNCEABLE.len()) {
+            let registered: Vec<&str> = ANNOUNCEABLE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, name)| *name)
+                .collect();
+            let announced = build_ready(1, &registered, 1).capabilities;
+            assert_eq!(announced, registered, "bits {bits:04b}");
         }
     }
 }

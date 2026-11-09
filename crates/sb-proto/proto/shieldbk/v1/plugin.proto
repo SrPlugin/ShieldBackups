@@ -3,7 +3,7 @@ syntax = "proto3";
 package shieldbk.v1;
 
 // Every plugin implements this service. On top of it, a plugin implements
-// any of Source, Storage and Notifier, and declares which in Info.
+// any of Source, Storage, Notifier and Drill, and declares which in Info.
 service Plugin {
   // First RPC over the already-authenticated channel. Confirms identity and
   // capabilities.
@@ -54,11 +54,37 @@ service Notifier {
   rpc Notify (NotifyRequest) returns (NotifyResponse);
 }
 
+// A source that can prove its own backups restore: it knows how to make a
+// disposable place to restore into, how to ask whether what landed there is
+// right, and how to throw that place away.
+//
+// A plugin implementing Drill also implements Source, and the two are the same
+// process: between Provision and Teardown, Source.Restore writes into the
+// disposable place and **never** into what the plugin was configured to back up.
+// Which place that is, and how it is made, is the plugin's business -- a scratch
+// database, a temporary directory, a throwaway volume. The core only runs the
+// sequence and reports the verdict.
+//
+// It is additive, like Notifier: a source that does not implement it keeps
+// working for everything but `shieldbk drill`.
+service Drill {
+  // Creates the disposable place. From here on, Source.Restore writes there.
+  rpc Provision (ProvisionRequest) returns (ProvisionResponse);
+  // Asks whether what was restored is right. A check that does not hold is an
+  // answer (ok = false), not an error: the RPC only fails when the question
+  // could not be asked at all.
+  rpc Check     (CheckRequest)     returns (CheckResponse);
+  // Throws the disposable place away. Idempotent: with nothing provisioned it
+  // succeeds, and the core calls it whatever happened before.
+  rpc Teardown  (TeardownRequest)  returns (TeardownResponse);
+}
+
 enum Capability {
   CAPABILITY_UNSPECIFIED = 0;
   CAPABILITY_SOURCE      = 1;
   CAPABILITY_STORAGE     = 2;
   CAPABILITY_NOTIFIER    = 3;
+  CAPABILITY_DRILL       = 4;
 }
 
 message InfoRequest {}
@@ -207,7 +233,7 @@ message ListResponse { repeated ArtifactMeta artifacts = 1; }
 
 // What happened, exactly as the command reported it.
 message NotifyRequest {
-  // The command that ran: `backup`, `restore`, `verify`, `doctor`,
+  // The command that ran: `backup`, `restore`, `verify`, `doctor`, `drill`,
   // `storage gc` or `storage prune`.
   string command     = 1;
   // Whether it succeeded. A `doctor` that found problems is not ok.
@@ -219,6 +245,28 @@ message NotifyRequest {
   string report_json = 3;
 }
 message NotifyResponse {}
+
+message ProvisionRequest {}
+message ProvisionResponse {
+  // Where restores now land, for the report: a database name, a directory.
+  // Never a credential.
+  string description = 1;
+}
+
+message CheckRequest {
+  // What to ask, exactly as the operator wrote it in `[target.drill] check`.
+  // The core does not interpret it: what a query means is the plugin's.
+  string query = 1;
+}
+message CheckResponse {
+  bool   ok     = 1;
+  // Why, in a line: what the check saw. Shown in the report whether it passed
+  // or not.
+  string detail = 2;
+}
+
+message TeardownRequest {}
+message TeardownResponse {}
 
 message DeleteRequest  { string key = 1; }
 message DeleteResponse {}

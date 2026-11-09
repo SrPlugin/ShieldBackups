@@ -13,6 +13,7 @@ use sb_plugin_sdk::tonic::{Request, Response, Status};
 use sb_plugin_sdk::{ProgressEmitter, ProgressStream, progress_stream};
 
 use crate::config::{Config, State};
+use crate::drill::Scratch;
 use crate::stream;
 
 /// Name of the file where `Restore` leaves what it receives.
@@ -20,12 +21,14 @@ pub const RESTORE_FILE: &str = "restore.bin";
 
 pub struct MockSource {
     state: State,
+    /// Where restores land during a drill; see [`Scratch`].
+    scratch: Scratch,
 }
 
 impl MockSource {
     #[must_use]
-    pub fn new(state: State) -> Self {
-        Self { state }
+    pub fn new(state: State, scratch: Scratch) -> Self {
+        Self { state, scratch }
     }
 }
 
@@ -54,7 +57,7 @@ impl Source for MockSource {
     ) -> Result<Response<Self::RestoreStream>, Status> {
         let config = self.state.resolved()?;
         let socket = request.into_inner().data_socket;
-        let dest = config.dir.join(RESTORE_FILE);
+        let dest = self.scratch.restore_file(&config);
         Ok(progress_stream(move |mut progress| async move {
             restore(&socket, &dest, &mut progress).await
         }))

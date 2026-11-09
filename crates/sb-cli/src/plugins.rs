@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use sb_config::{ConfigTable, Notify, Target, validate_and_convert};
+use sb_config::{ConfigTable, Drill, Notify, Target, validate_and_convert};
 use sb_core::lockfile::Lockfile;
 use sb_core::plugin::{Capability, PluginClient};
 
@@ -162,6 +162,47 @@ pub async fn start_for(
         &format!("target `{}`", target.name),
     )
     .await
+}
+
+/// Starts the source plugin of `target` configured **for its drill**: the
+/// target's own `source_config` with the `[target.drill]` overlay on top, and
+/// the `drill` capability checked on top of `source`.
+///
+/// It is the same plugin binary and the same schema validation as
+/// [`start_for`]; what changes is only which fields it is handed, so a drill
+/// can aim a plugin at a staging server without the backup's configuration
+/// moving.
+///
+/// # Errors
+/// The same as [`start_for`], plus [`CliError::Config`] if the plugin is a
+/// source but cannot take part in a drill.
+pub async fn start_drill_source(
+    ctx: &Context,
+    target: &Target,
+    drill: &Drill,
+) -> Result<PluginClient, CliError> {
+    let owner = format!("target `{}`", target.name);
+    let config = drill.source_config_over(&target.source_config);
+    let client = start_configured(
+        ctx,
+        &target.source,
+        Capability::Source,
+        Role::Source.section(),
+        &config,
+        &owner,
+    )
+    .await?;
+
+    // Checked here, with the plugin's name in the message, and not left for
+    // `run_drill` to find after the storage plugin has also been started.
+    if let Err(source) = client.require_capability(Capability::Drill) {
+        close(client).await;
+        return Err(CliError::config(format!(
+            "the {owner} has a `[target.drill]` block, but {source}: its source plugin has to \
+             implement the `drill` capability to be restored into a disposable place"
+        )));
+    }
+    Ok(client)
 }
 
 /// Starts the notifier plugin a `[[notify]]` block names, already configured

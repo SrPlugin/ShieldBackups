@@ -4,7 +4,7 @@
 //! Neither RPC speaks the `PostgreSQL` wire protocol; both are a byte pump with
 //! a subprocess on one end and the data channel on the other, plus the rule
 //! that decides whose error wins when both ends fail at once (see
-//! [`run_dump`] and [`run_restore`]).
+//! `run_dump` and `run_restore`).
 
 use std::path::Path;
 use std::process::Stdio;
@@ -19,6 +19,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 
 use crate::command::{self, Running};
 use crate::config::{Config, State};
+use crate::drill::Scratch;
 
 /// Size of the chunks moved between the process and the channel. Deliberately
 /// smaller than the SDK's progress milestone: a larger chunk would skip whole
@@ -27,12 +28,15 @@ const CHUNK: usize = 64 * 1024;
 
 pub struct PostgresSource {
     state: State,
+    /// Which database a restore lands in: the configured one, except between a
+    /// drill's `Provision` and `Teardown`, when it is the scratch one.
+    scratch: Scratch,
 }
 
 impl PostgresSource {
     #[must_use]
-    pub fn new(state: State) -> Self {
-        Self { state }
+    pub fn new(state: State, scratch: Scratch) -> Self {
+        Self { state, scratch }
     }
 }
 
@@ -62,7 +66,9 @@ impl Source for PostgresSource {
         &self,
         request: Request<RestoreRequest>,
     ) -> Result<Response<Self::RestoreStream>, Status> {
-        let config = self.state.resolved()?;
+        // Aimed at the scratch database while a drill is under way. This is the
+        // one line that keeps a drill from restoring over what is being backed up.
+        let config = self.scratch.applied_to(self.state.resolved()?);
         let socket = request.into_inner().data_socket;
         Ok(progress_stream(move |mut progress| async move {
             let pg_restore_path = config.pg_restore_path.clone();
@@ -253,6 +259,7 @@ mod tests {
 
     use super::{PostgresSource, run_dump, run_restore};
     use crate::config::{Config, State};
+    use crate::drill::Scratch;
 
     fn config() -> Config {
         let map = HashMap::from([
@@ -431,7 +438,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dump_without_configure_fails_with_failed_precondition() {
-        let source = PostgresSource::new(State::default());
+        let source = PostgresSource::new(State::default(), Scratch::default());
         let e = source
             .dump(Request::new(DumpRequest {
                 data_socket: "/tmp/unused".into(),
@@ -443,7 +450,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn restore_without_configure_fails_with_failed_precondition() {
-        let source = PostgresSource::new(State::default());
+        let source = PostgresSource::new(State::default(), Scratch::default());
         let e = source
             .restore(Request::new(RestoreRequest {
                 data_socket: "/tmp/unused".into(),

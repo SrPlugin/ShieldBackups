@@ -17,6 +17,8 @@ pub const FIELD_USER: &str = "user";
 pub const FIELD_PASSWORD: &str = "password";
 pub const FIELD_PG_DUMP_PATH: &str = "pg_dump_path";
 pub const FIELD_PG_RESTORE_PATH: &str = "pg_restore_path";
+pub const FIELD_PSQL_PATH: &str = "psql_path";
+pub const FIELD_MAINTENANCE_DATABASE: &str = "maintenance_database";
 
 /// `PostgreSQL`'s own default port.
 pub const DEFAULT_PORT: i64 = 5432;
@@ -25,6 +27,13 @@ pub const DEFAULT_PORT: i64 = 5432;
 /// installed `postgresql-client` already satisfies.
 pub const DEFAULT_PG_DUMP_PATH: &str = "pg_dump";
 pub const DEFAULT_PG_RESTORE_PATH: &str = "pg_restore";
+/// Only a restore drill runs `psql`: it creates and drops the scratch database and
+/// asks the check. Backups and plain restores never need it installed.
+pub const DEFAULT_PSQL_PATH: &str = "psql";
+/// The database a drill connects to in order to `CREATE`/`DROP` the scratch one:
+/// it cannot be the scratch database itself, and `postgres` is the one every
+/// server has.
+pub const DEFAULT_MAINTENANCE_DATABASE: &str = "postgres";
 
 /// The fields the plugin accepts, exactly as `Schema` publishes them.
 ///
@@ -77,6 +86,27 @@ pub fn fields() -> Vec<Field> {
             description: "Path to the `pg_restore` binary, if it is not the one on PATH".into(),
             default_value: DEFAULT_PG_RESTORE_PATH.into(),
         },
+        Field {
+            name: FIELD_PSQL_PATH.into(),
+            r#type: FieldType::Path as i32,
+            required: false,
+            secret: false,
+            description:
+                "Path to the `psql` binary a restore drill uses, if it is not the one on PATH"
+                    .into(),
+            default_value: DEFAULT_PSQL_PATH.into(),
+        },
+        Field {
+            name: FIELD_MAINTENANCE_DATABASE.into(),
+            r#type: FieldType::String as i32,
+            required: false,
+            secret: false,
+            description:
+                "Database a restore drill connects to in order to create and drop its scratch \
+                 database; `user` needs the CREATEDB privilege"
+                    .into(),
+            default_value: DEFAULT_MAINTENANCE_DATABASE.into(),
+        },
     ]
 }
 
@@ -105,6 +135,8 @@ pub struct Config {
     password: Option<String>,
     pub pg_dump_path: String,
     pub pg_restore_path: String,
+    pub psql_path: String,
+    pub maintenance_database: String,
 }
 
 impl Config {
@@ -133,6 +165,12 @@ impl Config {
         let pg_restore_path = optional_string(map, FIELD_PG_RESTORE_PATH)?
             .unwrap_or(DEFAULT_PG_RESTORE_PATH)
             .to_string();
+        let psql_path = optional_string(map, FIELD_PSQL_PATH)?
+            .unwrap_or(DEFAULT_PSQL_PATH)
+            .to_string();
+        let maintenance_database = optional_string(map, FIELD_MAINTENANCE_DATABASE)?
+            .unwrap_or(DEFAULT_MAINTENANCE_DATABASE)
+            .to_string();
 
         Ok(Self {
             host: host.to_string(),
@@ -142,12 +180,26 @@ impl Config {
             password,
             pg_dump_path,
             pg_restore_path,
+            psql_path,
+            maintenance_database,
         })
     }
 
     #[must_use]
     pub fn password(&self) -> Option<&str> {
         self.password.as_deref()
+    }
+
+    /// The same configuration aimed at another database on the same server.
+    ///
+    /// It is how a drill points `pg_restore` and `psql` at the scratch database
+    /// without a second place that knows how to build their arguments.
+    #[must_use]
+    pub fn with_database(&self, database: &str) -> Self {
+        Self {
+            database: database.to_string(),
+            ..self.clone()
+        }
     }
 }
 
@@ -161,6 +213,8 @@ impl std::fmt::Debug for Config {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("pg_dump_path", &self.pg_dump_path)
             .field("pg_restore_path", &self.pg_restore_path)
+            .field("psql_path", &self.psql_path)
+            .field("maintenance_database", &self.maintenance_database)
             .finish()
     }
 }
@@ -218,8 +272,9 @@ mod tests {
     use sb_plugin_sdk::tonic::Code;
 
     use super::{
-        Config, DEFAULT_PG_DUMP_PATH, DEFAULT_PG_RESTORE_PATH, DEFAULT_PORT, FIELD_DATABASE,
-        FIELD_HOST, FIELD_PASSWORD, FIELD_PG_DUMP_PATH, FIELD_PG_RESTORE_PATH, FIELD_PORT,
+        Config, DEFAULT_MAINTENANCE_DATABASE, DEFAULT_PG_DUMP_PATH, DEFAULT_PG_RESTORE_PATH,
+        DEFAULT_PORT, DEFAULT_PSQL_PATH, FIELD_DATABASE, FIELD_HOST, FIELD_MAINTENANCE_DATABASE,
+        FIELD_PASSWORD, FIELD_PG_DUMP_PATH, FIELD_PG_RESTORE_PATH, FIELD_PORT, FIELD_PSQL_PATH,
         FIELD_USER, fields,
     };
 
@@ -256,6 +311,8 @@ mod tests {
                 FIELD_PASSWORD,
                 FIELD_PG_DUMP_PATH,
                 FIELD_PG_RESTORE_PATH,
+                FIELD_PSQL_PATH,
+                FIELD_MAINTENANCE_DATABASE,
             ]
         );
         for f in &fields {
@@ -274,6 +331,8 @@ mod tests {
             FIELD_PASSWORD,
             FIELD_PG_DUMP_PATH,
             FIELD_PG_RESTORE_PATH,
+            FIELD_PSQL_PATH,
+            FIELD_MAINTENANCE_DATABASE,
         ] {
             assert!(!fields.iter().find(|f| f.name == name).unwrap().required);
         }
@@ -394,5 +453,38 @@ mod tests {
             Config::from_map(&m).unwrap_err().code(),
             Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn the_drill_fields_default_to_psql_and_the_postgres_database() {
+        let c = Config::from_map(&base()).unwrap();
+        assert_eq!(c.psql_path, DEFAULT_PSQL_PATH);
+        assert_eq!(c.maintenance_database, DEFAULT_MAINTENANCE_DATABASE);
+        assert_eq!(DEFAULT_MAINTENANCE_DATABASE, "postgres");
+    }
+
+    #[test]
+    fn explicit_drill_fields_override_the_defaults() {
+        let mut m = base();
+        m.insert(FIELD_PSQL_PATH.to_string(), string("/opt/pg16/bin/psql"));
+        m.insert(FIELD_MAINTENANCE_DATABASE.to_string(), string("template1"));
+        let c = Config::from_map(&m).unwrap();
+        assert_eq!(c.psql_path, "/opt/pg16/bin/psql");
+        assert_eq!(c.maintenance_database, "template1");
+    }
+
+    #[test]
+    fn aiming_at_another_database_changes_only_the_database() {
+        let mut m = base();
+        m.insert(FIELD_PASSWORD.to_string(), string("hunter2"));
+        let original = Config::from_map(&m).unwrap();
+
+        let scratch = original.with_database("drill_1");
+        assert_eq!(scratch.database, "drill_1");
+        assert_eq!(scratch.host, original.host);
+        assert_eq!(scratch.user, original.user);
+        assert_eq!(scratch.password(), Some("hunter2"));
+        // And the original is untouched: the backup still goes to its own database.
+        assert_eq!(original.database, "app");
     }
 }

@@ -67,11 +67,28 @@ async fn restore(
     artifact: &str,
     identity: &Identity,
 ) -> Result<u64, CliError> {
-    // The manifest may be missing -- an artifact copied by hand, a half-migrated
-    // storage target -- and that cannot stop the restore: if it is missing, a
-    // warning is issued and the extra check is skipped. Refusing would mean
-    // leaving unrecovered data that can in fact be recovered.
-    let expected = match read_manifest(storage, artifact).await {
+    Ok(run_restore(RestoreRequest {
+        source,
+        storage,
+        artifact_key: artifact.to_owned(),
+        identity,
+        expected_ciphertext_sha256: expected_digest(storage, artifact).await,
+    })
+    .await?)
+}
+
+/// The digest the manifest says `artifact` has, if there is a manifest to ask.
+///
+/// The manifest may be missing -- an artifact copied by hand, a half-migrated
+/// storage target -- and that cannot stop a restore: if it is missing, a
+/// warning is issued and the extra check is skipped. Refusing would mean
+/// leaving unrecovered data that can in fact be recovered. `drill` goes through
+/// the same function, so the two cannot disagree about it.
+pub(super) async fn expected_digest(
+    storage: &sb_core::plugin::PluginClient,
+    artifact: &str,
+) -> Option<Digest> {
+    match read_manifest(storage, artifact).await {
         Ok(manifest) => Digest::from_hex(&manifest.ciphertext_sha256).ok(),
         Err(source) => {
             tracing::warn!(
@@ -82,16 +99,7 @@ async fn restore(
             );
             None
         }
-    };
-
-    Ok(run_restore(RestoreRequest {
-        source,
-        storage,
-        artifact_key: artifact.to_owned(),
-        identity,
-        expected_ciphertext_sha256: expected,
-    })
-    .await?)
+    }
 }
 
 /// Reads the private key file.
@@ -99,7 +107,7 @@ async fn restore(
 /// The error names the path but **never the content**: what was being read is a
 /// private key, and a message quoting it would leave it written in the log of
 /// whoever picked the wrong file.
-fn read_identity(path: &Path) -> Result<Identity, CliError> {
+pub(super) fn read_identity(path: &Path) -> Result<Identity, CliError> {
     let text = std::fs::read_to_string(path).map_err(|source| {
         CliError::config(format!(
             "could not read the private key `{}`: {source}",

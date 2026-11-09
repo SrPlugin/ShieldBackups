@@ -386,6 +386,9 @@ account_id        = "0123456789abcdef0123456789abcdef"
 bucket            = "backups"
 access_key_id     = { env = "R2_ACCESS_KEY_ID" }
 secret_access_key = { file = "/run/secrets/r2_secret" }
+
+# [target.drill]                      # optional: what `shieldbk drill` asks after restoring
+# check = "SELECT count(*) > 0 FROM users"
 ```
 
 Unknown keys are a hard error, not a shrug: a typo in a field name is a field
@@ -423,8 +426,8 @@ written into the template by hand.
 
 `shieldbk` does not know what Slack, Discord, Telegram or a mailbox is, and it
 never will: **notifying is a plugin role**, like a source or a storage. After
-`backup`, `restore`, `verify`, `doctor`, `storage gc` and `storage prune`, every
-`[[notify]]` block that asked to hear about the outcome gets the same JSON
+`backup`, `restore`, `verify`, `drill`, `doctor`, `storage gc` and `storage prune`,
+every `[[notify]]` block that asked to hear about the outcome gets the same JSON
 document `--format json` prints, and its plugin decides what to do with it.
 
 ```toml
@@ -502,6 +505,65 @@ plugin.
 
 Read the warning in [Security, plainly](#security-plainly) about what a *failed*
 restore can leave behind.
+
+### `shieldbk drill TARGET --identity PATH [--artifact KEY]`
+
+A backup that has never been restored is a hope, not a backup. `drill` is how a
+target proves otherwise, on a schedule: it restores the target's **newest**
+artifact into a disposable place, asks the question you wrote, reports the
+answer, and throws the place away — whatever happened in between.
+
+```toml
+[[target]]
+name = "app"
+# ...source, storage, recipient as usual...
+
+[target.drill]
+check = "SELECT count(*) > 0 FROM users"   # must return a single boolean
+
+[target.drill.source_config]               # optional: laid over the target's own
+host = "staging-db.internal"
+user = "drill"                             # a role with CREATEDB
+```
+
+```sh
+shieldbk drill app --identity key.txt
+```
+
+```
+app: drill passed: restored 1048576 bytes from app/2026/08/23/app-20260823T023637Z-postgres.dump.zst.age; check: the check returned true (2.3s)
+```
+
+- **It cannot restore over the database you back up.** The *source plugin*
+  makes the disposable place — for PostgreSQL, a `drill_<time>_<pid>` database
+  created on the server `source_config` points at — and between `Provision` and
+  `Teardown` its restores land there and nowhere else. There is no field to
+  mistype to aim a drill at production, because the drill never reads one.
+- **The question is yours, and the plugin's to interpret.** `check` goes to the
+  source plugin verbatim. For PostgreSQL it passes only if the query prints
+  exactly `t`; a number, `f`, no rows, or a query that errors (the table is gone)
+  all fail it. That is the point: a check satisfied by almost anything proves
+  almost nothing.
+- **`[target.drill.source_config]` is an overlay**, field by field, over the
+  target's own. Repeating eight fields to change two invites them to drift
+  apart. Secrets are references here too.
+- **No artifacts is a failure, not a pass.** A target whose backups are missing
+  is what a drill exists to flag. `--artifact KEY` drills a specific one.
+- **It needs the private key**, exactly like `restore`, so schedule it on a
+  machine where the key may live.
+- **A drill that runs and fails exits 4**, and the report says how far it got —
+  `failed_stage` is `provision`, `restore` or `check` — so the page can say "the
+  restore worked and the check found no rows". `teardown_ok: false` is a warning
+  and never changes the verdict: the backup restored, but a scratch database is
+  left to drop.
+
+```json
+{"artifact_key":"app/2026/08/23/app-20260823T023637Z-postgres.dump.zst.age","check":{"detail":"the check returned true","ok":true},"command":"drill","elapsed_ms":2310,"failed_stage":null,"failure":null,"ok":true,"passed":true,"plaintext_bytes":1048576,"restore_ms":1790,"scratch":"database `drill_1787452597_4242` on staging-db.internal:5432","target":"app","teardown_error":null,"teardown_ok":true}
+```
+
+The source plugin has to implement the `drill` capability: `postgres` does (it
+needs `psql` on `PATH`, or `psql_path`), and so does `mock`. [`[[notify]]`
+blocks](#notifications) hear about a drill as the command `drill`.
 
 ### `shieldbk doctor [TARGET]`
 
@@ -589,7 +651,8 @@ hourly entry) so the storage target never grows past what the retention allows.
 0   success
 2   configuration error   — the TOML, a secret reference, an age recipient
 3   plugin error          — missing, unregistered, altered or crashed plugin
-4   operation error       — the backup itself failed: source, network, storage
+4   operation error       — the backup itself failed: source, network, storage;
+                            or a drill's restore or check did
 ```
 
 They are stable and meant to be routed to different people. `--format json`
@@ -778,3 +841,4 @@ and get in each other's way otherwise.
 | [`docs/security.md`](docs/security.md) | The security decisions and, more usefully, where each one stops. |
 | [`docs/plugins/examples/command-plugin/`](docs/plugins/examples/command-plugin/) | A working non-Rust plugin. `./try-it.sh` runs a real backup and restore. |
 | `crates/sb-proto/proto/shieldbk/v1/plugin.proto` | The contract itself. |
+| [`ROADMAP.md`](ROADMAP.md) | Features that could be added next, and what is deliberately not planned. |

@@ -894,3 +894,215 @@ fn plugin_docs_works_with_a_plugins_only_config() {
         assert!(text.contains(expected), "`{expected}` is missing:\n{text}");
     }
 }
+
+// --- shieldbk drill ---------------------------------------------------------
+//
+// The mock's disposable place is a directory, and its checks (`size=N`,
+// `restored`, `error`) are the ones its own docs list. What these tests prove is
+// the CLI around the drill: which artifact it picks, what it prints, which exit
+// code it ends with, and -- the property the feature rests on -- that it never
+// writes where the backup comes from.
+
+/// A `[target.drill]` block for the mock.
+fn drill_block(check: &str) -> String {
+    format!("[target.drill]\ncheck = \"{check}\"\n")
+}
+
+/// A locked bench whose target has a drill block, with one backup already taken.
+fn drillable(check: &str, extra: &str) -> (Bench, std::path::PathBuf) {
+    let (bench, config) = locked_with("", &format!("{}\n{extra}", drill_block(check)));
+    let out = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "backup"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (bench, config)
+}
+
+/// Runs `drill production` with the key `locked_with` left in the bench, plus
+/// `extra` arguments.
+fn drill(bench: &Bench, config: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "--format", "json"])
+        .args(["drill", "production", "--identity"])
+        .arg(bench.path("key.age"))
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// The RPCs the mock's drill saw, in order.
+fn drill_calls(bench: &Bench) -> Vec<String> {
+    std::fs::read_to_string(bench.data_dir().join("drill-calls.log"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn a_drill_proves_the_latest_backup_restores_without_touching_the_sources_own_data() {
+    let (bench, config) = drillable("size=65536", "");
+
+    let out = drill(&bench, &config, &[]);
+
+    assert!(
+        out.status.success(),
+        "drill failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out.stdout);
+    assert_eq!(json["command"], "drill");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["passed"], true);
+    assert_eq!(json["plaintext_bytes"], 65536);
+    assert_eq!(json["check"]["ok"], true);
+    assert_eq!(json["teardown_ok"], true);
+    assert!(
+        json["artifact_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("production/")),
+        "{json}"
+    );
+
+    // The property the feature rests on: a plain `restore` writes `restore.bin`
+    // into the source's directory, and a drill must not.
+    assert!(
+        !bench.data_dir().join("restore.bin").exists(),
+        "the drill restored over the source's own data"
+    );
+    assert!(
+        !bench.data_dir().join("drill-scratch").exists(),
+        "the scratch place was left behind"
+    );
+    assert_eq!(
+        drill_calls(&bench),
+        ["provision", "check size=65536", "teardown"]
+    );
+}
+
+#[test]
+fn a_drill_whose_check_does_not_hold_exits_4_and_says_which_step_failed() {
+    let (bench, config) = drillable("size=1", "");
+
+    let out = drill(&bench, &config, &[]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "the code a cron job pages on: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Under `--format json` the failure travels in stdout's single document.
+    let json = json_of(&out.stdout);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["passed"], false);
+    assert_eq!(json["failed_stage"], "check");
+    assert_eq!(json["class"], "operation");
+    assert!(
+        json["failure"].as_str().unwrap().contains("expected 1"),
+        "{json}"
+    );
+    // The restore did work, and the report keeps that.
+    assert_eq!(json["plaintext_bytes"], 65536);
+    // And the scratch place went away anyway.
+    assert_eq!(drill_calls(&bench).last().unwrap(), "teardown");
+    assert!(!bench.data_dir().join("drill-scratch").exists());
+}
+
+#[test]
+fn a_drill_that_cannot_provision_fails_at_provision_and_restores_nothing() {
+    let (bench, config) = drillable("restored", "");
+    std::fs::write(bench.data_dir().join("drill-fail-provision"), b"").unwrap();
+
+    let out = drill(&bench, &config, &[]);
+
+    assert_eq!(out.status.code(), Some(4));
+    let json = json_of(&out.stdout);
+    assert_eq!(json["failed_stage"], "provision");
+    assert!(json["plaintext_bytes"].is_null(), "nothing was restored");
+    assert!(!bench.data_dir().join("restore.bin").exists());
+}
+
+#[test]
+fn a_target_without_a_drill_block_cannot_be_drilled_and_the_message_says_how() {
+    let (bench, config) = backed_up_with_retention("", "");
+
+    let out = drill(&bench, &config, &[]);
+
+    assert_eq!(out.status.code(), Some(2), "it is a configuration error");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("[target.drill]"), "{text}");
+    assert!(
+        !bench.data_dir().join("drill-calls.log").exists(),
+        "nothing was provisioned for a drill that cannot run"
+    );
+}
+
+#[test]
+fn a_drill_of_a_target_with_nothing_backed_up_is_a_failure_and_not_a_pass() {
+    // A target whose backups are missing is exactly what a drill is there to
+    // flag, so "nothing to restore" cannot come out green.
+    let (bench, config) = locked_with("", &drill_block("restored"));
+
+    let out = drill(&bench, &config, &[]);
+
+    assert_eq!(out.status.code(), Some(4));
+    let json = json_of(&out.stdout);
+    assert!(
+        json["error"].as_str().unwrap().contains("no artifacts"),
+        "{json}"
+    );
+}
+
+#[test]
+fn a_drill_can_be_aimed_at_a_named_artifact() {
+    let (bench, config) = drillable("restored", "");
+    let backup = bench
+        .cmd()
+        .args(["--config", &config.to_string_lossy(), "--format", "json"])
+        .arg("verify")
+        .arg("production")
+        .output()
+        .unwrap();
+    let key = json_of(&backup.stdout)["artifacts"][0]["artifact_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let named = drill(&bench, &config, &["--artifact", &key]);
+    assert!(
+        named.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named.stdout)
+    );
+    assert_eq!(json_of(&named.stdout)["artifact_key"], key.as_str());
+
+    // One that is not there fails in the restore, and says so.
+    let missing = drill(&bench, &config, &["--artifact", "production/nope.age"]);
+    assert_eq!(missing.status.code(), Some(4));
+    assert_eq!(json_of(&missing.stdout)["failed_stage"], "restore");
+}
+
+#[test]
+fn a_drill_is_told_to_the_notifier_under_its_own_name() {
+    let (bench, config) = drillable("restored", &notify_mock("always"));
+
+    let out = drill(&bench, &config, &[]);
+    assert!(out.status.success());
+
+    let events = notifications(&bench);
+    let told = events
+        .iter()
+        .find(|e| e["command"] == "drill")
+        .expect("the drill was not notified");
+    assert_eq!(told["ok"], true);
+    assert_eq!(told["report"]["passed"], true);
+}

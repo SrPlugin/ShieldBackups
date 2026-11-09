@@ -51,6 +51,10 @@ pub enum Capability {
     Storage,
     /// It can be told how a command went and pass that on: it is a notifier.
     Notifier,
+    /// It can make a disposable place to restore into, check what landed there
+    /// and throw it away: it can take part in a restore drill. It is always on
+    /// top of [`Capability::Source`].
+    Drill,
 }
 
 impl Capability {
@@ -62,6 +66,7 @@ impl Capability {
             Self::Source => "source",
             Self::Storage => "storage",
             Self::Notifier => "notifier",
+            Self::Drill => "drill",
         }
     }
 }
